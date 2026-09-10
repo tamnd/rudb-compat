@@ -4,13 +4,26 @@
 //! against are `spec/12-duckdb-compat.md` section 12.8. This crate is the part that turns
 //! "compatible with DuckDB" from an assertion into a number a machine computed.
 //!
-//! Nothing here runs a query yet. What exists is the shape of the report, because the shape is
-//! what the rest is built to fill in, and because a compatibility percentage with no failure list
-//! attached to it is a number nobody should believe.
+//! What is here is the differential loop and nothing above it. Two engines, one statement at a
+//! time, the full result set compared, and a list of differences with enough in each one to
+//! reproduce it by hand. The reducer, the bisector and the query generators from section 14.2 all
+//! hang off this loop and none of them exists yet.
+//!
+//! rudb cannot run a query today, so the only thing the loop can ask both engines is whether a
+//! piece of text is SQL. That is a smaller question than the harness is for and it is not a small
+//! question: the dialect is the compatibility claim, and every statement in `spec/12` that has
+//! been checked so far was checked by reading DuckDB's source rather than by running it.
 //!
 //! [rudb repository]: https://github.com/tamnd/rudb
 
 #![forbid(unsafe_code)]
+
+pub mod compare;
+pub mod csv;
+pub mod duckdb;
+pub mod engine;
+pub mod rudb;
+pub mod suite;
 
 /// The four compatibility levels from `spec/12-duckdb-compat.md` section 12.8.
 ///
