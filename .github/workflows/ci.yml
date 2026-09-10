@@ -1,0 +1,81 @@
+# The per-commit gate. Everything here is required to merge.
+#
+# This repository is a harness rather than a library, so the matrix is smaller than the engine's:
+# what matters is that it builds and runs where someone would run it, which is Linux for the
+# nightly sweeps and macOS for a laptop. The differential jobs that need a real DuckDB and a real
+# rudb build arrive with M2, and they are not listed yet because a job that is red because the
+# thing it calls does not exist teaches everyone to ignore a red run.
+#
+# Actions are pinned to a patch version rather than a major tag, so a run can be reproduced.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  quick:
+    name: format and lints
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features
+
+  test:
+    name: test on ${{ matrix.os }}
+    needs: quick
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: cargo test
+        run: cargo test --all-features
+      # The prose rules are checked by a test, so this is covered above. What is not covered above
+      # is that the command line still answers, which is the whole of what this binary does today.
+      - name: the harness reports its levels
+        run: cargo run -q -- levels
+
+  docs:
+    name: documentation
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - run: cargo doc --all-features --no-deps
+
+  ci:
+    name: ci
+    if: always()
+    needs: [quick, test, docs]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: fail if anything upstream failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - name: pass
+        run: echo "all required jobs succeeded"

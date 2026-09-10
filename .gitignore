@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+
+# Harness output. Results, reduced reproductions and the databases a run built to compare against.
+/results
+/corpus-out
+/fixtures-out
+*.duckdb
+*.duckdb.wal
+*.rudb
+*.rudb-wal
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

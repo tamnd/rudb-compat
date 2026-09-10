@@ -1,0 +1,29 @@
+# Not published. This is a harness, it depends on a real DuckDB and on rudb at once, and nobody
+# should be depending on it from a build.
+[package]
+name = "rudb-compat"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+repository = "https://github.com/tamnd/rudb-compat"
+description = "The DuckDB compatibility harness for rudb."
+publish = false
+
+[dependencies]
+
+[lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "warn"
+doc_markdown = "allow"
+missing_panics_doc = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
