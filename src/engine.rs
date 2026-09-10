@@ -179,6 +179,21 @@ pub trait Engine {
     ///
     /// When the engine could not be run at all.
     fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError>;
+
+    /// Throw away everything the engine has been told and start again.
+    ///
+    /// A sqllogictest file creates its own tables and expects them not to be there when it starts,
+    /// so the runner in `crate::conform` calls this between files. The default does nothing, which
+    /// is right for an engine that keeps no state between statements, and wrong for one that does,
+    /// which is why it is on the trait rather than being something the runner does by rebuilding
+    /// whichever engine it happens to know about.
+    ///
+    /// # Errors
+    ///
+    /// When the engine could not be restarted.
+    fn reset(&mut self) -> Result<(), HarnessError> {
+        Ok(())
+    }
 }
 
 /// Whether an engine thinks a piece of text is SQL.

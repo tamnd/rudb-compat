@@ -1,0 +1,148 @@
+# name: corpus/slt/scalar.test
+# description: Literals, arithmetic, comparison and CASE, with no table involved
+# group: [smoke]
+
+query I
+SELECT 1;
+----
+1
+
+query I
+SELECT 1 + 2 * 3;
+----
+7
+
+query I
+SELECT (1 + 2) * 3;
+----
+9
+
+query I
+SELECT 7 / 2;
+----
+3
+
+query I
+SELECT 7 % 3;
+----
+1
+
+query I
+SELECT -5 + 3;
+----
+-2
+
+query T
+SELECT 'hello';
+----
+hello
+
+query T
+SELECT 'a' || 'b' || 'c';
+----
+abc
+
+query T
+SELECT true;
+----
+true
+
+query T
+SELECT 1 < 2;
+----
+true
+
+query T
+SELECT 1 = 2;
+----
+false
+
+query T
+SELECT 2 <> 2;
+----
+false
+
+query T
+SELECT 1 < 2 AND 2 < 3;
+----
+true
+
+query T
+SELECT 1 > 2 OR 2 < 3;
+----
+true
+
+query T
+SELECT NOT (1 = 1);
+----
+false
+
+query T
+SELECT NULL;
+----
+NULL
+
+query T
+SELECT NULL IS NULL;
+----
+true
+
+query T
+SELECT 1 IS NOT NULL;
+----
+true
+
+query I
+SELECT CASE WHEN 1 = 1 THEN 10 ELSE 20 END;
+----
+10
+
+query I
+SELECT CASE WHEN 1 = 2 THEN 10 ELSE 20 END;
+----
+20
+
+query T
+SELECT CASE WHEN 1 = 2 THEN 10 END;
+----
+NULL
+
+query I
+SELECT 3 AS answer;
+----
+3
+
+query II
+SELECT 1, 2;
+----
+1	2
+
+query ITT
+SELECT 1 + 1, 'two', 3 < 4;
+----
+2	two	true
+
+query T
+SELECT 2 BETWEEN 1 AND 3;
+----
+true
+
+query T
+SELECT 5 BETWEEN 1 AND 3;
+----
+false
+
+query T
+SELECT 2 IN (1, 2, 3);
+----
+true
+
+query T
+SELECT 9 IN (1, 2, 3);
+----
+false
+
+query T
+SELECT 9 NOT IN (1, 2, 3);
+----
+true

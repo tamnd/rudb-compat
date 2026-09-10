@@ -1,0 +1,90 @@
+# name: corpus/slt/join.test
+# description: Inner and outer joins, ORDER BY, LIMIT and UNION
+# group: [smoke]
+
+statement ok
+CREATE TABLE people (id INTEGER, name VARCHAR);
+
+statement ok
+INSERT INTO people VALUES (1, 'ann'), (2, 'bob'), (3, 'cat');
+
+statement ok
+CREATE TABLE pets (owner INTEGER, pet VARCHAR);
+
+statement ok
+INSERT INTO pets VALUES (1, 'dog'), (1, 'fish'), (2, 'cat');
+
+query TT
+SELECT name, pet FROM people JOIN pets ON people.id = pets.owner ORDER BY name, pet;
+----
+ann	dog
+ann	fish
+bob	cat
+
+query TT
+SELECT name, pet FROM people LEFT JOIN pets ON people.id = pets.owner ORDER BY name, pet;
+----
+ann	dog
+ann	fish
+bob	cat
+cat	NULL
+
+query I
+SELECT count(*) FROM people, pets;
+----
+9
+
+query T
+SELECT name FROM people ORDER BY name DESC;
+----
+cat
+bob
+ann
+
+query T
+SELECT name FROM people ORDER BY name LIMIT 2;
+----
+ann
+bob
+
+query T
+SELECT name FROM people ORDER BY name LIMIT 2 OFFSET 1;
+----
+bob
+cat
+
+query T
+SELECT name FROM people UNION ALL SELECT pet FROM pets ORDER BY 1;
+----
+ann
+bob
+cat
+cat
+dog
+fish
+
+query T
+SELECT name FROM people UNION SELECT pet FROM pets ORDER BY 1;
+----
+ann
+bob
+cat
+dog
+fish
+
+query T
+SELECT name FROM people INTERSECT SELECT pet FROM pets ORDER BY 1;
+----
+cat
+
+query T
+SELECT name FROM people EXCEPT SELECT pet FROM pets ORDER BY 1;
+----
+ann
+bob
+
+statement ok
+DROP TABLE pets;
+
+statement ok
+DROP TABLE people;

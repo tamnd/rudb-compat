@@ -86,6 +86,51 @@ jobs:
       - name: the harness reports its levels
         run: cargo run -q -- levels
 
+  # The DuckDB sqllogictest corpus, run against rudb on every commit and published on the run
+  # summary. This is the number issue 3 in the engine repository asks for, and it is here rather
+  # than in a nightly job because a conformance number that runs once a night is a number nobody
+  # can attribute to a commit. The whole corpus takes a couple of seconds, so there is no reason
+  # to run it any less often than everything else.
+  #
+  # It does not fail on a low number. rudb is being built and the number is low by construction
+  # until the milestones are done, so a threshold here would mean a red tick every day until the
+  # day it goes green, and a check that is always red is a check nobody reads. What guards against
+  # a fall is the committed corpus under corpus/slt, which cargo test runs and which has to pass
+  # in full. This job publishes and does not gate.
+  conformance:
+    name: duckdb sqllogictest pass rate
+    needs: quick
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+      - name: fetch the corpus
+        run: cargo run --release -q -- vendor | tee vendor.txt
+      - name: run the corpus
+        run: cargo run --release -q -- slt | tee slt.txt
+      - name: publish the pass rate
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## DuckDB sqllogictest"
+            echo
+            echo '```'
+            cat vendor.txt
+            echo '```'
+            echo
+            echo '```'
+            tail -2 slt.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -2 slt.txt
+      - name: keep the failures for reading
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: sqllogictest-failures
+          path: slt.txt
+          retention-days: 14
+
   docs:
     name: documentation
     needs: quick
@@ -98,7 +143,7 @@ jobs:
   ci:
     name: ci
     if: always()
-    needs: [quick, test, docs]
+    needs: [quick, test, conformance, docs]
     runs-on: ubuntu-24.04
     steps:
       - name: fail if anything upstream failed

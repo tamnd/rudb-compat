@@ -1,0 +1,82 @@
+# name: corpus/slt/ddl.test
+# description: CREATE TABLE, INSERT, DROP and the catalog errors around them
+# group: [smoke]
+
+statement ok
+CREATE TABLE t (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+query IT
+SELECT a, b FROM t ORDER BY a;
+----
+1	one
+2	two
+3	three
+
+query I
+SELECT a FROM t WHERE a > 1 ORDER BY a;
+----
+2
+3
+
+query T
+SELECT b FROM t WHERE a = 2;
+----
+two
+
+statement ok
+INSERT INTO t (a) VALUES (4);
+
+query T
+SELECT b FROM t WHERE a = 4;
+----
+NULL
+
+statement ok
+CREATE TABLE u AS SELECT a * 10 AS big FROM t WHERE a <= 2;
+
+query I
+SELECT big FROM u ORDER BY big;
+----
+10
+20
+
+# The same name twice is an error, and the same name twice behind IF NOT EXISTS is not.
+statement error
+CREATE TABLE t (a INTEGER);
+----
+already exists
+
+statement ok
+CREATE TABLE IF NOT EXISTS t (a INTEGER);
+
+statement error
+SELECT * FROM does_not_exist;
+----
+does not exist
+
+statement error
+INSERT INTO t VALUES (1, 'one', 'extra');
+----
+has 2 columns but 3 values were supplied
+
+statement ok
+DROP TABLE u;
+
+statement error
+SELECT * FROM u;
+----
+does not exist
+
+statement ok
+DROP TABLE IF EXISTS u;
+
+statement error
+DROP TABLE u;
+----
+does not exist
+
+statement ok
+DROP TABLE t;
