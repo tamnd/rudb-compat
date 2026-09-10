@@ -2,9 +2,9 @@
 #
 # This repository is a harness rather than a library, so the matrix is smaller than the engine's:
 # what matters is that it builds and runs where someone would run it, which is Linux for the
-# nightly sweeps and macOS for a laptop. The differential jobs that need a real DuckDB and a real
-# rudb build arrive with M2, and they are not listed yet because a job that is red because the
-# thing it calls does not exist teaches everyone to ignore a red run.
+# nightly sweeps and macOS for a laptop. Both legs install a real DuckDB of a named version before
+# the tests, because the differential tests skip when there is not one and a suite that silently
+# skips its only interesting test is worse than no suite.
 #
 # Actions are pinned to a patch version rather than a major tag, so a run can be reproduced.
 
@@ -28,6 +28,11 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
+  # The newest released DuckDB. rudb vendors its grammar from the v2.0 development ref, which has
+  # no published binary, so this is the closest real thing there is and the harness says as much on
+  # every run. Written down here rather than resolved to latest, because a compatibility number
+  # whose other side moved on its own is not a measurement.
+  DUCKDB_VERSION: v1.5.5
 
 jobs:
   quick:
@@ -52,8 +57,30 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: Swatinem/rust-cache@v2.9.2
+      - name: install duckdb
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            Linux) asset=duckdb_cli-linux-amd64.zip ;;
+            macOS) asset=duckdb_cli-osx-universal.zip ;;
+            *) echo "no duckdb build wired up for ${{ runner.os }}" >&2; exit 1 ;;
+          esac
+          url=https://github.com/duckdb/duckdb/releases/download/$DUCKDB_VERSION/$asset
+          curl -fsSL --retry 3 -o duckdb.zip "$url"
+          unzip -q duckdb.zip -d "$RUNNER_TEMP/duckdb"
+          chmod +x "$RUNNER_TEMP/duckdb/duckdb"
+          echo "RUDB_COMPAT_DUCKDB=$RUNNER_TEMP/duckdb/duckdb" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/duckdb/duckdb" -version
       - name: cargo test
         run: cargo test --all-features
+      # The tests skip when there is no DuckDB, so passing tests alone do not prove the differential
+      # path ran. This step fails outright when the binary is missing, and it prints which one CI
+      # measured against, which is the thing every number in a report has to be read next to.
+      - name: the harness found the duckdb it was given
+        run: cargo run -q -- duckdb
+      - name: the m0 corpus still parses the same on both engines
+        run: cargo run -q -- parse corpus/m0.sql
       # The prose rules are checked by a test, so this is covered above. What is not covered above
       # is that the command line still answers, which is the whole of what this binary does today.
       - name: the harness reports its levels

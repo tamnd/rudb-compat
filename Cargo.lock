@@ -3,5 +3,22 @@
 version = 4
 
 [[package]]
+name = "rudb-common"
+version = "0.0.2"
+source = "git+https://github.com/tamnd/rudb?branch=main#6138d9b0b270bcb0ee143f48588a8eef5ae0d70e"
+
+[[package]]
 name = "rudb-compat"
 version = "0.1.0"
+dependencies = [
+ "rudb-common",
+ "rudb-parse",
+]
+
+[[package]]
+name = "rudb-parse"
+version = "0.0.2"
+source = "git+https://github.com/tamnd/rudb?branch=main#6138d9b0b270bcb0ee143f48588a8eef5ae0d70e"
+dependencies = [
+ "rudb-common",
+]
