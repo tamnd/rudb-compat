@@ -1,0 +1,83 @@
+#!/bin/sh
+# Run the gate somewhere that is not this machine, and skip it when nothing it checks changed.
+#
+# The development laptop is a 460 GB disk that sits above ninety percent full, and this crate
+# builds all of rudb as a git dependency, so its target directory is the whole workspace again.
+# The gate rsyncs the working tree to a Linux box and runs there, the same way tamnd/rudb does it.
+#
+#   scripts/gate              the gate on server3
+#   scripts/gate server1      the same, on the box with the data on it
+#   scripts/gate --update     refresh the rudb pin first, which is what a merge in rudb needs
+#
+# The pin matters. Cargo.toml points at a branch of tamnd/rudb, and a branch dependency is locked
+# in Cargo.lock like any other, so a merge over in rudb changes nothing here until the lock moves.
+# That is why --update exists and why it is not the default: an unasked-for pin bump turns a green
+# gate into a measurement of somebody else's commit.
+#
+# This crate is one package, so there is no crate graph to narrow against. The narrowing worth
+# having is a change that is nothing but markdown, which needs the prose test and no compiler.
+# A skipped check announces itself, every time.
+set -e
+
+host=server3
+update=no
+while :; do
+  case "$1" in
+    server1 | server2 | server3 | gamingpc) host=$1; shift ;;
+    --update) update=yes; shift ;;
+    *) break ;;
+  esac
+done
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+name=$(basename "$root")
+remote="gate/$name"
+
+base=$(git -C "$root" merge-base origin/main HEAD 2>/dev/null || git -C "$root" rev-parse HEAD~1 2>/dev/null || true)
+if [ "$base" = "$(git -C "$root" rev-parse HEAD 2>/dev/null)" ]; then
+  base=$(git -C "$root" rev-parse HEAD~1 2>/dev/null || true)
+fi
+changed=""
+if [ -n "$base" ]; then
+  changed=$(
+    { git -C "$root" diff --name-only "$base...HEAD"
+      git -C "$root" status --porcelain --untracked-files=all | cut -c4- | sed 's/.* -> //'
+    } | sort -u | grep -v '^$' || true
+  )
+fi
+
+code=yes
+if [ "$update" = no ] && [ -n "$base" ] && [ -n "$changed" ] && ! echo "$changed" | grep -qv '\.md$'; then
+  code=no
+fi
+
+rsync -a --delete \
+  --exclude '/target' \
+  --rsync-path "mkdir -p ~/$remote && rsync" \
+  "$root/" "$host:$remote/"
+
+if [ "$code" = no ]; then
+  echo "only markdown changed, running the prose test and skipping the compiler"
+  # shellcheck disable=SC2029
+  ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && cargo test --test style $*"
+  exit 0
+fi
+
+pin=""
+if [ "$update" = yes ]; then
+  pin="cargo update -p rudb -p rudb-common -p rudb-parse && "
+  echo "refreshing the rudb pin before the gate, so the pass rate is of today's rudb"
+fi
+
+# shellcheck disable=SC2029
+ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && ${pin}\
+  cargo fmt --all --check && \
+  cargo clippy --all-targets --all-features -- -D warnings && \
+  cargo test --all-features && \
+  rustup run 1.85.0 cargo check --all-targets $*"
+
+if [ "$update" = yes ]; then
+  echo "copying the refreshed Cargo.lock back, it is the record of what was measured"
+  rsync -a "$host:$remote/Cargo.lock" "$root/Cargo.lock"
+fi
+echo "everything the gate runs is green"
