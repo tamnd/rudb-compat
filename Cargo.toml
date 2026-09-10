@@ -14,6 +14,7 @@ publish = false
 # rudb is not published in a usable state yet, so this tracks the branch and the lock file pins
 # the commit. That is the right way round for a harness: it should follow the engine, and a run
 # should still say exactly which engine it followed.
+rudb = { git = "https://github.com/tamnd/rudb", branch = "main" }
 rudb-common = { git = "https://github.com/tamnd/rudb", branch = "main" }
 rudb-parse = { git = "https://github.com/tamnd/rudb", branch = "main" }
 

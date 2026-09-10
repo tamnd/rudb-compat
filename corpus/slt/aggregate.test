@@ -1,0 +1,80 @@
+# name: corpus/slt/aggregate.test
+# description: COUNT, SUM, MIN, MAX, AVG, GROUP BY, HAVING and DISTINCT
+# group: [smoke]
+
+statement ok
+CREATE TABLE sales (region VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO sales VALUES ('north', 10), ('north', 20), ('south', 5), ('south', 15), ('east', 100);
+
+query I
+SELECT count(*) FROM sales;
+----
+5
+
+query I
+SELECT sum(amount) FROM sales;
+----
+150
+
+query I
+SELECT min(amount) FROM sales;
+----
+5
+
+query I
+SELECT max(amount) FROM sales;
+----
+100
+
+query I
+SELECT count(*) FROM sales WHERE amount > 10;
+----
+3
+
+query TI
+SELECT region, sum(amount) FROM sales GROUP BY region ORDER BY region;
+----
+east	100
+north	30
+south	20
+
+query TI
+SELECT region, count(*) FROM sales GROUP BY region ORDER BY region;
+----
+east	1
+north	2
+south	2
+
+query T
+SELECT region FROM sales GROUP BY region HAVING sum(amount) > 25 ORDER BY region;
+----
+east
+north
+
+query T
+SELECT DISTINCT region FROM sales ORDER BY region;
+----
+east
+north
+south
+
+query I
+SELECT count(*) FROM (SELECT DISTINCT region FROM sales);
+----
+3
+
+# An aggregate over nothing counts zero rows and sums to null, which are different answers.
+query I
+SELECT count(*) FROM sales WHERE amount > 1000;
+----
+0
+
+query T
+SELECT sum(amount) FROM sales WHERE amount > 1000;
+----
+NULL
+
+statement ok
+DROP TABLE sales;

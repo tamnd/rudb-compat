@@ -76,10 +76,10 @@ fn a_query_and_a_statement_that_is_not_sql_both_reach_the_full_comparison() {
     let report = rudb_compat::suite::run(&mut duckdb, &mut rudb, &cases, MessageMatch::Kind)
         .expect("both engines should answer");
 
-    // rudb has no executor, so the first case is a difference and the second is not. That is the
-    // honest state of the project and it is what makes this test worth having now: the loop, the
-    // comparison and the report are all exercised, and the day there is an executor the first
-    // assertion is the one that changes.
-    assert!(!report.cases[0].agreed(), "rudb cannot return a row yet");
+    // Both agree now. The first case used to be a difference because rudb had no executor, and it
+    // is the one line in this file that had to change the day one arrived. Two engines returning
+    // the same one row with the same name and the same type is the smallest complete pass through
+    // the loop, the comparison and the report, which is what this test is for.
+    assert!(report.cases[0].agreed(), "{:?}", report.cases[0].differences);
     assert!(report.cases[1].agreed(), "both engines reject the same non SQL");
 }

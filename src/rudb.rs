@@ -1,26 +1,29 @@
 //! rudb, as an engine the harness can point at.
 //!
-//! rudb cannot run a query yet. That is not a reason to leave this side of the harness unwritten,
-//! because there is one thing it can already answer and it is the thing the compatibility claim
-//! rests on hardest: whether a piece of text is SQL. `rudb-parse` has a tokenizer, a rule table
-//! generated from DuckDB's own grammar, a matcher and a transformer, so every statement in a
-//! corpus can be put to both engines and the two answers compared today.
+//! This used to answer only one question, whether a piece of text is SQL, because that was the
+//! only one rudb could answer. It runs queries now, so this drives [`rudb::Database`] and hands
+//! back real rows, and the parse only path stays because the two questions are still different.
+//! A statement that fails to parse and a statement that returns the wrong answer are different
+//! bugs, and one number covering both hides both.
 //!
-//! That comparison already earns its keep. Three claims in the rudb specification about the
-//! dialect turned out to be wrong and each was found by reading DuckDB's source rather than by
-//! running it, which is exactly the method this harness exists to replace.
+//! The database is held across statements. A corpus that creates a table and then selects from it
+//! needs that, and it is also what makes [`Engine::reset`] necessary: a `.test` file expects to
+//! start from an empty database, and one file leaving a table behind for the next one is a pass
+//! that means nothing.
 
-use rudb_common::{Error, ErrorCode};
+use rudb::Database;
+use rudb_common::{Error, ErrorCode, LogicalType, Value};
 use rudb_parse::ast::Statement;
 use rudb_parse::{parse_ast, tokenize};
 
 use crate::compare::Ordering;
-use crate::engine::{Acceptance, Engine, EngineError, HarnessError, Outcome};
+use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
 
-/// The rudb build this harness was linked against.
-#[derive(Debug, Clone)]
+/// The rudb build this harness was linked against, and the database it is talking to.
+#[derive(Debug)]
 pub struct Rudb {
     version: String,
+    database: Database,
 }
 
 impl Default for Rudb {
@@ -30,18 +33,23 @@ impl Default for Rudb {
 }
 
 impl Rudb {
-    /// The rudb this crate is built against.
+    /// The rudb this crate is built against, with an empty database.
     #[must_use]
     pub fn new() -> Self {
-        Self { version: format!("rudb-parse {}", rudb_parse_version()) }
+        Self { version: format!("rudb {}", rudb_version()), database: Database::new() }
+    }
+
+    /// The database, for a caller that wants to look at the catalog after a run.
+    #[must_use]
+    pub fn database(&self) -> &Database {
+        &self.database
     }
 }
 
-/// What version of the parser crate we linked, which is the version of rudb we are testing.
-fn rudb_parse_version() -> &'static str {
-    // There is no `rudb` to ask yet, so the version comes from the one crate that does work. When
-    // the embedding API arrives this asks that instead, and the string in every report changes
-    // from naming a crate to naming a database.
+/// What version of rudb we linked, which is the version being tested.
+fn rudb_version() -> &'static str {
+    // Set by CI from the commit that was built. A local run says `from git`, which is honest: the
+    // lock file says which commit and the report says to go and look at it.
     option_env!("RUDB_VERSION").unwrap_or("from git")
 }
 
@@ -55,11 +63,8 @@ impl Engine for Rudb {
     }
 
     fn run(&mut self, sql: &str) -> Result<Outcome, HarnessError> {
-        match parse_ast(sql) {
-            Ok(_) => Ok(Outcome::Error(EngineError {
-                kind: ErrorCode::NotImplemented.duckdb_name().to_owned(),
-                message: "rudb parses this and cannot run it yet".to_owned(),
-            })),
+        match self.database.execute(sql) {
+            Ok(result) => Ok(Outcome::Rows(table(&result))),
             Err(e) => Ok(Outcome::Error(engine_error(&e))),
         }
     }
@@ -74,6 +79,42 @@ impl Engine for Rudb {
             Err(e) => Acceptance::Rejected(engine_error(&e)),
         })
     }
+
+    fn reset(&mut self) -> Result<(), HarnessError> {
+        self.database = Database::new();
+        Ok(())
+    }
+}
+
+/// Turn a rudb result into the table the comparison reads.
+///
+/// Values go across as the text rudb printed, for the reason [`Cell`] gives: the printed form is
+/// itself part of what has to match DuckDB, so comparing text catches a printing difference that
+/// comparing decoded values would let through.
+fn table(result: &rudb::QueryResult) -> Table {
+    let columns = result
+        .names()
+        .iter()
+        .zip(result.types())
+        .map(|(name, ty)| Column { name: name.clone(), ty: type_name(ty) })
+        .collect();
+    let rows = result
+        .rows()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| match value {
+                    Value::Null => Cell::Null,
+                    other => Cell::Text(other.to_string()),
+                })
+                .collect()
+        })
+        .collect();
+    Table { columns, rows }
+}
+
+/// A logical type, spelled the way DuckDB spells it in `DESCRIBE`.
+fn type_name(ty: &LogicalType) -> String {
+    ty.to_string()
 }
 
 /// Turn a rudb error into the form the comparison reads.
@@ -83,6 +124,15 @@ impl Engine for Rudb {
 /// through text would mean parsing back out something we have in hand.
 fn engine_error(error: &Error) -> EngineError {
     EngineError { kind: error.code().duckdb_name().to_owned(), message: error.message().to_owned() }
+}
+
+/// The error a statement rudb cannot run yet produces, for a caller that wants to recognize one.
+///
+/// Worth having a name for. A run against the corpus is mostly this today, and telling it apart
+/// from a wrong answer is the difference between a list of things to build and a list of bugs.
+#[must_use]
+pub fn is_not_implemented(error: &EngineError) -> bool {
+    error.kind == ErrorCode::NotImplemented.duckdb_name()
 }
 
 /// Whether the query fixes its own row order.
@@ -101,10 +151,13 @@ fn engine_error(error: &Error) -> EngineError {
 #[must_use]
 pub fn ordering_of(sql: &str) -> Ordering {
     if let Ok(ast) = parse_ast(sql) {
-        let ordered = ast.statements.iter().any(|statement| {
-            let Statement::Query(at) = statement;
-            let query = ast.query(*at);
-            query.order_by_all || !query.order_by.is_empty()
+        let ordered = ast.statements.iter().any(|statement| match statement {
+            Statement::Query(at) => {
+                let query = ast.query(*at);
+                query.order_by_all || !query.order_by.is_empty()
+            }
+            // Nothing else returns rows, so nothing else has an order to preserve.
+            _ => false,
         });
         return if ordered { Ordering::AsWritten } else { Ordering::Sorted };
     }
@@ -123,7 +176,7 @@ pub fn ordering_of(sql: &str) -> Ordering {
 mod tests {
     use super::{Rudb, ordering_of};
     use crate::compare::Ordering;
-    use crate::engine::{Engine, Outcome};
+    use crate::engine::{Cell, Engine, Outcome};
 
     #[test]
     fn text_that_is_not_sql_gets_duckdbs_own_error_kind() {
@@ -135,12 +188,52 @@ mod tests {
     }
 
     #[test]
-    fn text_that_is_sql_says_so_and_says_it_cannot_run_it() {
+    fn a_query_comes_back_as_rows_with_the_names_and_types_rudb_gave_them() {
         let mut rudb = Rudb::new();
-        let Outcome::Error(e) = rudb.run("SELECT 1").unwrap() else {
-            panic!("nothing here can return rows yet");
+        let Outcome::Rows(table) = rudb.run("SELECT 1 AS a, 'x' AS b").unwrap() else {
+            panic!("that is a query");
         };
-        assert_eq!(e.kind, "Not implemented Error");
+        assert_eq!(table.width(), 2);
+        assert_eq!(table.height(), 1);
+        assert_eq!(table.columns[0].name, "a");
+        assert_eq!(table.columns[0].ty, "INTEGER");
+        assert_eq!(table.rows[0][1], Cell::Text("x".to_owned()));
+    }
+
+    #[test]
+    fn a_null_comes_back_as_a_null_and_not_as_the_text_of_one() {
+        let mut rudb = Rudb::new();
+        let Outcome::Rows(table) = rudb.run("SELECT NULL").unwrap() else {
+            panic!("that is a query");
+        };
+        assert_eq!(table.rows[0][0], Cell::Null);
+    }
+
+    #[test]
+    fn the_database_is_held_across_statements_so_a_table_survives_until_it_is_reset() {
+        let mut rudb = Rudb::new();
+        assert!(rudb.run("CREATE TABLE t (a INTEGER)").unwrap().is_rows());
+        assert!(rudb.run("INSERT INTO t VALUES (1)").unwrap().is_rows());
+        let Outcome::Rows(table) = rudb.run("SELECT a FROM t").unwrap() else {
+            panic!("that is a query");
+        };
+        assert_eq!(table.height(), 1);
+
+        rudb.reset().unwrap();
+        let Outcome::Error(e) = rudb.run("SELECT a FROM t").unwrap() else {
+            panic!("the table is gone");
+        };
+        assert_eq!(e.kind, "Catalog Error");
+    }
+
+    #[test]
+    fn a_statement_that_writes_returns_no_columns_rather_than_a_count() {
+        let mut rudb = Rudb::new();
+        rudb.run("CREATE TABLE t (a INTEGER)").unwrap();
+        let Outcome::Rows(table) = rudb.run("INSERT INTO t VALUES (1)").unwrap() else {
+            panic!("an insert is not an error");
+        };
+        assert_eq!(table.width(), 0);
     }
 
     #[test]
@@ -157,10 +250,7 @@ mod tests {
 
     #[test]
     fn the_word_order_in_a_string_is_not_an_order_by() {
-        // This one has to go through the fallback to be worth anything, so it is deliberately
-        // something the transformer does not handle yet. When it does, the AST answers it and the
-        // answer is the same.
-        assert_eq!(ordering_of("VALUES ('order by x')"), Ordering::Sorted);
+        assert_eq!(ordering_of("SELECT 'order by x'"), Ordering::Sorted);
     }
 
     #[test]

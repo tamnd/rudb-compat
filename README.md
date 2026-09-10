@@ -10,9 +10,19 @@ The design is [`spec/14-rudb-compat.md`](https://github.com/tamnd/rudb/blob/main
 
 ## Status
 
-Early, and running. rudb cannot execute a query yet, so no level has a coverage number against it. What does work today is the differential loop itself, pointed at the one question rudb can already answer: whether a piece of text is SQL.
+Early, and running. rudb executes queries now, so there is a conformance number, and it is small.
 
-That question is not a consolation prize. rudb vendors DuckDB's PEG grammar and generates its rule table from it, precisely so that the dialect cannot drift, and this is the check that the vendoring worked. Every statement in a corpus goes to both engines and the two answers are compared.
+```
+$ rudb-compat slt
+4084 files, 11494 passed, 53017 failed, which is 17.8 percent of what was attempted
+14306 skipped, of which 13391 the file turned off, 0 in a skipped section and 915 behind a directive the runner does not implement
+```
+
+That is DuckDB's own `sqllogictest` corpus at `v2.0-cyanoptera`, every `.test` file under `test/sql`, run against rudb on every commit and published on the run summary. The M2 exit criterion is above 60 percent, so the distance between those two numbers is the work list for the milestone. The skips are printed on the line underneath rather than folded into the percentage, because a record the file itself turned off with `skipif` and a record behind a directive this runner does not implement mean completely different things and neither of them is a pass.
+
+This half of the harness needs no DuckDB on the machine. A `.test` file already carries what every statement is supposed to produce, which is what makes it something CI can run on every commit in a second and a half rather than a nightly job whose result nobody can attribute to a commit. The corpus is fetched rather than committed, by `rudb-compat vendor`, into `target/corpus` at the pinned ref.
+
+The other half is the differential loop, which does need a binary, and which is pointed at the question the vendored grammar exists to answer: whether a piece of text is SQL. rudb vendors DuckDB's PEG grammar and generates its rule table from it, precisely so that the dialect cannot drift, and this is the check that the vendoring worked. Every statement in a corpus goes to both engines and the two answers are compared.
 
 ```
 $ rudb-compat parse corpus/m0.sql
@@ -21,7 +31,7 @@ $ rudb-compat parse corpus/m0.sql
 
 Errors are compared too, by error kind, so a statement both engines reject counts as agreement only when they reject it as the same kind of error. `--strict-messages` tightens that to the first line of the message.
 
-The full path is there behind `run` rather than `parse`: two engines, full result sets, column names and types, and a per-statement ordering rule that comes from rudb's own AST. It is honest about where it stands. `rudb-compat query 'SELECT 1'` reports the difference that rudb has no executor, and the day it has one that report is what changes.
+The full path is there behind `run` rather than `parse`: two engines, full result sets, column names and types, and a per-statement ordering rule that comes from rudb's own AST. `rudb-compat query 'SELECT 1'` runs one statement on both and prints what differs.
 
 The DuckDB side is a real binary of a named version, found on `PATH` or named by `RUDB_COMPAT_DUCKDB`. `rudb-compat duckdb` prints which one it found and whether it matches the version rudb tracks.
 
@@ -68,7 +78,9 @@ The weighting matters. A function nobody calls and a function in the top hundred
 
 Five sources, in increasing order of how much they find.
 
-DuckDB's own `sqllogictest` corpus, which is tens of thousands of queries with expected results written by the people who know where the edges are. Running it is the highest-value first step and it is what M2 does.
+DuckDB's own `sqllogictest` corpus, which is tens of thousands of queries with expected results written by the people who know where the edges are. Running it is the highest-value first step and it is the one thing here that is already wired up, under `rudb-compat slt`.
+
+There is a second, much smaller corpus under `corpus/slt`, which is ours rather than upstream's, written in the same format, and which covers what rudb is supposed to be able to do today. `cargo test` runs it and every record in it has to pass. The upstream corpus is a measurement that goes up over the milestones and the committed one is a gate that is never allowed to go down, and confusing the two is how a conformance number ends up meaning nothing.
 
 The benchmark suites, which are modest in count and exercise real plan shapes.
 
