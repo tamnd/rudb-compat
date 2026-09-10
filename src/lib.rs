@@ -30,6 +30,7 @@ pub mod csv;
 pub mod duckdb;
 pub mod engine;
 pub mod hash;
+pub mod isolate;
 pub mod rudb;
 pub mod slt;
 pub mod suite;

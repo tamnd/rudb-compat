@@ -550,6 +550,22 @@ fn chunk(values: &[String], width: usize) -> Vec<Vec<String>> {
 }
 
 /// Every `.test` file under a path, or the path itself when it is a file.
+/// Every test file under a path, in a stable order.
+///
+/// Public because the isolating runner in [`crate::isolate`] walks the corpus itself and then
+/// hands the files out one at a time to child processes, so it needs the same list this module
+/// would have built and it needs it before anything runs.
+///
+/// # Errors
+///
+/// When a directory cannot be read.
+pub fn files(path: &Path, slow: bool) -> Result<Vec<PathBuf>, HarnessError> {
+    let mut out = Vec::new();
+    collect(path, slow, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
 fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), HarnessError> {
     if path.is_file() {
         out.push(path.to_path_buf());

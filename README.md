@@ -14,13 +14,16 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4084 files, 11494 passed, 53017 failed, which is 17.8 percent of what was attempted
+4084 files, 12803 passed, 51427 failed, which is 19.9 percent of what was attempted
 14306 skipped, of which 13391 the file turned off, 0 in a skipped section and 915 behind a directive the runner does not implement
+7 files were cut off and are counted in neither column, which is listed above
 ```
 
 That is DuckDB's own `sqllogictest` corpus at `v2.0-cyanoptera`, every `.test` file under `test/sql`, run against rudb on every commit and published on the run summary. The M2 exit criterion is above 60 percent, so the distance between those two numbers is the work list for the milestone. The skips are printed on the line underneath rather than folded into the percentage, because a record the file itself turned off with `skipif` and a record behind a directive this runner does not implement mean completely different things and neither of them is a pass.
 
-This half of the harness needs no DuckDB on the machine. A `.test` file already carries what every statement is supposed to produce, which is what makes it something CI can run on every commit in a second and a half rather than a nightly job whose result nobody can attribute to a commit. The corpus is fetched rather than committed, by `rudb-compat vendor`, into `target/corpus` at the pinned ref.
+Each file gets a process of its own, with ten seconds and two gigabytes on it. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that DuckDB stops with a memory manager and a timeout that rudb does not have yet. Run in one process, a single one of those takes the whole run with it and CI publishes nothing at all. A file that goes over either limit is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for.
+
+This half of the harness needs no DuckDB on the machine. A `.test` file already carries what every statement is supposed to produce, which is what makes it something CI can run on every commit in fourteen seconds rather than a nightly job whose result nobody can attribute to a commit. The corpus is fetched rather than committed, by `rudb-compat vendor`, into `target/corpus` at the pinned ref.
 
 The other half is the differential loop, which does need a binary, and which is pointed at the question the vendored grammar exists to answer: whether a piece of text is SQL. rudb vendors DuckDB's PEG grammar and generates its rule table from it, precisely so that the dialect cannot drift, and this is the check that the vendoring worked. Every statement in a corpus goes to both engines and the two answers are compared.
 

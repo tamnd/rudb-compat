@@ -1,0 +1,160 @@
+# name: corpus/slt/table_function.test
+# description: range and generate_series, the two table functions
+# group: [smoke]
+
+query I
+SELECT * FROM range(3);
+----
+0
+1
+2
+
+# The only difference between the two is whether the last value comes out.
+query I
+SELECT * FROM generate_series(3);
+----
+0
+1
+2
+3
+
+query I
+SELECT * FROM range(2, 5);
+----
+2
+3
+4
+
+# A step that does not divide the span stops before the end of it, in both functions.
+query I
+SELECT * FROM range(2, 7, 2);
+----
+2
+4
+6
+
+query I
+SELECT * FROM generate_series(2, 7, 2);
+----
+2
+4
+6
+
+query I
+SELECT * FROM range(5, 1, -2);
+----
+5
+3
+
+query I
+SELECT * FROM generate_series(5, 1, -2);
+----
+5
+3
+1
+
+# A step going the wrong way is nothing, not an error and not a run that never ends.
+query I
+SELECT count(*) FROM range(5, 2);
+----
+0
+
+query I
+SELECT count(*) FROM range(0, 10, -1);
+----
+0
+
+# A null anywhere in the arguments is nothing as well, which is also not an error.
+query I
+SELECT count(*) FROM range(NULL);
+----
+0
+
+# A step of zero is the one call that is an error rather than an empty result.
+statement error
+SELECT * FROM range(1, 5, 0);
+----
+interval cannot be 0
+
+# The column is named after the function until it is aliased.
+query I
+SELECT range FROM range(2);
+----
+0
+1
+
+query I
+SELECT i FROM range(2) t(i);
+----
+0
+1
+
+query I
+SELECT t.generate_series FROM generate_series(1, 2) t;
+----
+1
+2
+
+# It is a source, so everything that works on a table works on it.
+query I
+SELECT sum(i) FROM range(1, 5) t(i);
+----
+10
+
+query I
+SELECT count(*) FROM range(3) a, range(4) b;
+----
+12
+
+query I
+SELECT i FROM range(10) t(i) WHERE i % 3 = 0 ORDER BY i DESC;
+----
+9
+6
+3
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM range(5) UNION ALL SELECT * FROM range(5));
+----
+10
+
+# The arguments are expressions and they are evaluated, not read as literals.
+query I
+SELECT count(*) FROM range(1 + 2);
+----
+3
+
+# A run wider than one chunk comes out whole and in order.
+query III
+SELECT count(*), min(i), max(i) FROM range(5000) t(i);
+----
+5000	0	4999
+
+# A name that is not a table function says so rather than being looked up as a table.
+statement error
+SELECT * FROM no_such_function(1);
+----
+does not exist
+
+statement error
+SELECT * FROM range();
+----
+takes between 1 and 3 arguments
+
+statement error
+SELECT * FROM range(1, 2, 3, 4);
+----
+takes between 1 and 3 arguments
+
+# A table function is fine as the source of a CREATE TABLE AS.
+statement ok
+CREATE TABLE numbers AS SELECT i FROM range(4) t(i);
+
+query I
+SELECT sum(i) FROM numbers;
+----
+6
+
+statement ok
+DROP TABLE numbers;
