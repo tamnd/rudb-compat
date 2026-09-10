@@ -9,12 +9,14 @@
 use std::process::ExitCode;
 
 use std::path::Path;
+use std::time::Duration;
 
 use rudb_compat::Level;
 use rudb_compat::compare::MessageMatch;
-use rudb_compat::conform::Summary;
+use rudb_compat::conform::{Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED};
 use rudb_compat::engine::{Engine, HarnessError};
+use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::suite::{Report, run, run_parse, statements};
 
@@ -25,11 +27,13 @@ fn main() -> ExitCode {
     let strict = args.iter().any(|a| a == "--strict-messages");
     let slow = args.iter().any(|a| a == "--slow");
     let refresh = args.iter().any(|a| a == "--refresh");
-    let rest: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with("--strict") && *a != "--slow" && *a != "--refresh")
-        .collect();
+    let default = Limits::default();
+    let limits = Limits {
+        time: valued(&args, "--limit").map_or(default.time, Duration::from_secs),
+        memory: valued(&args, "--memory")
+            .map_or(default.memory, |mb| mb.saturating_mul(1024 * 1024)),
+    };
+    let rest = positional(&args);
     let messages = if strict { MessageMatch::Headline } else { MessageMatch::Kind };
 
     match rest.first().copied() {
@@ -63,7 +67,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("slt") => slt(rest.get(1).copied(), slow, refresh),
+        Some("slt") => slt(rest.get(1).copied(), slow, refresh, limits),
+        // Not in the help. This is the harness re-running itself for one file, which is how the
+        // corpus run survives a query that does not stop, and running it by hand is only ever
+        // debugging the runner rather than debugging the engine.
+        Some("slt-one") => match (rest.get(1), rest.get(2)) {
+            (Some(path), Some(name)) => one_file(Path::new(path), name),
+            _ => {
+                eprintln!("rudb-compat: slt-one needs a file and the name to report it under");
+                ExitCode::FAILURE
+            }
+        },
         Some("vendor") => fetch(refresh),
         Some("reduce" | "report") => {
             eprintln!("rudb-compat: not built yet, see spec/14-rudb-compat.md in tamnd/rudb");
@@ -79,6 +93,53 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The flags that take a number, in either the `--flag 30` or the `--flag=30` spelling.
+///
+/// A flag that is there with something after it that is not a number reads as absent rather than
+/// as an error, which is the same thing the rest of this command line does with an argument it did
+/// not expect.
+fn valued(args: &[String], flag: &str) -> Option<u64> {
+    for (at, arg) in args.iter().enumerate() {
+        if let Some(rest) = arg.strip_prefix(flag) {
+            if let Some(number) = rest.strip_prefix('=') {
+                return number.parse().ok();
+            }
+            if rest.is_empty() {
+                return args.get(at + 1).and_then(|next| next.parse().ok());
+            }
+        }
+    }
+    None
+}
+
+/// Everything on the command line except the options this file has already read.
+///
+/// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
+/// the arm that says it is not a flag rather than being quietly dropped here.
+fn positional(args: &[String]) -> Vec<&str> {
+    const VALUED: [&str; 2] = ["--limit", "--memory"];
+    const PLAIN: [&str; 3] = ["--strict-messages", "--slow", "--refresh"];
+    let mut out = Vec::new();
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if VALUED.contains(&arg.as_str()) {
+            skip = true;
+            continue;
+        }
+        if PLAIN.contains(&arg.as_str())
+            || VALUED.iter().any(|flag| arg.starts_with(&format!("{flag}=")))
+        {
+            continue;
+        }
+        out.push(arg.as_str());
+    }
+    out
 }
 
 /// Say which DuckDB is on the machine and whether it is the one this project tracks.
@@ -198,20 +259,53 @@ fn verdict(report: &Report) -> ExitCode {
 }
 
 /// Run the sqllogictest corpus, either a path that was given or the upstream one.
-fn slt(path: Option<&str>, slow: bool, refresh: bool) -> ExitCode {
+fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCode {
     match path {
-        Some(path) => corpus(Path::new(path), slow),
+        Some(path) => corpus(Path::new(path), slow, limits),
         // No path means the upstream corpus, fetched if it is not already there. That is the run
         // CI does and it is the number the project publishes, so it is the one that takes no
         // argument. Pointing it at a directory is for narrowing down a failure by hand.
         None => match rudb_compat::vendor::corpus(Path::new(root()), refresh) {
-            Ok(dir) => corpus(&dir, slow),
+            Ok(dir) => corpus(&dir, slow, limits),
             Err(e) => {
                 eprintln!("rudb-compat: {e}");
                 ExitCode::FAILURE
             }
         },
     }
+}
+
+/// Run one file and print what happened in the form the parent process reads back.
+///
+/// This is the other side of [`rudb_compat::isolate`]. It exits zero whatever the file did, so that
+/// a nonzero exit means the process itself came apart and not that a test failed.
+fn one_file(path: &Path, name: &str) -> ExitCode {
+    // Read here rather than letting the runner walk to it, so the file is reported under the name
+    // the parent gave it, which is its path inside the corpus and not its basename.
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("rudb-compat: cannot read {}: {e}", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut rudb = Rudb::new();
+    let summary = match String::from_utf8(bytes) {
+        Ok(text) => match rudb_compat::conform::run_text(&mut rudb, name, &text) {
+            Ok(summary) => summary,
+            Err(e) => {
+                eprintln!("rudb-compat: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(_) => Summary {
+            files: 1,
+            skipped_files: vec![(name.to_owned(), Skipped::NotText)],
+            ..Summary::default()
+        },
+    };
+    print!("{}", rudb_compat::isolate::encode(&summary));
+    ExitCode::SUCCESS
 }
 
 /// Fetch the corpus and say where it went.
@@ -265,16 +359,22 @@ const fn root() -> &'static str {
 /// deliberate. The corpus is thousands of statements against a database that is being built, so a
 /// nonzero exit would mean the job is red every day until the day it is finished and nobody would
 /// read it. What CI watches is the number going down, and the number is what this prints.
-fn corpus(path: &Path, slow: bool) -> ExitCode {
-    let mut rudb = Rudb::new();
-    let summary = match rudb_compat::conform::run_path(&mut rudb, path, slow) {
-        Ok(summary) => summary,
+fn corpus(path: &Path, slow: bool, limits: Limits) -> ExitCode {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("rudb-compat: cannot find this binary to re-run it: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let total = match rudb_compat::isolate::run_corpus(&exe, path, slow, limits) {
+        Ok(total) => total,
         Err(e) => {
             eprintln!("rudb-compat: {e}");
             return ExitCode::FAILURE;
         }
     };
-    print_corpus(&rudb, &summary);
+    print_corpus(&Rudb::new(), &total);
     ExitCode::SUCCESS
 }
 
@@ -282,27 +382,40 @@ fn corpus(path: &Path, slow: bool) -> ExitCode {
 ///
 /// Every failure in full, then the counts. The failures come first because a report whose useful
 /// part is above the fold is a report people read.
-fn print_corpus(engine: &Rudb, summary: &Summary) {
+fn print_corpus(engine: &Rudb, total: &Isolated) {
     println!("engine  {} {}", engine.name(), engine.version());
     println!();
-    for failure in &summary.failures {
+    for failure in &total.failures {
         println!("{failure}");
     }
-    if !summary.skipped_files.is_empty() {
+    if !total.skipped_files.is_empty() {
         println!("files not run");
-        for (name, why) in &summary.skipped_files {
+        for (name, why) in &total.skipped_files {
+            println!("    {name}: {why}");
+        }
+        println!();
+    }
+    if !total.stopped.is_empty() {
+        println!("files that were cut off");
+        for (name, why) in &total.stopped {
             println!("    {name}: {why}");
         }
         println!();
     }
     println!(
         "{} files, {} passed, {} failed, which is {:.1} percent of what was attempted",
-        summary.files,
-        summary.passed,
-        summary.failed,
-        summary.rate() * 100.0
+        total.files,
+        total.passed,
+        total.failed,
+        total.rate() * 100.0
     );
-    println!("{}", summary.skipped);
+    println!("{}", total.skips);
+    if !total.stopped.is_empty() {
+        println!(
+            "{} files were cut off and are counted in neither column, which is listed above",
+            total.stopped.len()
+        );
+    }
 }
 
 /// The four levels and where each one currently stands, which is nowhere.
@@ -335,6 +448,13 @@ fn help() {
     println!("  --strict-messages  require error text to match and not only the error kind");
     println!("  --slow             include the .test_slow files, which slt leaves out by default");
     println!("  --refresh          fetch the corpus again even if it is already there");
+    println!("  --limit <seconds>  how long one file may run before it is cut off, 10 by default");
+    println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
+    println!();
+    println!("Each file in an slt run gets a process of its own, because the corpus contains");
+    println!("queries that are meant to be enormous and rudb has no memory manager to stop them");
+    println!("yet. A file that goes over either limit is killed and named rather than being left");
+    println!("to decide whether the rest of the run gets reported.");
     println!();
     println!("The slt command needs no DuckDB on the machine, because a sqllogictest file already");
     println!("carries what every statement is supposed to produce. Everything else here compares");
