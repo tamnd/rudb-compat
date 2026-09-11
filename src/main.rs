@@ -18,6 +18,7 @@ use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::rudb::Rudb;
+use rudb_compat::shell::Shell;
 use rudb_compat::suite::{Report, run, run_parse, statements};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,6 +29,7 @@ fn main() -> ExitCode {
     let slow = args.iter().any(|a| a == "--slow");
     let refresh = args.iter().any(|a| a == "--refresh");
     let pinned = args.iter().any(|a| a == "--pinned");
+    let through_shells = args.iter().any(|a| a == "--shell");
     let default = Limits::default();
     let limits = Limits {
         time: valued(&args, "--limit").map_or(default.time, Duration::from_secs),
@@ -48,21 +50,21 @@ fn main() -> ExitCode {
         }
         Some("duckdb") => report_on_duckdb(pinned),
         Some("parse") => match rest.get(1) {
-            Some(path) => suite(path, messages, Mode::Parse),
+            Some(path) => suite(path, messages, Mode::Parse, through_shells),
             None => {
                 eprintln!("rudb-compat: parse needs a file of SQL");
                 ExitCode::FAILURE
             }
         },
         Some("query") => match rest.get(1) {
-            Some(sql) => one(sql, messages),
+            Some(sql) => one(sql, messages, through_shells),
             None => {
                 eprintln!("rudb-compat: query needs a statement");
                 ExitCode::FAILURE
             }
         },
         Some("run") => match rest.get(1) {
-            Some(path) => suite(path, messages, Mode::Run),
+            Some(path) => suite(path, messages, Mode::Run, through_shells),
             None => {
                 eprintln!("rudb-compat: run needs a file of SQL");
                 ExitCode::FAILURE
@@ -202,9 +204,9 @@ enum Mode {
 }
 
 /// Compare one statement and print the differences.
-fn one(sql: &str, messages: MessageMatch) -> ExitCode {
+fn one(sql: &str, messages: MessageMatch, through_shells: bool) -> ExitCode {
     let statements = vec![sql.to_owned()];
-    match go(&statements, messages, Mode::Run) {
+    match go(&statements, messages, Mode::Run, through_shells) {
         Ok((report, pin)) => {
             print(&report, pin);
             verdict(&report)
@@ -217,7 +219,7 @@ fn one(sql: &str, messages: MessageMatch) -> ExitCode {
 }
 
 /// Compare every statement in a file.
-fn suite(path: &str, messages: MessageMatch, mode: Mode) -> ExitCode {
+fn suite(path: &str, messages: MessageMatch, mode: Mode, through_shells: bool) -> ExitCode {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -230,7 +232,7 @@ fn suite(path: &str, messages: MessageMatch, mode: Mode) -> ExitCode {
         eprintln!("rudb-compat: {path} has no statements in it");
         return ExitCode::FAILURE;
     }
-    match go(&statements, messages, mode) {
+    match go(&statements, messages, mode, through_shells) {
         Ok((report, pin)) => {
             print(&report, pin);
             verdict(&report)
@@ -251,7 +253,18 @@ fn go(
     statements: &[String],
     messages: MessageMatch,
     mode: Mode,
+    through_shells: bool,
 ) -> Result<(Report, Pin), HarnessError> {
+    if through_shells {
+        let mut duckdb = Shell::duckdb()?;
+        let pin = rudb_compat::duckdb::pin_of(duckdb.version());
+        let mut rudb = Shell::rudb()?;
+        let report = match mode {
+            Mode::Parse => run_parse(&mut duckdb, &mut rudb, statements, messages)?,
+            Mode::Run => run(&mut duckdb, &mut rudb, statements, messages)?,
+        };
+        return Ok((report, pin));
+    }
     let mut duckdb = Duckdb::discover()?;
     let pin = duckdb.pin();
     let mut rudb = Rudb::new();
@@ -500,6 +513,9 @@ fn help() {
     println!("  --slow             include the .test_slow files, which slt leaves out by default");
     println!("  --refresh          fetch the corpus again even if it is already there");
     println!("  --pinned           make `duckdb` fail when the binary is not the pinned commit");
+    println!("  --shell            drive both engines as command line binaries rather than one");
+    println!("                     binary and one linked library, which is what tests the drop in");
+    println!("                     claim. Needs a built rudb on PATH or in RUDB_COMPAT_RUDB.");
     println!("  --limit <seconds>  how long one file may run before it is cut off, 10 by default");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
     println!();
