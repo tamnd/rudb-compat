@@ -85,8 +85,48 @@ SELECT a.id, a.name AS who, b.score FROM read_parquet('corpus/data/people.parque
 # The two readers do not agree about the first column and that is not a bug. Parquet carries the
 # type, so id comes back INTEGER, and the CSV has nothing but the digits to go on, so the sniffer
 # picks BIGINT. Reading the same five rows through the two readers and getting two different widths
-# of integer is what the binary does. There is no record here asserting that, because the two ways
-# of asking an engine what type a column is are DESCRIBE and typeof and rudb has neither yet.
+# of integer is what the binary does, and the two records below are the only thing in this file that
+# says so, because the rows above print 1 either way.
+#
+# This is also the query the harness itself runs. rudb-compat learns the types of every result it
+# compares by selecting column_name and column_type out of a DESCRIBE, so a difference here is a
+# difference in the instrument rather than in what is being measured.
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_csv('corpus/data/people.csv'));
+----
+id	BIGINT
+name	VARCHAR
+score	DOUBLE
+member	BOOLEAN
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM read_parquet('corpus/data/people.parquet'));
+----
+id	INTEGER
+name	VARCHAR
+score	DOUBLE
+member	BOOLEAN
+
+# Naming the file instead of writing a query is the same answer, and the width is six. Nothing here
+# can set a primary key or a default yet, so key and default and extra are null for every column,
+# and they still have to be there: a client reading the fifth column of a DESCRIBE has to find one.
+
+query TTTTTT
+SELECT * FROM (DESCRIBE 'corpus/data/people.parquet') LIMIT 1;
+----
+id	INTEGER	YES	NULL	NULL	NULL
+
+# Every column of a file is nullable. No format this reads carries a NOT NULL, so YES is not a
+# default that happens to be right, it is the answer.
+
+query TT
+SELECT column_name, "null" FROM (DESCRIBE 'corpus/data/people.csv');
+----
+id	YES
+name	YES
+score	YES
+member	YES
 
 # A file that is not there is an IO error naming the pattern, through either spelling.
 
