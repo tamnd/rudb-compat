@@ -29,6 +29,10 @@
 //! The hundred thousand row partition works too and answers a weaker question: every query still
 //! has to return the same thing on both engines, and ties at a `LIMIT` are rarer on a smaller file,
 //! so a green run on the partition is a floor rather than the claim the milestone wants.
+//!
+//! One query is allowed to disagree, and the list of them is `UPSTREAM_WRONG` below. A difference
+//! between two engines is usually this one being wrong, and every other test here is written on
+//! that assumption, but it is not a law and the full file found the exception.
 
 use std::path::PathBuf;
 
@@ -89,15 +93,43 @@ fn against(corpus: &str) -> Option<(Report, PathBuf)> {
     Some((report, at))
 }
 
+/// The statements where the two engines disagree and DuckDB is the one that is wrong.
+///
+/// The one entry is DuckDB summing a BIGINT column short by a multiple of two to the sixty fourth
+/// on the full file. `SELECT SUM(UserID::HUGEINT) FROM hits` and `SELECT SUM(UserID::DECIMAL(38,
+/// 0)) FROM hits` in the same binary return what rudb returns, and so does adding the column up
+/// outside a database, so rudb has the right answer here and DuckDB does not. The reduction and the
+/// numbers are in issue #12. It does not show on the hundred thousand row partition, where this
+/// query agrees.
+///
+/// A list rather than a skip, because the difference still has to be a difference in a value. If
+/// one of these ever comes back with a different column count, a different type, a different row
+/// count or an error on one side, that is a new bug wearing an old bug's name and this still fails
+/// on it.
+const UPSTREAM_WRONG: &[&str] = &["SELECT AVG(UserID) FROM hits"];
+
+/// Whether a statement is one of the ones DuckDB gets wrong.
+fn upstream_wrong(sql: &str) -> bool {
+    UPSTREAM_WRONG.contains(&sql.trim().trim_end_matches(';').trim_end())
+}
+
 /// Every case that disagreed, with the statement above the reasons, for a message worth reading.
+///
+/// A value difference on a statement in [`UPSTREAM_WRONG`] is not counted and nothing else there is
+/// forgiven.
 fn disagreements(report: &Report) -> Vec<String> {
     report
         .cases
         .iter()
-        .filter(|case| !case.agreed())
-        .map(|case| {
-            let why: Vec<String> = case.differences.iter().map(ToString::to_string).collect();
-            format!("{}\n    {}", case.sql, why.join("\n    "))
+        .filter_map(|case| {
+            let allowed = upstream_wrong(&case.sql);
+            let why: Vec<String> = case
+                .differences
+                .iter()
+                .filter(|difference| !(allowed && matches!(difference, Difference::Value { .. })))
+                .map(ToString::to_string)
+                .collect();
+            (!why.is_empty()).then(|| format!("{}\n    {}", case.sql, why.join("\n    ")))
         })
         .collect()
 }
@@ -146,7 +178,13 @@ fn breaking_the_tie_at_the_cut_settles_every_one_of_the_forty_three() {
     };
 
     // This is the one the milestone is about. Every query fixes its own order here, so there is
-    // nothing left for an engine to choose and a difference is a wrong answer.
+    // nothing left for an engine to choose and a difference is a wrong answer, on one side or the
+    // other.
+    for case in &report.cases {
+        if upstream_wrong(&case.sql) && !case.agreed() {
+            eprintln!("{} differed, which is DuckDB's bug and is allowed, see #12", case.sql);
+        }
+    }
     let disagreed = disagreements(&report);
     assert!(
         disagreed.is_empty(),
@@ -157,4 +195,23 @@ fn breaking_the_tie_at_the_cut_settles_every_one_of_the_forty_three() {
         report.left,
         disagreed.join("\n\n")
     );
+}
+
+/// Every statement named as one DuckDB gets wrong is still a statement in both corpus files.
+///
+/// This is the only thing keeping that list honest, and it is the only test in this file that runs
+/// without the fourteen gigabytes, so it runs on every machine in the gate. A query that gets
+/// rewritten or dropped has to take its entry with it.
+#[test]
+fn the_statements_duckdb_gets_wrong_are_still_in_both_corpus_files() {
+    for corpus in ["corpus/clickbench.sql", "corpus/clickbench-settled.sql"] {
+        let text = std::fs::read_to_string(corpus).unwrap();
+        let queries = statements(&text);
+        for sql in UPSTREAM_WRONG {
+            assert!(
+                queries.iter().any(|query| upstream_wrong(query) && query.trim() == *sql),
+                "{sql} is named as one DuckDB gets wrong and is not in {corpus} any more"
+            );
+        }
+    }
 }
