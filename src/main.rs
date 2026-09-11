@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use rudb_compat::Level;
 use rudb_compat::compare::MessageMatch;
-use rudb_compat::conform::{Skipped, Summary};
+use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
@@ -449,10 +449,23 @@ fn print_corpus(engine: &Rudb, total: &Isolated) {
     );
     println!("{}", total.skips);
     if !total.stopped.is_empty() {
-        println!(
-            "{} files were cut off and are counted in neither column, which is listed above",
-            total.stopped.len()
-        );
+        println!("{}, and they are counted in neither column", total.cut_off());
+    }
+    let reasons = total.reasons();
+    if reasons.total() > 0 {
+        println!();
+        print!("{reasons}");
+        // Said again on its own line because it is the only row here that is a bug. Everything
+        // else on the list is the engine saying it cannot do something, which is a schedule item,
+        // and a wrong answer is the engine saying it can and then being wrong. A reader who takes
+        // one number away from this report should take this one.
+        let wrong = reasons.count(Reason::WrongAnswer);
+        println!();
+        if wrong == 0 {
+            println!("no wrong answers, which is the row that matters");
+        } else {
+            println!("{wrong} wrong answers, every one of them a bug at priority/p0");
+        }
     }
 }
 

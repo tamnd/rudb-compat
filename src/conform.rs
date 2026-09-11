@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::engine::{Cell, Engine, HarnessError, Outcome, Table};
+use crate::engine::{Cell, Engine, EngineError, HarnessError, Outcome, Table};
 use crate::hash::hash_values;
 use crate::slt::{Directive, ParseError, QueryResult, Record, Sort, StatementResult, TestFile};
 
@@ -33,6 +33,177 @@ use crate::slt::{Directive, ParseError, QueryResult, Record, Sort, StatementResu
 /// and every one of those would be a failure that means nothing.
 pub const NAMES: &[&str] = &["rudb", "duckdb"];
 
+/// What kind of thing went wrong, as opposed to what went wrong.
+///
+/// `spec/14-rudb-compat.md` section 14.1 asks for the report to break failures down rather than
+/// publish one percentage, and this is the axis it breaks down on. The point is that the eight
+/// reasons below are eight different jobs for eight different people. A `Syntax` is a grammar rule
+/// nobody has written, an `Unbound` is usually one function, a `WrongAnswer` is a bug at
+/// `priority/p0` and the three error reasons are a message somebody has to copy exactly. A number
+/// that adds them together tells whoever reads it nothing about what to do next, which is the only
+/// thing a conformance report is for.
+///
+/// The classification is made where the failure is, from what the engine actually said, and not
+/// afterwards by matching on the text of the report. Doing it afterwards would mean the categories
+/// drift every time somebody rewords a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Reason {
+    /// The file expected it to work and the engine could not parse it.
+    Syntax,
+    /// The file expected it to work and the engine parsed it and has not built it yet.
+    NotImplemented,
+    /// The file expected it to work and the engine could not resolve a name in it.
+    ///
+    /// A function, a table, a column or a type. Almost always one missing function, which is why
+    /// this is worth its own line: it is the reason with the best ratio of records recovered to
+    /// work done, and reading it off the report beats reading four thousand files.
+    Unbound,
+    /// The file expected it to work and the engine raised something else.
+    Runtime,
+    /// The engine returned rows and they are not the rows the file says.
+    ///
+    /// The one reason on this list that is a bug rather than a schedule item. Everything else is
+    /// the engine being honest about something it cannot do, and this is the engine being wrong
+    /// while looking right, which is the failure mode the whole project is trying not to have.
+    WrongAnswer,
+    /// The file expected an error and the engine was happy.
+    MissedError,
+    /// The file expected an error and the engine raised one of a different kind.
+    ErrorClass,
+    /// The kind was right and the message did not contain what the file asked for.
+    ErrorText,
+}
+
+impl Reason {
+    /// Every reason, in the order the report prints them.
+    ///
+    /// Roughly from furthest from working to closest, so a report read top to bottom is read in
+    /// the order the work happens in.
+    pub const ALL: [Self; 8] = [
+        Self::Syntax,
+        Self::NotImplemented,
+        Self::Unbound,
+        Self::Runtime,
+        Self::WrongAnswer,
+        Self::MissedError,
+        Self::ErrorClass,
+        Self::ErrorText,
+    ];
+
+    /// The short name used in the breakdown and in the wire format.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Syntax => "syntax",
+            Self::NotImplemented => "not-implemented",
+            Self::Unbound => "unbound",
+            Self::Runtime => "runtime",
+            Self::WrongAnswer => "wrong-answer",
+            Self::MissedError => "missed-error",
+            Self::ErrorClass => "error-class",
+            Self::ErrorText => "error-text",
+        }
+    }
+
+    /// What the name means, for the line the report prints next to the count.
+    #[must_use]
+    pub const fn blurb(self) -> &'static str {
+        match self {
+            Self::Syntax => "the engine could not parse it",
+            Self::NotImplemented => "parsed, and the engine has not built it yet",
+            Self::Unbound => "a function, table, column or type the engine does not have",
+            Self::Runtime => "it should have worked and the engine raised something else",
+            Self::WrongAnswer => "rows came back and they are the wrong rows",
+            Self::MissedError => "the file expected an error and the engine was happy",
+            Self::ErrorClass => "an error of the wrong kind",
+            Self::ErrorText => "the right kind of error with the wrong words in it",
+        }
+    }
+
+    /// Read a reason back from its name, for the wire format.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.name() == name)
+    }
+
+    /// Which reason an error is, when the file expected the statement to work.
+    ///
+    /// The kinds are DuckDB's own prefixes, which `rudb-common` reproduces, so this is reading a
+    /// closed set rather than guessing from prose. `Binder Error` is grouped with `Catalog Error`
+    /// because from the outside they are the same complaint, which is that a name in the statement
+    /// does not resolve, and splitting them would put the same missing function in two rows
+    /// depending on which layer noticed it first.
+    #[must_use]
+    pub fn of(error: &EngineError) -> Self {
+        match error.kind.as_str() {
+            "Parser Error" => Self::Syntax,
+            "Not implemented Error" => Self::NotImplemented,
+            "Catalog Error" | "Binder Error" => Self::Unbound,
+            _ => Self::Runtime,
+        }
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// How many failures there were of each reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Reasons([usize; Reason::ALL.len()]);
+
+impl Reasons {
+    /// Count a list of failures by reason.
+    #[must_use]
+    pub fn of(failures: &[Failure]) -> Self {
+        let mut out = Self::default();
+        for failure in failures {
+            out.0[Reason::ALL.iter().position(|r| *r == failure.reason).unwrap_or(0)] += 1;
+        }
+        out
+    }
+
+    /// How many failures had this reason.
+    #[must_use]
+    pub fn count(&self, reason: Reason) -> usize {
+        Reason::ALL.iter().position(|r| *r == reason).map_or(0, |at| self.0[at])
+    }
+
+    /// Every reason that happened at least once, most frequent first.
+    ///
+    /// A reason with no failures is left out rather than printed as a zero, because a report where
+    /// most lines are zero is a report whose non zero lines are hard to find.
+    #[must_use]
+    pub fn rows(&self) -> Vec<(Reason, usize)> {
+        let mut rows: Vec<(Reason, usize)> =
+            Reason::ALL.into_iter().zip(self.0).filter(|(_, count)| *count > 0).collect();
+        rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        rows
+    }
+
+    /// Every failure, however it happened.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.0.iter().sum()
+    }
+}
+
+impl fmt::Display for Reasons {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let rows = self.rows();
+        if rows.is_empty() {
+            return f.write_str("no failures to break down");
+        }
+        writeln!(f, "failures by reason")?;
+        for (reason, count) in rows {
+            writeln!(f, "    {count:>7}  {:<16}{}", reason.name(), reason.blurb())?;
+        }
+        Ok(())
+    }
+}
+
 /// Why one record did not pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
@@ -42,17 +213,19 @@ pub struct Failure {
     pub line: usize,
     /// The SQL, as it ran, which for a loop body is the iteration that failed and not the template.
     pub sql: String,
-    /// What went wrong, in one or more lines.
-    pub reason: String,
+    /// What kind of failure it is, which is what the breakdown counts.
+    pub reason: Reason,
+    /// What went wrong in this particular case, in one or more lines.
+    pub detail: String,
 }
 
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "{}:{}", self.file, self.line)?;
+        writeln!(f, "{}:{}  {}", self.file, self.line, self.reason)?;
         for line in self.sql.lines() {
             writeln!(f, "    {line}")?;
         }
-        for line in self.reason.lines() {
+        for line in self.detail.lines() {
             writeln!(f, "  {line}")?;
         }
         Ok(())
@@ -173,6 +346,15 @@ impl Summary {
         {
             self.passed as f64 / self.attempted() as f64
         }
+    }
+
+    /// The failures broken down by reason.
+    ///
+    /// Derived from the failures rather than counted alongside them, so the breakdown and the list
+    /// can never disagree about how many there were.
+    #[must_use]
+    pub fn reasons(&self) -> Reasons {
+        Reasons::of(&self.failures)
     }
 
     /// Fold another summary into this one.
@@ -312,8 +494,14 @@ fn check(
     record: &Record,
     labels: &mut HashMap<String, Vec<String>>,
 ) -> Result<Result<(), Failure>, HarnessError> {
-    let fail = |sql: &str, reason: String| {
-        Err(Failure { file: file.name.clone(), line: record.line, sql: sql.to_owned(), reason })
+    let fail = |sql: &str, reason: Reason, detail: String| {
+        Err(Failure {
+            file: file.name.clone(),
+            line: record.line,
+            sql: sql.to_owned(),
+            reason,
+            detail,
+        })
     };
 
     match &record.directive {
@@ -322,7 +510,7 @@ fn check(
             Ok(match (expected, &outcome) {
                 (StatementResult::Ok, Outcome::Rows(_)) | (StatementResult::Maybe, _) => Ok(()),
                 (StatementResult::Ok, Outcome::Error(e)) => {
-                    fail(sql, format!("expected it to work, and it said\n{e}"))
+                    fail(sql, Reason::of(e), format!("expected it to work, and it said\n{e}"))
                 }
                 (StatementResult::Error(None), Outcome::Error(_)) => Ok(()),
                 (StatementResult::Error(Some(wanted)), Outcome::Error(e)) => {
@@ -331,12 +519,13 @@ fn check(
                     } else {
                         fail(
                             sql,
+                            wrong_error(e, wanted),
                             format!("expected an error containing\n{wanted}\nand it said\n{e}"),
                         )
                     }
                 }
                 (StatementResult::Error(_), Outcome::Rows(_)) => {
-                    fail(sql, "expected it to fail, and it worked".to_owned())
+                    fail(sql, Reason::MissedError, "expected it to fail, and it worked".to_owned())
                 }
             })
         }
@@ -350,15 +539,24 @@ fn check(
                     } else {
                         fail(
                             sql,
+                            wrong_error(e, wanted),
                             format!("expected an error containing\n{wanted}\nand it said\n{e}"),
                         )
                     });
                 }
                 (Outcome::Error(e), _) => {
-                    return Ok(fail(sql, format!("expected rows, and it said\n{e}")));
+                    return Ok(fail(
+                        sql,
+                        Reason::of(e),
+                        format!("expected rows, and it said\n{e}"),
+                    ));
                 }
                 (Outcome::Rows(_), QueryResult::Error(_)) => {
-                    return Ok(fail(sql, "expected it to fail, and it returned rows".to_owned()));
+                    return Ok(fail(
+                        sql,
+                        Reason::MissedError,
+                        "expected it to fail, and it returned rows".to_owned(),
+                    ));
                 }
                 (Outcome::Rows(table), _) => table,
             };
@@ -367,6 +565,7 @@ fn check(
             if table.width() != width {
                 return Ok(fail(
                     sql,
+                    Reason::WrongAnswer,
                     format!("expected {width} columns and got {}", table.width()),
                 ));
             }
@@ -377,6 +576,7 @@ fn check(
                     if previous != &values {
                         return Ok(fail(
                             sql,
+                            Reason::WrongAnswer,
                             format!(
                                 "this is labelled {label} and does not match what the earlier query with that label returned"
                             ),
@@ -392,17 +592,22 @@ fn check(
                     if &values == wanted {
                         Ok(())
                     } else {
-                        fail(sql, difference(wanted, &values, width))
+                        fail(sql, Reason::WrongAnswer, difference(wanted, &values, width))
                     }
                 }
                 QueryResult::Hash { count, digest } => {
                     if values.len() != *count {
-                        fail(sql, format!("expected {count} values and got {}", values.len()))
+                        fail(
+                            sql,
+                            Reason::WrongAnswer,
+                            format!("expected {count} values and got {}", values.len()),
+                        )
                     } else if &hash_values(&values) == digest {
                         Ok(())
                     } else {
                         fail(
                             sql,
+                            Reason::WrongAnswer,
                             format!(
                                 "expected {count} values hashing to {digest} and got {}",
                                 hash_values(&values)
@@ -426,7 +631,34 @@ fn check(
 /// A substring match on the message and not an equality, because that is what the format means and
 /// because the corpus writes short fragments like `Conversion Error` where the real message is a
 /// paragraph. The kind is included in the text being searched, so a file can pin either.
-fn contains(error: &crate::engine::EngineError, wanted: &str) -> bool {
+/// Whether an error that was not the one the file asked for is the wrong kind or the wrong words.
+///
+/// The distinction is worth drawing because the two are different sizes of problem. A kind that
+/// does not match means the engine reached a different conclusion about the statement, which is a
+/// behaviour difference. The right kind with different words is a message somebody has to copy
+/// from DuckDB, which is an afternoon and no design.
+///
+/// A file that writes only a fragment of the message and never names a kind cannot be a kind
+/// mismatch, so it falls to the text, which is what the fragment was about.
+fn wrong_error(got: &EngineError, wanted: &str) -> Reason {
+    match wanted_kind(wanted) {
+        Some(kind) if kind != got.kind => Reason::ErrorClass,
+        _ => Reason::ErrorText,
+    }
+}
+
+/// The error kind a file's expected text names, when it names one.
+///
+/// Both spellings the corpus uses. `Conversion Error: cannot cast` names one with a colon after
+/// it, and a bare `Conversion Error` on its own line names one without, and both are common enough
+/// that reading only the first would put most of these in the wrong row.
+fn wanted_kind(wanted: &str) -> Option<&str> {
+    let first = wanted.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let head = first.split_once(": ").map_or(first, |(kind, _)| kind);
+    head.ends_with("Error").then_some(head)
+}
+
+fn contains(error: &EngineError, wanted: &str) -> bool {
     let full = format!("{}: {}", error.kind, error.message);
     let wanted = wanted.trim();
     // The corpus writes an expected error over several lines when the real one has several lines,
@@ -588,8 +820,8 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 
 #[cfg(test)]
 mod tests {
-    use super::{NAMES, Skips, Summary, flatten, render, run_text};
-    use crate::engine::{Cell, Column, Engine, HarnessError, Outcome, Table};
+    use super::{NAMES, Reason, Skips, Summary, flatten, render, run_text};
+    use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
     use crate::slt::{Condition, Sort};
 
     /// An engine that answers from a script, so the runner can be tested without a database.
@@ -648,9 +880,10 @@ mod tests {
         let answers = vec![Outcome::Rows(table(1, &["1", "3"]))];
         let summary = run(answers, "query I\nSELECT a FROM t\n----\n1\n2\n");
         assert_eq!(summary.failed, 1);
-        let reason = &summary.failures[0].reason;
-        assert!(reason.contains('2'), "{reason}");
-        assert!(reason.contains('3'), "{reason}");
+        let detail = &summary.failures[0].detail;
+        assert!(detail.contains('2'), "{detail}");
+        assert!(detail.contains('3'), "{detail}");
+        assert_eq!(summary.failures[0].reason, Reason::WrongAnswer);
     }
 
     #[test]
@@ -675,7 +908,8 @@ mod tests {
         let answers = vec![Outcome::Rows(table(1, &["1", "2"]))];
         let summary = run(answers, "query II\nSELECT a, b FROM t\n----\n1\n2\n");
         assert_eq!(summary.failed, 1);
-        assert!(summary.failures[0].reason.contains("columns"));
+        assert!(summary.failures[0].detail.contains("columns"));
+        assert_eq!(summary.failures[0].reason, Reason::WrongAnswer);
     }
 
     #[test]
@@ -683,11 +917,12 @@ mod tests {
         let answers = vec![Outcome::Rows(Table::default())];
         let summary = run(answers, "statement error\nDROP TABLE nope\n");
         assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failures[0].reason, Reason::MissedError);
     }
 
     #[test]
     fn an_expected_error_is_matched_as_a_fragment_of_the_real_one() {
-        let answers = vec![Outcome::Error(crate::engine::EngineError {
+        let answers = vec![Outcome::Error(EngineError {
             kind: "Catalog Error".to_owned(),
             message: "Table with name nope does not exist!".to_owned(),
         })];
@@ -754,5 +989,98 @@ mod tests {
         let table = table(2, &["2", "9", "1", "8"]);
         assert_eq!(flatten(&table, "II", Sort::RowSort), ["1", "8", "2", "9"]);
         assert_eq!(flatten(&table, "II", Sort::ValueSort), ["1", "2", "8", "9"]);
+    }
+
+    fn errored(kind: &str, message: &str) -> Outcome {
+        Outcome::Error(EngineError { kind: kind.to_owned(), message: message.to_owned() })
+    }
+
+    #[test]
+    fn a_statement_that_should_have_worked_is_classified_by_what_the_engine_said_about_it() {
+        let cases = [
+            ("Parser Error", "syntax error at or near \"qualify\"", Reason::Syntax),
+            ("Not implemented Error", "a cast from VARCHAR to TIME", Reason::NotImplemented),
+            ("Catalog Error", "Scalar Function with name typeof does not exist!", Reason::Unbound),
+            ("Binder Error", "Referenced column \"x\" not found", Reason::Unbound),
+            ("Out of Range Error", "overflow in addition", Reason::Runtime),
+        ];
+        for (kind, message, want) in cases {
+            let summary = run(vec![errored(kind, message)], "statement ok\nSELECT 1\n");
+            assert_eq!(summary.failed, 1, "{kind}");
+            assert_eq!(summary.failures[0].reason, want, "{kind}");
+        }
+    }
+
+    #[test]
+    fn an_error_of_the_wrong_kind_and_an_error_with_the_wrong_words_are_different_failures() {
+        // Both of these are records where the file wanted an error and got one. The first is a
+        // different conclusion about the statement and the second is the same conclusion worded
+        // differently, and they are a design question and a copying job in that order.
+        let class = run(
+            vec![errored("Binder Error", "Referenced column \"x\" not found")],
+            "statement error\nSELECT 1\n----\nConversion Error: Could not convert\n",
+        );
+        assert_eq!(class.failures[0].reason, Reason::ErrorClass);
+
+        let text = run(
+            vec![errored("Conversion Error", "something else entirely")],
+            "statement error\nSELECT 1\n----\nConversion Error: Could not convert\n",
+        );
+        assert_eq!(text.failures[0].reason, Reason::ErrorText);
+    }
+
+    #[test]
+    fn a_file_that_names_no_kind_cannot_be_a_kind_mismatch() {
+        // Most of the corpus writes a fragment of the message and nothing else, and calling that a
+        // kind mismatch would put nearly every error failure in one row and make the split useless.
+        let summary = run(
+            vec![errored("Binder Error", "Referenced column \"x\" not found")],
+            "statement error\nSELECT 1\n----\ndoes not exist\n",
+        );
+        assert_eq!(summary.failures[0].reason, Reason::ErrorText);
+    }
+
+    #[test]
+    fn a_bare_kind_on_its_own_line_is_still_a_kind() {
+        let summary = run(
+            vec![errored("Binder Error", "Referenced column \"x\" not found")],
+            "statement error\nSELECT 1\n----\nConversion Error\n",
+        );
+        assert_eq!(summary.failures[0].reason, Reason::ErrorClass);
+    }
+
+    #[test]
+    fn the_breakdown_counts_every_failure_and_leaves_out_the_reasons_that_did_not_happen() {
+        let summary = run(
+            vec![
+                errored("Parser Error", "syntax error"),
+                Outcome::Rows(table(1, &["9"])),
+                errored("Parser Error", "syntax error"),
+            ],
+            "statement ok\nSELECT 1\n\nquery I\nSELECT a FROM t\n----\n1\n\nstatement ok\nSELECT 2\n",
+        );
+        let reasons = summary.reasons();
+        assert_eq!(reasons.total(), summary.failed);
+        assert_eq!(reasons.count(Reason::Syntax), 2);
+        assert_eq!(reasons.count(Reason::WrongAnswer), 1);
+        assert_eq!(reasons.count(Reason::Unbound), 0);
+        // Most frequent first, because the top line is what somebody picks up next.
+        assert_eq!(reasons.rows(), vec![(Reason::Syntax, 2), (Reason::WrongAnswer, 1)]);
+        let printed = reasons.to_string();
+        assert!(printed.contains("syntax"), "{printed}");
+        assert!(!printed.contains("unbound"), "{printed}");
+    }
+
+    #[test]
+    fn every_reason_has_a_name_of_its_own_that_reads_back_as_itself() {
+        // The names travel through a pipe between the child process and the parent, so two reasons
+        // sharing one would silently merge two rows of the report.
+        for reason in Reason::ALL {
+            assert_eq!(Reason::from_name(reason.name()), Some(reason));
+        }
+        let names: std::collections::BTreeSet<&str> =
+            Reason::ALL.iter().map(|r| r.name()).collect();
+        assert_eq!(names.len(), Reason::ALL.len());
+        assert_eq!(Reason::from_name("frobnicated"), None);
     }
 }

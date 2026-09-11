@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::conform::{Failure, Skips, Summary};
+use crate::conform::{Failure, Reason, Reasons, Skips, Summary};
 use crate::engine::HarnessError;
 
 /// How long and how large one file is allowed to get.
@@ -67,6 +67,38 @@ impl fmt::Display for Stopped {
             Self::Memory(bytes) => write!(f, "over the memory cap at {} MB", bytes / (1024 * 1024)),
             Self::Died(what) => write!(f, "exited without finishing: {what}"),
         }
+    }
+}
+
+/// How many files were cut off, by which limit caught them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Cut {
+    /// Still running when the clock ran out.
+    pub timeout: usize,
+    /// Over the resident set cap.
+    pub memory: usize,
+    /// Exited on its own without finishing, which is a panic or a signal.
+    pub crashed: usize,
+}
+
+impl Cut {
+    /// Every file that was cut off, however it was caught.
+    #[must_use]
+    pub const fn total(self) -> usize {
+        self.timeout + self.memory + self.crashed
+    }
+}
+
+impl fmt::Display for Cut {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} files cut off, of which {} timed out, {} went over the memory cap and {} came apart",
+            self.total(),
+            self.timeout,
+            self.memory,
+            self.crashed
+        )
     }
 }
 
@@ -117,6 +149,31 @@ impl Isolated {
         {
             self.passed as f64 / self.attempted() as f64
         }
+    }
+
+    /// The failures broken down by reason.
+    #[must_use]
+    pub fn reasons(&self) -> Reasons {
+        Reasons::of(&self.failures)
+    }
+
+    /// How many files were cut off for each of the three reasons a file gets cut off.
+    ///
+    /// The record level breakdown cannot see these, because a file that was killed has no records
+    /// with outcomes at all. They are the crash and timeout rows of the report and they are
+    /// counted separately for the same reason they are excluded from the pass rate, which is that
+    /// nobody knows what the records inside them would have done.
+    #[must_use]
+    pub fn cut_off(&self) -> Cut {
+        let mut out = Cut::default();
+        for (_, why) in &self.stopped {
+            match why {
+                Stopped::Time(_) => out.timeout += 1,
+                Stopped::Memory(_) => out.memory += 1,
+                Stopped::Died(_) => out.crashed += 1,
+            }
+        }
+        out
     }
 
     fn absorb(&mut self, other: Self) {
@@ -314,11 +371,12 @@ pub fn encode(summary: &Summary) -> String {
     }
     for failure in &summary.failures {
         out.push_str(&format!(
-            "failure\t{}\t{}\t{}\t{}\n",
+            "failure\t{}\t{}\t{}\t{}\t{}\n",
             escape(&failure.file),
             failure.line,
             escape(&failure.sql),
-            escape(&failure.reason)
+            failure.reason.name(),
+            escape(&failure.detail)
         ));
     }
     out
@@ -347,12 +405,17 @@ pub fn decode(name: &str, text: &str) -> Isolated {
             ["skipfile", file, why] => {
                 out.skipped_files.push((unescape(file), unescape(why)));
             }
-            ["failure", file, line, sql, reason] => {
+            // A reason that does not parse becomes `Runtime` rather than dropping the failure.
+            // Losing a failure would make the pass rate look better than it is, and `Runtime` is
+            // the row that means the harness has nothing more specific to say, so it is where an
+            // unreadable one belongs.
+            ["failure", file, line, sql, reason, detail] => {
                 out.failures.push(Failure {
                     file: unescape(file),
                     line: line.parse().unwrap_or(0),
                     sql: unescape(sql),
-                    reason: unescape(reason),
+                    reason: Reason::from_name(reason).unwrap_or(Reason::Runtime),
+                    detail: unescape(detail),
                 });
             }
             _ => {}
@@ -418,7 +481,8 @@ mod tests {
                 file: "b.test".to_owned(),
                 line: 12,
                 sql: "SELECT 1,\n  2".to_owned(),
-                reason: "wanted 1\tgot 2".to_owned(),
+                reason: Reason::WrongAnswer,
+                detail: "wanted 1\tgot 2".to_owned(),
             }],
         };
         let back = decode("b.test", &encode(&summary));
@@ -428,8 +492,40 @@ mod tests {
         assert_eq!(back.skips.total(), 7);
         assert_eq!(back.skipped_files, vec![("a.test".to_owned(), "requires parquet".to_owned())]);
         assert_eq!(back.failures[0].sql, "SELECT 1,\n  2");
-        assert_eq!(back.failures[0].reason, "wanted 1\tgot 2");
+        assert_eq!(back.failures[0].detail, "wanted 1\tgot 2");
+        assert_eq!(back.failures[0].reason, Reason::WrongAnswer);
+        assert_eq!(back.reasons().count(Reason::WrongAnswer), 1);
         assert!(back.stopped.is_empty());
+    }
+
+    #[test]
+    fn a_reason_the_parent_does_not_know_keeps_the_failure_rather_than_losing_it() {
+        // A child built from a newer tree than the parent is not a thing that happens on purpose,
+        // and it is a thing that would make the pass rate go up if an unreadable line were
+        // dropped. A pass rate that improves because the two halves of the harness disagree is the
+        // worst failure this file could have.
+        let text = "counts\t1\t0\t1\t0\t0\t0\nfailure\tz.test\t3\tSELECT 1\tfrobnicated\tno idea\n";
+        let back = decode("z.test", text);
+        assert_eq!(back.failed, 1);
+        assert_eq!(back.failures[0].reason, Reason::Runtime);
+        assert_eq!(back.failures[0].detail, "no idea");
+    }
+
+    #[test]
+    fn the_files_that_were_cut_off_are_counted_by_which_limit_caught_them() {
+        let mut total = Isolated::default();
+        total.absorb(Isolated {
+            files: 3,
+            stopped: vec![
+                ("a.test".to_owned(), Stopped::Time(Duration::from_secs(10))),
+                ("b.test".to_owned(), Stopped::Memory(3 << 30)),
+                ("c.test".to_owned(), Stopped::Died("signal 11".to_owned())),
+            ],
+            ..Isolated::default()
+        });
+        let cut = total.cut_off();
+        assert_eq!((cut.timeout, cut.memory, cut.crashed), (1, 1, 1));
+        assert_eq!(cut.total(), 3);
     }
 
     #[test]
@@ -457,7 +553,8 @@ mod tests {
                 file: "d.test".to_owned(),
                 line: 1,
                 sql: "SELECT '\\n'".to_owned(),
-                reason: String::new(),
+                reason: Reason::Syntax,
+                detail: String::new(),
             }],
             ..Summary::default()
         };
