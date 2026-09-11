@@ -65,7 +65,7 @@ fi
 
 pin=""
 if [ "$update" = yes ]; then
-  pin="cargo update -p rudb -p rudb-common -p rudb-parse && "
+  pin="cargo update -p rudb && "
   echo "refreshing the rudb pin before the gate, so the pass rate is of today's rudb"
 fi
 

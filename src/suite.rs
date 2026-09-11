@@ -132,40 +132,15 @@ pub fn run_parse(
 /// tokenizer that answers it is the same one the parser uses, so the corpus is split the way the
 /// engine would split it.
 ///
-/// Text that does not tokenize comes back as one statement, because the harness's job is to hand
-/// it to both engines and see what they say, not to decide in advance that it is not SQL.
+/// [`rudb::split`] is that same tokenizer, reached through the embedding API rather than through
+/// `rudb-parse`, and it keeps the two things this harness needs that a plain `;` split does not:
+/// text that does not tokenize comes back as one statement, because the harness's job is to hand
+/// it to both engines and see what they say rather than to decide in advance that it is not SQL,
+/// and a trailing block of comments is not a statement, because handing that to an engine gets an
+/// error that is about the harness rather than about the corpus.
 #[must_use]
 pub fn statements(text: &str) -> Vec<String> {
-    let Ok(tokens) = rudb_parse::tokenize(text) else {
-        let trimmed = text.trim();
-        return if trimmed.is_empty() { Vec::new() } else { vec![trimmed.to_owned()] };
-    };
-
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for token in &tokens {
-        if token.kind == rudb_parse::Kind::Terminator {
-            push(&mut out, &text[start..token.start as usize]);
-            start = token.end as usize;
-        }
-    }
-    push(&mut out, &text[start..]);
-    out
-}
-
-/// Add one statement to the list, unless it is only whitespace and comments.
-fn push(out: &mut Vec<String>, text: &str) {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return;
-    }
-    // A trailing block of comments after the last semicolon tokenizes to nothing but the end of
-    // input, and handing that to an engine gets an error that is about the harness rather than
-    // about the corpus.
-    if rudb_parse::tokenize(trimmed).is_ok_and(|t| t.len() <= 1) {
-        return;
-    }
-    out.push(trimmed.to_owned());
+    rudb::split(text).unwrap_or_default()
 }
 
 #[cfg(test)]
