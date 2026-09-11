@@ -14,7 +14,7 @@ use std::time::Duration;
 use rudb_compat::Level;
 use rudb_compat::compare::MessageMatch;
 use rudb_compat::conform::{Skipped, Summary};
-use rudb_compat::duckdb::{Duckdb, PINNED};
+use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::rudb::Rudb;
@@ -27,6 +27,7 @@ fn main() -> ExitCode {
     let strict = args.iter().any(|a| a == "--strict-messages");
     let slow = args.iter().any(|a| a == "--slow");
     let refresh = args.iter().any(|a| a == "--refresh");
+    let pinned = args.iter().any(|a| a == "--pinned");
     let default = Limits::default();
     let limits = Limits {
         time: valued(&args, "--limit").map_or(default.time, Duration::from_secs),
@@ -45,7 +46,7 @@ fn main() -> ExitCode {
             levels();
             ExitCode::SUCCESS
         }
-        Some("duckdb") => report_on_duckdb(),
+        Some("duckdb") => report_on_duckdb(pinned),
         Some("parse") => match rest.get(1) {
             Some(path) => suite(path, messages, Mode::Parse),
             None => {
@@ -120,7 +121,7 @@ fn valued(args: &[String], flag: &str) -> Option<u64> {
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
     const VALUED: [&str; 2] = ["--limit", "--memory"];
-    const PLAIN: [&str; 3] = ["--strict-messages", "--slow", "--refresh"];
+    const PLAIN: [&str; 4] = ["--strict-messages", "--slow", "--refresh", "--pinned"];
     let mut out = Vec::new();
     let mut skip = false;
     for arg in args {
@@ -143,21 +144,45 @@ fn positional(args: &[String]) -> Vec<&str> {
 }
 
 /// Say which DuckDB is on the machine and whether it is the one this project tracks.
-fn report_on_duckdb() -> ExitCode {
+///
+/// `require` is `--pinned`, which turns anything other than the pinned commit into a failure. The
+/// machines that produce published numbers run it that way and CI does not, because CI has a
+/// released binary and a fallback run is still worth having.
+fn report_on_duckdb(require: bool) -> ExitCode {
     match Duckdb::discover() {
         Ok(db) => {
+            let short = &PINNED_COMMIT[..10];
             println!("binary   {}", db.binary().display());
             println!("version  {}", db.version());
-            println!("pinned   {PINNED}");
-            if db.is_pinned_version() {
-                println!();
-                println!("This is the version the grammar is vendored from.");
-                ExitCode::SUCCESS
-            } else {
-                println!();
-                println!("This is not the version the grammar is vendored from, so a number that");
-                println!("comes out of it is about this DuckDB and not about the one rudb tracks.");
-                ExitCode::SUCCESS
+            println!("commit   {}", db.commit().unwrap_or("unknown"));
+            println!("pinned   {PINNED} at {short}");
+            println!();
+            match db.pin() {
+                Pin::Pinned => {
+                    println!("This is the commit the grammar is vendored from.");
+                    ExitCode::SUCCESS
+                }
+                Pin::OtherCommit => {
+                    println!(
+                        "This is a {PINNED} alpha built at some other commit. The branch moves"
+                    );
+                    println!(
+                        "every day, so this binary and the vendored grammar are two languages"
+                    );
+                    println!("and a number out of this run is about neither of them on its own.");
+                    println!("`scripts/oracle` in the rudb repository builds the pinned one.");
+                    if require { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+                }
+                Pin::Fallback => {
+                    println!(
+                        "This is not the DuckDB the grammar is vendored from, so a number that"
+                    );
+                    println!(
+                        "comes out of it is about this DuckDB and not about the one rudb tracks."
+                    );
+                    println!("`scripts/oracle` in the rudb repository builds the pinned one.");
+                    if require { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+                }
             }
         }
         Err(e) => {
@@ -180,8 +205,8 @@ enum Mode {
 fn one(sql: &str, messages: MessageMatch) -> ExitCode {
     let statements = vec![sql.to_owned()];
     match go(&statements, messages, Mode::Run) {
-        Ok(report) => {
-            print(&report);
+        Ok((report, pin)) => {
+            print(&report, pin);
             verdict(&report)
         }
         Err(e) => {
@@ -206,8 +231,8 @@ fn suite(path: &str, messages: MessageMatch, mode: Mode) -> ExitCode {
         return ExitCode::FAILURE;
     }
     match go(&statements, messages, mode) {
-        Ok(report) => {
-            print(&report);
+        Ok((report, pin)) => {
+            print(&report, pin);
             verdict(&report)
         }
         Err(e) => {
@@ -218,22 +243,35 @@ fn suite(path: &str, messages: MessageMatch, mode: Mode) -> ExitCode {
 }
 
 /// Build both engines and put the statements to them.
-fn go(statements: &[String], messages: MessageMatch, mode: Mode) -> Result<Report, HarnessError> {
+///
+/// The pin comes back with the report because it belongs to every number in it. A run against a
+/// binary that is not the vendored commit is a measurement of a different DuckDB, and the place to
+/// say so is next to the percentage rather than in a paragraph somebody has to remember.
+fn go(
+    statements: &[String],
+    messages: MessageMatch,
+    mode: Mode,
+) -> Result<(Report, Pin), HarnessError> {
     let mut duckdb = Duckdb::discover()?;
+    let pin = duckdb.pin();
     let mut rudb = Rudb::new();
-    match mode {
-        Mode::Parse => run_parse(&mut duckdb, &mut rudb, statements, messages),
-        Mode::Run => run(&mut duckdb, &mut rudb, statements, messages),
-    }
+    let report = match mode {
+        Mode::Parse => run_parse(&mut duckdb, &mut rudb, statements, messages)?,
+        Mode::Run => run(&mut duckdb, &mut rudb, statements, messages)?,
+    };
+    Ok((report, pin))
 }
 
 /// Print the report.
 ///
 /// Every case that disagreed is printed in full, with the statement above the differences, because
 /// a report that summarizes is a report somebody has to run again with a flag to make useful.
-fn print(report: &Report) {
+fn print(report: &Report, pin: Pin) {
     println!("left   {}", report.left);
     println!("right  {}", report.right);
+    if pin != Pin::Pinned {
+        println!("note   not the pinned commit, so this run is not comparable to a pinned one");
+    }
     println!();
     for case in &report.cases {
         if case.agreed() {
@@ -448,6 +486,7 @@ fn help() {
     println!("  --strict-messages  require error text to match and not only the error kind");
     println!("  --slow             include the .test_slow files, which slt leaves out by default");
     println!("  --refresh          fetch the corpus again even if it is already there");
+    println!("  --pinned           make `duckdb` fail when the binary is not the pinned commit");
     println!("  --limit <seconds>  how long one file may run before it is cut off, 10 by default");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
     println!();

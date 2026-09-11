@@ -28,10 +28,13 @@ env:
   CARGO_INCREMENTAL: 0
   RUSTFLAGS: -D warnings
   RUSTDOCFLAGS: -D warnings
-  # The newest released DuckDB. rudb vendors its grammar from the v2.0 development ref, which has
-  # no published binary, so this is the closest real thing there is and the harness says as much on
-  # every run. Written down here rather than resolved to latest, because a compatibility number
-  # whose other side moved on its own is not a measurement.
+  # The newest released DuckDB. rudb vendors its grammar from a commit on the v2.0 development
+  # branch, which has no published binary, and building one here would put a forty minute C++ build
+  # in front of a fourteen second test run. So this leg is the allowed fallback: it proves the
+  # harness builds and runs, every report it produces says it is not the pinned commit, and the
+  # pinned runs happen on the lab machines, which have the binary installed by `scripts/oracle` in
+  # the rudb repository. Written down here rather than resolved to latest, because a compatibility
+  # number whose other side moved on its own is not a measurement.
   DUCKDB_VERSION: v1.5.5
 
 jobs:

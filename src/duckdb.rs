@@ -36,6 +36,31 @@ use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError,
 /// worse than no number.
 pub const PINNED: &str = "v2.0";
 
+/// The commit the grammar is vendored from, which is what the binary has to be built at.
+///
+/// The version string is not enough on its own. `v2.0-cyanoptera` is a development branch that
+/// moves every day, so two binaries can both say `v2.0.0-dev` and disagree about the language, and
+/// the whole point of this harness is that the two sides speak the same one. The CLI prints the
+/// short hash as the last word of `--version`, so the check is a prefix match against this.
+///
+/// This is the `commit:` line of `crates/rudb-parse/grammar/VENDOR` in the rudb repository. The two
+/// repositories are separate, so it is written here by hand and `rudb-compat duckdb` is what
+/// notices when it has gone stale.
+pub const PINNED_COMMIT: &str = "cc7e7bac7fcb6e0994359965a87ac4f6a96f2e17";
+
+/// What the binary on this machine is, next to the one the grammar came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pin {
+    /// The commit the grammar is vendored from. A number out of this run is about rudb.
+    Pinned,
+    /// A v2.0 alpha, but built at some other commit. This is the state that used to pass the check
+    /// silently, and it is the one worth naming: the version is right, the language may not be.
+    OtherCommit,
+    /// Some other DuckDB, which in practice is a published release. The run still happens and the
+    /// report says which version produced it, because a released binary is what most machines have.
+    Fallback,
+}
+
 /// How many statements this process has run, which is what keeps two runs from sharing a file.
 static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -105,10 +130,30 @@ impl Duckdb {
         self
     }
 
-    /// True when the binary is the version this project pins.
+    /// The commit the binary was built at, as it printed it.
+    ///
+    /// `duckdb --version` is one line and the hash is the last word of it, on a release and on a
+    /// development build alike: `v1.5.5 (Variegata) d8cdaa33fd` and `v2.0.0-dev84237 (Development
+    /// Version) cc7e7bac7f`. Anything that is not a hash comes back as nothing rather than as a
+    /// wrong answer, so a binary that prints something else is a mismatch and not a crash.
     #[must_use]
-    pub fn is_pinned_version(&self) -> bool {
-        self.version.starts_with(&format!("v{}", PINNED.trim_start_matches('v')))
+    pub fn commit(&self) -> Option<&str> {
+        hash_in(&self.version)
+    }
+
+    /// Whether this binary is the one the grammar came from, and if not, how far off it is.
+    ///
+    /// The hash is matched as a prefix in both directions, so a binary that prints ten characters
+    /// and one that prints all forty both compare equal to the commit written down here.
+    #[must_use]
+    pub fn pin(&self) -> Pin {
+        classify(&self.version)
+    }
+
+    /// True when the binary is the commit this project pins.
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        self.pin() == Pin::Pinned
     }
 
     /// The binary being driven, for the report.
@@ -217,6 +262,27 @@ fn serialize(sql: &str) -> String {
     )
 }
 
+/// The commit hash in a `duckdb --version` line, which is the last word of it.
+///
+/// A word that is not hexadecimal, or is too short to be a short hash, is not one. That way a
+/// binary whose version line has some other shape reads as a version with no commit in it, and the
+/// pin then says the honest thing rather than comparing a hash against a word.
+fn hash_in(version: &str) -> Option<&str> {
+    let last = version.split_whitespace().next_back()?;
+    let looks_like_a_hash = last.len() >= 8 && last.chars().all(|c| c.is_ascii_hexdigit());
+    looks_like_a_hash.then_some(last)
+}
+
+/// Where a version line sits next to the commit the grammar is vendored from.
+fn classify(version: &str) -> Pin {
+    if let Some(commit) = hash_in(version) {
+        if PINNED_COMMIT.starts_with(commit) || commit.starts_with(PINNED_COMMIT) {
+            return Pin::Pinned;
+        }
+    }
+    if version.starts_with(PINNED) { Pin::OtherCommit } else { Pin::Fallback }
+}
+
 /// Resolve a bare command name against `PATH`.
 ///
 /// This exists so the report names a file rather than a word. Every number the harness prints has
@@ -283,9 +349,46 @@ fn assemble(types: &[Vec<Cell>], rows: &[Vec<Cell>]) -> Result<Table, HarnessErr
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Duckdb, copy_of, on_path};
+    use super::{Duckdb, PINNED_COMMIT, Pin, classify, copy_of, hash_in, on_path};
     use crate::engine::{Cell, Engine, Outcome};
     use std::path::Path;
+
+    /// The version line of the binary built at the vendored commit, read off one of the test
+    /// machines rather than made up here.
+    const VENDORED: &str = "v2.0.0-dev84237 (Development Version) cc7e7bac7f";
+
+    #[test]
+    fn the_commit_is_the_last_word_of_the_version_line() {
+        assert_eq!(hash_in(VENDORED), Some("cc7e7bac7f"));
+        assert_eq!(hash_in("v1.5.5 (Variegata) d8cdaa33fd"), Some("d8cdaa33fd"));
+        assert_eq!(hash_in("v1.4.4 (Andium) 6ddac802ff"), Some("6ddac802ff"));
+        // Nothing that is not a hash is read as one, including the version itself.
+        assert_eq!(hash_in("v1.5.5"), None);
+        assert_eq!(hash_in(""), None);
+    }
+
+    #[test]
+    fn the_binary_at_the_vendored_commit_is_the_pinned_one() {
+        assert_eq!(classify(VENDORED), Pin::Pinned);
+        // The whole hash and the short one are the same commit.
+        assert_eq!(
+            classify(&format!("v2.0.0-dev84237 (Development Version) {PINNED_COMMIT}")),
+            Pin::Pinned
+        );
+    }
+
+    #[test]
+    fn a_v2_alpha_at_another_commit_is_not_the_pinned_one() {
+        // This is the case the old version string check passed. The branch moves every day, so a
+        // v2.0 alpha from another day is a different language from the vendored grammar.
+        assert_eq!(classify("v2.0.0-dev84100 (Development Version) 0123456789"), Pin::OtherCommit);
+    }
+
+    #[test]
+    fn a_released_binary_is_the_fallback() {
+        assert_eq!(classify("v1.5.5 (Variegata) d8cdaa33fd"), Pin::Fallback);
+        assert_eq!(classify("v1.4.4 (Andium) 6ddac802ff"), Pin::Fallback);
+    }
 
     /// Every test here needs a DuckDB on the machine, and CI installs one. A developer without one
     /// gets a skipped test and a line saying so rather than a red build, because a harness that
