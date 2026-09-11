@@ -10,11 +10,14 @@
 //! needs that, and it is also what makes [`Engine::reset`] necessary: a `.test` file expects to
 //! start from an empty database, and one file leaving a table behind for the next one is a pass
 //! that means nothing.
+//!
+//! Everything here goes through the `rudb` crate and nothing else. That is a real constraint and
+//! not tidiness: this harness is the closest thing the project has to somebody embedding rudb, so
+//! the moment it reaches past the embedding API for something, the embedding API is missing
+//! something. It used to reach into `rudb-parse` for a tokenizer and into `rudb-common` for the
+//! error type, and both of those reaches were holes in `rudb` rather than conveniences here.
 
-use rudb::Database;
-use rudb_common::{Error, ErrorCode, LogicalType, Value};
-use rudb_parse::ast::Statement;
-use rudb_parse::{parse_ast, tokenize};
+use rudb::{Database, Error, ErrorCode, LogicalType, RowOrder, Value};
 
 use crate::compare::Ordering;
 use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
@@ -70,11 +73,10 @@ impl Engine for Rudb {
     }
 
     fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError> {
-        // The matcher and not the transformer, because acceptance is a question about the grammar.
-        // A statement the transformer has not reached yet still parses, and counting it as a
-        // rejection would make the harness report a hole in the dialect where there is a hole in
-        // the AST.
-        Ok(match rudb_parse::parse(sql) {
+        // The grammar and not the AST, because acceptance is a question about the grammar. A
+        // statement the AST has not reached yet still parses, and counting it as a rejection would
+        // make the harness report a hole in the dialect where there is a hole in the AST.
+        Ok(match rudb::accepts(sql) {
             Ok(_) => Acceptance::Accepted,
             Err(e) => Acceptance::Rejected(engine_error(&e)),
         })
@@ -138,37 +140,20 @@ pub fn is_not_implemented(error: &EngineError) -> bool {
 /// Whether the query fixes its own row order.
 ///
 /// Section 14.2 says results are compared in order when the query has an `ORDER BY` and sorted
-/// when it does not. Deciding which needs a parser, and rudb has one, so the AST answers it: a
-/// query orders itself when its top level has an order clause, and an `ORDER BY` inside a
-/// subquery does not count because it does not survive into the outer result.
+/// when it does not. Deciding which needs a parser, and rudb has one, so [`rudb::row_order`]
+/// answers it: a query orders itself when its top level has an order clause, and an `ORDER BY`
+/// inside a subquery does not count because it does not survive into the outer result.
 ///
-/// When rudb cannot parse the text at all, the fallback is a token scan for the word `ORDER`,
-/// using rudb's tokenizer so that the word inside a string literal or a comment does not count.
-/// The scan cannot tell a top level clause from a nested one, so it says `AsWritten` whenever it
-/// sees the word, which makes an unstable order show up as a difference rather than disappear into
-/// a sort. A false failure costs someone a look at a report. A false pass costs a user their data
-/// coming back in an order the query said it would not.
+/// The third answer, the one that says rudb could not read the text, is a policy decision and it
+/// belongs here rather than in the engine. This harness says `AsWritten`, so an order it cannot
+/// check shows up as a difference rather than disappearing into a sort. A false failure costs
+/// someone a look at a report. A false pass costs a user their data coming back in an order the
+/// query said it would not.
 #[must_use]
 pub fn ordering_of(sql: &str) -> Ordering {
-    if let Ok(ast) = parse_ast(sql) {
-        let ordered = ast.statements.iter().any(|statement| match statement {
-            Statement::Query(at) => {
-                let query = ast.query(*at);
-                query.order_by_all || !query.order_by.is_empty()
-            }
-            // Nothing else returns rows, so nothing else has an order to preserve.
-            _ => false,
-        });
-        return if ordered { Ordering::AsWritten } else { Ordering::Sorted };
-    }
-
-    let Ok(tokens) = tokenize(sql) else {
-        return Ordering::AsWritten;
-    };
-    if tokens.iter().any(|t| t.text(sql).eq_ignore_ascii_case("order")) {
-        Ordering::AsWritten
-    } else {
-        Ordering::Sorted
+    match rudb::row_order(sql) {
+        RowOrder::Declared | RowOrder::Unknown => Ordering::AsWritten,
+        RowOrder::Unspecified => Ordering::Sorted,
     }
 }
 
@@ -254,7 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn text_that_does_not_even_tokenize_is_treated_as_ordered() {
+    fn text_rudb_cannot_read_is_treated_as_ordered() {
+        // The engine says it does not know, and the harness turns that into the cautious answer.
         assert_eq!(ordering_of("SELECT 'unterminated"), Ordering::AsWritten);
+        assert_eq!(ordering_of("SELECT FROM WHERE"), Ordering::AsWritten);
     }
 }

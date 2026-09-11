@@ -20,6 +20,11 @@
 //! is most of it. The corpus finds behaviour DuckDB's own authors thought worth pinning down, at a
 //! volume and a speed the differential loop cannot reach.
 //!
+//! This crate depends on `rudb` and on nothing else in that workspace, which is a rule rather than
+//! an accident. It is the closest thing the project has to somebody embedding rudb, so anything it
+//! needs and cannot get from the one crate is something the embedding API is missing, and reaching
+//! past it would hide that instead of fixing it.
+//!
 //! [rudb repository]: https://github.com/tamnd/rudb
 
 #![forbid(unsafe_code)]
