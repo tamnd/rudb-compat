@@ -22,6 +22,10 @@
 //! a hundred million rows through forty three queries twice, which takes hours and is a decision
 //! somebody makes rather than one they discover.
 //!
+//! Set `RUDB_COMPAT_PROGRESS` as well when the file is the full one. The run takes hours and says
+//! nothing until it is over, and if it ends by being killed rather than by finishing then the
+//! query it died on is the thing worth knowing.
+//!
 //! The hundred thousand row partition works too and answers a weaker question: every query still
 //! has to return the same thing on both engines, and ties at a `LIMIT` are rarer on a smaller file,
 //! so a green run on the partition is a floor rather than the claim the milestone wants.

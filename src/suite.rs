@@ -65,6 +65,18 @@ impl Report {
     }
 }
 
+/// Whether somebody asked to watch a run happen, which is `RUDB_COMPAT_PROGRESS` set to anything
+/// other than `0`.
+///
+/// A run prints nothing until it is over, which is right for a gate and wrong for the one run this
+/// project most needs to watch. The full ClickBench file is a hundred million rows through forty
+/// three queries twice and it takes hours, and a query that gets the process killed by the kernel
+/// takes the report with it, so afterwards there is no way to say which query it died on. One line
+/// per statement as it finishes answers that. Off by default, because a gate should say one thing.
+fn watching() -> bool {
+    std::env::var_os("RUDB_COMPAT_PROGRESS").is_some_and(|on| on != "0")
+}
+
 /// Run every statement through both engines.
 ///
 /// The ordering rule is decided per statement rather than for the run, because it depends on
@@ -80,12 +92,28 @@ pub fn run(
     statements: &[String],
     messages: MessageMatch,
 ) -> Result<Report, HarnessError> {
+    let watching = watching();
     let mut cases = Vec::with_capacity(statements.len());
-    for sql in statements {
+    for (at, sql) in statements.iter().enumerate() {
         let rules = Rules { ordering: ordering_of(sql), messages };
+        let started = std::time::Instant::now();
         let a = left.run(sql)?;
+        let between = std::time::Instant::now();
         let b = right.run(sql)?;
-        cases.push(Case { sql: sql.clone(), differences: compare(&a, &b, rules) });
+        let differences = compare(&a, &b, rules);
+        if watching {
+            eprintln!(
+                "{} of {}, {} {:.1?}, {} {:.1?}, {}",
+                at + 1,
+                statements.len(),
+                left.name(),
+                between - started,
+                right.name(),
+                between.elapsed(),
+                if differences.is_empty() { "agreed" } else { "differed" }
+            );
+        }
+        cases.push(Case { sql: sql.clone(), differences });
     }
     Ok(Report {
         left: format!("{} {}", left.name(), left.version()),
