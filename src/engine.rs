@@ -144,6 +144,54 @@ impl fmt::Display for Cell {
     }
 }
 
+/// Put a `DESCRIBE` and a result set together into one table.
+///
+/// Both arrive as records with the header first, whichever way the engine was made to write them,
+/// so this is shared between the driver that reads a `COPY` and the one that reads a shell.
+///
+/// The column names come from the `DESCRIBE` rather than from the row header, because they are the
+/// same names and the `DESCRIBE` is the one that also carries the types. They are checked against
+/// each other anyway, since a disagreement means the two runs did not see the same query and every
+/// value below is then lined up against the wrong column.
+///
+/// # Errors
+///
+/// When the `DESCRIBE` is malformed, when the two disagree about how many columns there are, or
+/// when they disagree about a name.
+pub(crate) fn assemble(types: &[Vec<Cell>], rows: &[Vec<Cell>]) -> Result<Table, HarnessError> {
+    let mut columns = Vec::with_capacity(types.len().saturating_sub(1));
+    for record in types.iter().skip(1) {
+        let name = match record.first() {
+            Some(Cell::Text(t)) => t.clone(),
+            _ => return Err(HarnessError::new("DESCRIBE returned a column with no name")),
+        };
+        let ty = match record.get(1) {
+            Some(Cell::Text(t)) => t.clone(),
+            _ => return Err(HarnessError::new(format!("DESCRIBE gave {name} no type"))),
+        };
+        columns.push(Column { name, ty });
+    }
+
+    let header = rows.first().map_or(&[][..], Vec::as_slice);
+    if header.len() != columns.len() {
+        return Err(HarnessError::new(format!(
+            "the query returned {} columns and DESCRIBE named {}",
+            header.len(),
+            columns.len()
+        )));
+    }
+    for (at, column) in columns.iter().enumerate() {
+        if header[at] != Cell::Text(column.name.clone()) {
+            return Err(HarnessError::new(format!(
+                "column {at} is {} in the result and {} in the DESCRIBE",
+                header[at], column.name
+            )));
+        }
+    }
+
+    Ok(Table { columns, rows: rows.iter().skip(1).cloned().collect() })
+}
+
 /// Something that can run a statement and say what happened.
 pub trait Engine {
     /// What to call this engine in a report.

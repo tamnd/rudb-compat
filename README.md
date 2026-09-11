@@ -122,6 +122,16 @@ The tests that need a DuckDB skip with a printed reason when there is not one, r
 RUDB_COMPAT_DUCKDB=/path/to/duckdb cargo test
 ```
 
+## Driving the two shells
+
+By default the harness runs DuckDB as a process and rudb as a library it links, which is the right comparison for almost everything and the wrong one for the claim the project actually makes. A drop in replacement is a claim about a binary: somebody has a script that runs `duckdb -c '...'` and they change the word `duckdb`. `--shell` runs both sides as binaries through one driver, so the only difference between the two is the path of the executable.
+
+```
+RUDB_COMPAT_RUDB=/path/to/rudb cargo run -- run corpus/clickbench.sql --shell
+```
+
+Both shells are driven in `.mode quote`, which is the one output mode that keeps a NULL, an empty string and the four letter string `NULL` apart, and which needs nothing from the engine under test. The types come from a second invocation that wraps the statement in a `DESCRIBE`. A statement `DESCRIBE` cannot wrap, `PRAGMA` for instance, still returns its rows, with the type column saying why there is no type rather than guessing one.
+
 ## License
 
 Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE).

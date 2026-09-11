@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::csv;
-use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
+use crate::engine::{Acceptance, Cell, Engine, EngineError, HarnessError, Outcome, assemble};
 
 /// The DuckDB this project tracks, which is the same ref the grammar is vendored from.
 ///
@@ -262,6 +262,16 @@ fn serialize(sql: &str) -> String {
     )
 }
 
+/// Where a version line sits next to the vendored commit, for a caller holding only the line.
+///
+/// [`Duckdb::pin`] is the same question asked of a driver that has one. The shell driver in
+/// `crate::shell` has the version string and nothing else, and the pin belongs next to every number
+/// however the binary was reached.
+#[must_use]
+pub fn pin_of(version: &str) -> Pin {
+    classify(version)
+}
+
 /// The commit hash in a `duckdb --version` line, which is the last word of it.
 ///
 /// A word that is not hexadecimal, or is too short to be a short hash, is not one. That way a
@@ -291,7 +301,7 @@ fn classify(version: &str) -> Pin {
 ///
 /// A name that resolves to nothing comes back unchanged, so the failure is the one from trying to
 /// run it, which already says what to do about it.
-fn on_path(name: &str) -> PathBuf {
+pub(crate) fn on_path(name: &str) -> PathBuf {
     let Some(path) = std::env::var_os("PATH") else { return PathBuf::from(name) };
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
@@ -303,46 +313,6 @@ fn on_path(name: &str) -> PathBuf {
 fn copy_of(statement: &str, to: &Path) -> String {
     let quoted = to.display().to_string().replace('\'', "''");
     format!("COPY ({statement}) TO '{quoted}' (FORMAT csv, HEADER, FORCE_QUOTE *)")
-}
-
-/// Put the two CSV files together into one table.
-///
-/// The column names come from the DESCRIBE rather than from the row header, because they are the
-/// same names and DESCRIBE is the one that also carries the types. They are checked against each
-/// other anyway, since a disagreement means the two COPYs did not see the same query and every
-/// value below is then lined up against the wrong column.
-fn assemble(types: &[Vec<Cell>], rows: &[Vec<Cell>]) -> Result<Table, HarnessError> {
-    let mut columns = Vec::with_capacity(types.len().saturating_sub(1));
-    for record in types.iter().skip(1) {
-        let name = match record.first() {
-            Some(Cell::Text(t)) => t.clone(),
-            _ => return Err(HarnessError::new("DESCRIBE returned a column with no name")),
-        };
-        let ty = match record.get(1) {
-            Some(Cell::Text(t)) => t.clone(),
-            _ => return Err(HarnessError::new(format!("DESCRIBE gave {name} no type"))),
-        };
-        columns.push(Column { name, ty });
-    }
-
-    let header = rows.first().map_or(&[][..], Vec::as_slice);
-    if header.len() != columns.len() {
-        return Err(HarnessError::new(format!(
-            "the query returned {} columns and DESCRIBE named {}",
-            header.len(),
-            columns.len()
-        )));
-    }
-    for (at, column) in columns.iter().enumerate() {
-        if header[at] != Cell::Text(column.name.clone()) {
-            return Err(HarnessError::new(format!(
-                "column {at} is {} in the result and {} in the DESCRIBE",
-                header[at], column.name
-            )));
-        }
-    }
-
-    Ok(Table { columns, rows: rows.iter().skip(1).cloned().collect() })
 }
 
 #[cfg(test)]
