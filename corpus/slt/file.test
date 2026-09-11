@@ -1,0 +1,101 @@
+# name: corpus/slt/file.test
+# description: read_csv, read_parquet and the replacement scan over a committed fixture
+# group: [smoke]
+
+# The two fixtures under corpus/data are read by a path relative to the working directory, which is
+# the crate root for every way this corpus is run: the test that walks corpus/slt, the binary the
+# isolating runner spawns, and rudb-compat run from a shell. That is how DuckDB's own corpus does
+# it, and both engines here resolve a relative path against the process they run in, so the same
+# text reaches the same bytes on both sides. The fixtures were written by the pinned binary from
+# one table, so the CSV and the Parquet hold the same five rows, and every expectation below was
+# taken off that binary and not out of rudb.
+
+query ITRT
+SELECT * FROM read_csv('corpus/data/people.csv') ORDER BY id;
+----
+1	ann	10.500	true
+2	bob	20.250	false
+3	cat	NULL	true
+4	dan	40.000	NULL
+5	eve	50.750	false
+
+query ITRT
+SELECT * FROM read_parquet('corpus/data/people.parquet') ORDER BY id;
+----
+1	ann	10.500	true
+2	bob	20.250	false
+3	cat	NULL	true
+4	dan	40.000	NULL
+5	eve	50.750	false
+
+# A bare string where a table name goes is the replacement scan, which picks the reader off the
+# extension. It is the spelling the ClickBench entry uses and the one a user reaches for first.
+
+query ITRT
+SELECT * FROM 'corpus/data/people.csv' ORDER BY id;
+----
+1	ann	10.500	true
+2	bob	20.250	false
+3	cat	NULL	true
+4	dan	40.000	NULL
+5	eve	50.750	false
+
+query ITRT
+SELECT * FROM 'corpus/data/people.parquet' ORDER BY id;
+----
+1	ann	10.500	true
+2	bob	20.250	false
+3	cat	NULL	true
+4	dan	40.000	NULL
+5	eve	50.750	false
+
+query I
+SELECT count(*) FROM read_parquet('corpus/data/people.parquet');
+----
+5
+
+query RR
+SELECT sum(score), avg(score) FROM read_parquet('corpus/data/people.parquet');
+----
+121.500	30.375
+
+query T
+SELECT name FROM read_csv('corpus/data/people.csv') WHERE member ORDER BY name;
+----
+ann
+cat
+
+query IR
+SELECT id, score FROM 'corpus/data/people.parquet' WHERE score IS NULL;
+----
+3	NULL
+
+# One query reading both files, because a scan that only works as the whole of a query is not a
+# scan, it is a way of printing a file.
+
+query ITR
+SELECT a.id, a.name AS who, b.score FROM read_parquet('corpus/data/people.parquet') a JOIN read_csv('corpus/data/people.csv') b ON a.id = b.id ORDER BY a.id;
+----
+1	ann	10.500
+2	bob	20.250
+3	cat	NULL
+4	dan	40.000
+5	eve	50.750
+
+# The two readers do not agree about the first column and that is not a bug. Parquet carries the
+# type, so id comes back INTEGER, and the CSV has nothing but the digits to go on, so the sniffer
+# picks BIGINT. Reading the same five rows through the two readers and getting two different widths
+# of integer is what the binary does. There is no record here asserting that, because the two ways
+# of asking an engine what type a column is are DESCRIBE and typeof and rudb has neither yet.
+
+# A file that is not there is an IO error naming the pattern, through either spelling.
+
+statement error
+SELECT count(*) FROM read_parquet('corpus/data/nosuch.parquet');
+----
+No files found that match the pattern
+
+statement error
+SELECT count(*) FROM 'corpus/data/nosuch.parquet';
+----
+No files found that match the pattern
