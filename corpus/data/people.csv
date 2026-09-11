@@ -1,0 +1,6 @@
+id,name,score,member
+1,ann,10.5,true
+2,bob,20.25,false
+3,cat,,true
+4,dan,40.0,
+5,eve,50.75,false
