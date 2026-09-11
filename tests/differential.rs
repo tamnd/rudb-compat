@@ -42,17 +42,15 @@ fn every_statement_the_engine_parses_is_a_statement_duckdb_parses() {
 }
 
 #[test]
-fn the_two_known_dialect_differences_are_still_the_only_two() {
+fn the_dialect_file_agrees_in_full_against_the_pinned_binary() {
     let Some(mut duckdb) = duckdb() else { return };
+    let pinned = duckdb.is_pinned();
     let mut rudb = Rudb::new();
     let text = std::fs::read_to_string("corpus/dialect.sql").unwrap();
     let statements = statements(&text);
     let report = run_parse(&mut duckdb, &mut rudb, &statements, MessageMatch::Kind).unwrap();
 
     let disagreed: Vec<_> = report.cases.iter().filter(|c| !c.agreed()).collect();
-    // Both of these are upstream moving between the newest released binary and the v2.0 ref the
-    // grammar is vendored from, so the assertion is on which way round each one falls rather than
-    // on there being none. When a v2.0 binary exists this test is what notices they went away.
     let mut only_duckdb_rejected = 0;
     let mut only_rudb_rejected = 0;
     for case in &disagreed {
@@ -64,6 +62,25 @@ fn the_two_known_dialect_differences_are_still_the_only_two() {
             }
         }
     }
+
+    if pinned {
+        // This is the file that used to show the gap, and against the commit the grammar is
+        // vendored from there is no gap to show. Every statement in it lands the same way on both
+        // engines, which is what the whole pin is for.
+        assert_eq!(
+            disagreed.len(),
+            0,
+            "{} of {} disagreed against the pinned binary",
+            disagreed.len(),
+            report.cases.len()
+        );
+        return;
+    }
+    // Without the pinned binary the comparison is against a release, and the two differences it
+    // produces are upstream moving between that release and the v2.0 ref rather than rudb being
+    // wrong. `ORDER BY x ASCENDING` is in the vendored grammar and a syntax error on 1.5.5, and
+    // `[1, 2] <-> [3, 4]` is array distance on 1.5.5 and cannot be one token under the v2.0
+    // tokenizer. So the assertion here is on which way round each one falls.
     assert_eq!(only_duckdb_rejected, 1, "ASCENDING is the only one of these");
     assert_eq!(only_rudb_rejected, 1, "the array distance operator is the only one of these");
 }

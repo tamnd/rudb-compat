@@ -36,21 +36,25 @@ Errors are compared too, by error kind, so a statement both engines reject count
 
 The full path is there behind `run` rather than `parse`: two engines, full result sets, column names and types, and a per-statement ordering rule that comes from rudb's own AST. `rudb-compat query 'SELECT 1'` runs one statement on both and prints what differs.
 
-The DuckDB side is a real binary of a named version, found on `PATH` or named by `RUDB_COMPAT_DUCKDB`. `rudb-compat duckdb` prints which one it found and whether it matches the version rudb tracks.
+The DuckDB side is a real binary built at a named commit, found on `PATH` or named by `RUDB_COMPAT_DUCKDB`. `rudb-compat duckdb` prints which one it found and whether it is the commit rudb vendors its grammar from.
 
 ```
 $ rudb-compat duckdb
-binary   /opt/homebrew/bin/duckdb
-version  v1.5.5 (Variegata) d8cdaa33fd
-pinned   v2.0
+binary   /home/tam/.local/bin/duckdb
+version  v2.0.0-dev84237 (Development Version) cc7e7bac7f
+commit   cc7e7bac7f
+pinned   v2.0 at cc7e7bac7f
 
-This is not the version the grammar is vendored from, so a number that
-comes out of it is about this DuckDB and not about the one rudb tracks.
+This is the commit the grammar is vendored from.
 ```
 
-There is no published v2.0 binary yet, so that mismatch is the state on every machine today rather than a local problem, and saying so in the tool is better than a percentage that quietly means something else.
+The commit is the check rather than the version. `v2.0-cyanoptera` is a development branch that moves every day, so two binaries can both say `v2.0.0-dev` and disagree about the language, and a version string comparison passes on both. `duckdb --version` prints the short hash as the last word of the line, so the comparison is against that. Same version and a different hash is its own reported state and not a pass.
 
-`corpus/dialect.sql` is the file where the mismatch shows. It comes back at 9 of 11, and both differences are upstream moving between the newest release and the v2.0 ref rather than rudb being wrong: `ORDER BY x ASCENDING` is `AscendingOrder <- 'ASC' / 'ASCENDING'` in the vendored grammar and a syntax error on 1.5.5, and `[1, 2] <-> [3, 4]` is array distance on 1.5.5 and cannot be one token under the v2.0 tokenizer, where a hyphen is a single byte operator that never joins an operator run. A test asserts those two and only those two, so the day a v2.0 binary exists the run is what tells us they went away.
+There is no published v2.0 binary to download, so the pinned one is built from source. `scripts/oracle` in the rudb repository does that on a named machine: it clones DuckDB, checks out the vendored commit, builds the CLI with the parquet and json extensions in it, and installs it into `~/.local/bin` under a name carrying the version and the hash, leaving whatever DuckDB was already there alone. server1, server2, server3 and gamingpc all have it.
+
+A release binary is still allowed, because most machines have one and a run against it is better than no run. Every report produced that way carries a line saying it is not the pinned commit, and `rudb-compat duckdb --pinned` fails outright rather than printing it, which is how a machine that publishes numbers refuses to publish the wrong ones.
+
+`corpus/dialect.sql` is the file where the difference showed. Against a 1.5.5 it came back at 9 of 11, and both differences were upstream moving rather than rudb being wrong: `ORDER BY x ASCENDING` is `AscendingOrder <- 'ASC' / 'ASCENDING'` in the vendored grammar and a syntax error on 1.5.5, and `[1, 2] <-> [3, 4]` is array distance on 1.5.5 and cannot be one token under the v2.0 tokenizer, where a hyphen is a single byte operator that never joins an operator run. Against the pinned binary it is 11 of 11, and the test asserts the full agreement there and the two known differences under a fallback.
 
 The suites behind the four levels arrive with M2 in [`spec/17-milestones.md`](https://github.com/tamnd/rudb/blob/main/spec/17-milestones.md), which is the milestone where there is first a database to point them at. `rudb-compat levels` prints them and the fact that none has been measured.
 
