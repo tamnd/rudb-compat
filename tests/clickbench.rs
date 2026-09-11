@@ -26,6 +26,11 @@
 //! nothing until it is over, and if it ends by being killed rather than by finishing then the
 //! query it died on is the thing worth knowing.
 //!
+//! Set `RUDB_COMPAT_SHELL` to run both engines as binaries instead of running rudb as the library
+//! this crate links. Everything else stays where it is, including the view, so the two runs ask the
+//! same question through two different doors and a number that only holds through one of them is a
+//! number about the door rather than about the engine. `RUDB_COMPAT_RUDB` names the binary.
+//!
 //! The hundred thousand row partition works too and answers a weaker question: every query still
 //! has to return the same thing on both engines, and ties at a `LIMIT` are rarer on a smaller file,
 //! so a green run on the partition is a floor rather than the claim the milestone wants.
@@ -40,6 +45,7 @@ use rudb_compat::compare::{Difference, MessageMatch};
 use rudb_compat::duckdb::Duckdb;
 use rudb_compat::engine::Engine;
 use rudb_compat::rudb::Rudb;
+use rudb_compat::shell::Shell;
 use rudb_compat::suite::{Report, run, statements};
 
 /// The projection every engine on the board gets, as a view over the file where it lies.
@@ -70,26 +76,42 @@ fn hits() -> Option<PathBuf> {
     [named, data].into_iter().flatten().find(|at| at.is_file())
 }
 
-/// Put one of the corpus files to both engines over the same view, or say why it did not run.
-fn against(corpus: &str) -> Option<(Report, PathBuf)> {
-    let at = hits()?;
+/// The two engines to put the corpus to, and the view they both read it through.
+///
+/// `RUDB_COMPAT_SHELL` swaps the rudb library for the rudb binary and leaves everything else alone,
+/// which is the comparison the drop in claim is actually about. The rest of this file does not care
+/// which it got, and that is the point: a number that only holds through one of the two doors is a
+/// number about the door.
+fn engines(view: &str) -> Option<(Box<dyn Engine>, Box<dyn Engine>)> {
+    if std::env::var_os("RUDB_COMPAT_SHELL").is_some() {
+        let left = Shell::duckdb().ok()?.with_setup(vec![view.to_owned()]);
+        let right = Shell::rudb().ok()?.with_setup(vec![view.to_owned()]);
+        return Some((Box::new(left), Box::new(right)));
+    }
     let Ok(duckdb) = Duckdb::discover() else {
         eprintln!("skipping, no DuckDB on this machine");
         return None;
     };
-    let view = view(&at);
     // DuckDB gets the view again in front of every statement because every statement there is its
     // own process. rudb keeps one database for the run, so it gets it once, and a failure on this
     // line is a broken harness rather than a failing case.
-    let mut duckdb = duckdb.with_setup(vec![view.clone()]);
-    let mut rudb = Rudb::new();
-    let made = rudb.run(&view).expect("rudb should answer");
+    let left = duckdb.with_setup(vec![view.to_owned()]);
+    let mut right = Rudb::new();
+    let made = right.run(view).expect("rudb should answer");
     assert!(made.is_rows(), "rudb could not make the view\n{view}\n{made:?}");
+    Some((Box::new(left), Box::new(right)))
+}
+
+/// Put one of the corpus files to both engines over the same view, or say why it did not run.
+fn against(corpus: &str) -> Option<(Report, PathBuf)> {
+    let at = hits()?;
+    let view = view(&at);
+    let (mut left, mut right) = engines(&view)?;
 
     let text = std::fs::read_to_string(corpus).unwrap();
     let queries = statements(&text);
     assert_eq!(queries.len(), 43, "ClickBench is forty three queries and {corpus} lost one");
-    let report = run(&mut duckdb, &mut rudb, &queries, MessageMatch::Kind).unwrap();
+    let report = run(left.as_mut(), right.as_mut(), &queries, MessageMatch::Kind).unwrap();
     Some((report, at))
 }
 
