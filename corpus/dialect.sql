@@ -3,10 +3,15 @@
 --
 -- Against the pinned binary all eleven of these parse the same way on both engines, which is what
 -- the vendored grammar is for and what `the_dialect_file_agrees_in_full_against_the_pinned_binary`
--- gates on. Running them rather than parsing them is a second number and it is nine of eleven, so
--- two of these say something different once an answer has to come out. Those two carry the issue
--- that tracks them, and they are the reason this file is not expected to come back at a hundred
--- percent through `rudb-compat run`.
+-- gates on. Running them rather than parsing them is a second number and it is ten of eleven through
+-- `rudb-compat run <file> --shell`, so one of these says something different once an answer has to
+-- come out. That one carries the issue that tracks it, and it is the reason this file is not expected
+-- to come back at a hundred percent.
+--
+-- The library driver says nine, and the extra one is not an engine difference. It wraps a statement
+-- in a COPY to get the types out of DuckDB, which puts bytes behind the number below that runs out at
+-- its exponent marker and so asks the two engines different questions. That is
+-- tamnd/rudb-compat#25.
 
 -- An operator the dialect does not name. Two or more operator characters that do not spell one of
 -- the operators the grammar lists reach OperatorLiteral and become a function call by that name.
@@ -20,9 +25,11 @@ SELECT a foo b;
 SELECT FROM WHERE;
 
 -- One number token when there is nothing left to read and a 1 aliased e when there is. The pinned
--- binary answers e = 1 for `SELECT 1e;` and cannot convert '1e' to a double for `SELECT 1e`, one
+-- binary answers e = 1 for `SELECT 1e;` and cannot convert '1e' to DOUBLE for `SELECT 1e`, one
 -- semicolon apart, because the tokenizer gives the exponent marker back when it has input left to
--- give it back into. rudb takes the number token both times, which is tamnd/rudb#277.
+-- give it back into. The harness sends a statement without its terminator, so what runs here is the
+-- second of those and both engines refuse it in the same words now, which took tamnd/rudb#277. rudb
+-- still refuses the one with the semicolon, and that is tamnd/rudb#297.
 SELECT 1e;
 
 -- Quoted identifiers keep their case, in DuckDB and here, which is the thing every other database
