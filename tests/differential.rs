@@ -86,7 +86,7 @@ fn the_dialect_file_agrees_in_full_against_the_pinned_binary() {
 }
 
 #[test]
-fn the_dialect_file_runs_at_eight_of_eleven_and_these_are_the_three_that_do_not() {
+fn the_dialect_file_runs_at_nine_of_eleven_and_these_are_the_two_that_do_not() {
     let Some(mut duckdb) = duckdb() else { return };
     if !duckdb.is_pinned() {
         eprintln!("skipping, the DuckDB here is not the binary the grammar was vendored from");
@@ -98,16 +98,17 @@ fn the_dialect_file_runs_at_eight_of_eleven_and_these_are_the_three_that_do_not(
     let report = rudb_compat::suite::run(&mut duckdb, &mut rudb, &statements, MessageMatch::Kind)
         .expect("both engines should answer");
 
-    // Parsing this file agrees eleven of eleven and running it agrees eight, which are two different
+    // Parsing this file agrees eleven of eleven and running it agrees nine, which are two different
     // measurements of the same statements and both are worth having. Pinned by statement rather than
-    // by count so that the day one of these is fixed or one of the other eight breaks, it is a diff
-    // somebody reviewed rather than a number that quietly moved. The issues are tamnd/rudb#277,
-    // tamnd/rudb#276 and tamnd/rudb#278, in the order they appear here.
+    // by count so that the day one of these is fixed or one of the other nine breaks, it is a diff
+    // somebody reviewed rather than a number that quietly moved. The issues are tamnd/rudb#277 and
+    // tamnd/rudb#278, in the order they appear here. The dollar quoted string was the third and is
+    // tamnd/rudb#276, which is fixed, so it is one of the nine now.
     let disagreed: Vec<&str> =
         report.cases.iter().filter(|c| !c.agreed()).map(|c| c.sql.as_str()).collect();
     assert_eq!(
         disagreed,
-        vec!["SELECT 1e", "SELECT $$dollar quoted$$", "SELECT x[1:2] FROM t"],
+        vec!["SELECT 1e", "SELECT x[1:2] FROM t"],
         "the dialect run changed shape"
     );
 }

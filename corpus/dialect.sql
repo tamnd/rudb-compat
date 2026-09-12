@@ -3,10 +3,10 @@
 --
 -- Against the pinned binary all eleven of these parse the same way on both engines, which is what
 -- the vendored grammar is for and what `the_dialect_file_agrees_in_full_against_the_pinned_binary`
--- gates on. Running them rather than parsing them is a second number and it is eight of eleven, so
--- three of these say something different once an answer has to come out. Those three carry the
--- issue that tracks them, and they are the reason this file is not expected to come back at a
--- hundred percent through `rudb-compat run`.
+-- gates on. Running them rather than parsing them is a second number and it is nine of eleven, so
+-- two of these say something different once an answer has to come out. Those two carry the issue
+-- that tracks them, and they are the reason this file is not expected to come back at a hundred
+-- percent through `rudb-compat run`.
 
 -- An operator the dialect does not name. Two or more operator characters that do not spell one of
 -- the operators the grammar lists reach OperatorLiteral and become a function call by that name.
@@ -34,7 +34,8 @@ SELECT "Quoted Col" FROM t;
 SELECT ascending FROM t ORDER BY x ASCENDING;
 
 -- Dollar quoting, which the grammar says nothing about, because the tokenizer owns it. Both engines
--- parse it and rudb keeps the dollar signs in the string, which is tamnd/rudb#276.
+-- parse it and both answer the text between the tags, the second half of that having taken
+-- tamnd/rudb#276: rudb found the closing tag and then kept every byte it had scanned.
 SELECT $$dollar quoted$$;
 
 -- Adjacent string literals are one string.
