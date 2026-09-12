@@ -37,6 +37,39 @@ fn every_file_in_the_committed_corpus_passes() {
     assert!(summary.passed > 100, "only {} records ran, which is too few", summary.passed);
 }
 
+/// The same corpus with every optimizer pass turned off, which has to answer the same.
+///
+/// The strongest property in the project, and it needs no new expected outputs. Every pass is a
+/// rewrite that is supposed to keep the answer, so the plan the binder produced is the right answer
+/// by construction and a file that passes with the passes off and fails with them on is a pass that
+/// changed an answer. `spec/09-optimizer.md` section 9.1 asks for exactly this.
+///
+/// It is checked both ways round. The unoptimized run has to pass the corpus on its own, which is
+/// what catches a pass covering for a hole in the executor, and the two summaries have to match
+/// record for record, which is what catches a pass changing an answer the corpus checks.
+#[test]
+fn the_corpus_answers_the_same_with_every_optimizer_pass_turned_off() {
+    let mut on = Rudb::new();
+    let optimized = run_path(&mut on, Path::new("corpus/slt"), false).expect("the corpus is there");
+
+    let mut off = Rudb::unoptimized();
+    let unoptimized =
+        run_path(&mut off, Path::new("corpus/slt"), false).expect("the corpus is there");
+
+    assert!(
+        unoptimized.failures.is_empty(),
+        "{} of {} records failed with the optimizer off\n{}",
+        unoptimized.failed,
+        unoptimized.attempted(),
+        unoptimized.failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+    );
+    assert!(unoptimized.skipped_files.is_empty(), "{:?}", unoptimized.skipped_files);
+    assert_eq!(unoptimized.files, optimized.files);
+    assert_eq!(unoptimized.passed, optimized.passed);
+    assert_eq!(unoptimized.failed, optimized.failed);
+    assert_eq!(unoptimized.failures, optimized.failures);
+}
+
 /// The same corpus through the shell, which is the rudb somebody who is not this harness runs.
 ///
 /// The library is one of the two ways into the engine and the binary is the other, and the drop in
