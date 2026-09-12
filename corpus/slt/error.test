@@ -1,0 +1,193 @@
+# name: corpus/slt/error.test
+# description: the error classes E0 ships, with the message upstream prints where both agree on it
+# group: [smoke]
+
+# An error is an answer. A query that should fail and instead returns rows is as wrong as a query
+# that returns the wrong rows, and a query that fails with the wrong kind sends whoever reads the
+# message looking in the wrong place. So the classes below are pinned the same way a result set is.
+#
+# Every expectation here was taken off the pinned DuckDB and not out of rudb, one statement per
+# process through both shells. Where the two engines print the same sentence the whole sentence is
+# written down, because that is the thing worth holding still. Where they do not yet agree the
+# record keeps only the part they share and a comment says what upstream prints instead, so the
+# file stays a gate rudb passes today without quietly agreeing that rudb's wording is the right one.
+
+statement ok
+CREATE TABLE t (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'one'), (2, 'two');
+
+# The parser, which is the first thing that can say no.
+
+statement error
+SELECT FROM WHERE;
+----
+Parser Error: syntax error at or near "WHERE"
+
+statement error
+SELECT ('unterminated;
+----
+Parser Error: unterminated string literal
+
+# The catalog, which is the second.
+
+statement error
+SELECT * FROM nosuchtable;
+----
+Catalog Error: Table with name nosuchtable does not exist!
+
+statement error
+DROP TABLE nosuchtable;
+----
+Catalog Error: Table with name nosuchtable does not exist!
+
+statement error
+CREATE TABLE t (a INTEGER);
+----
+Catalog Error: Table with name "t" already exists!
+
+statement error
+SELECT nosuchfunction(1);
+----
+Catalog Error: Scalar Function with name nosuchfunction does not exist!
+
+# The binder. A name that is not there is the common one, and it has to come out the same wherever
+# in the statement the name was written, so it is pinned from three clauses.
+
+statement error
+SELECT nosuchcolumn FROM t;
+----
+Binder Error: Referenced column "nosuchcolumn" not found in FROM clause!
+
+statement error
+SELECT * FROM t WHERE nosuchcolumn = 1;
+----
+Binder Error: Referenced column "nosuchcolumn" not found in FROM clause!
+
+statement error
+SELECT a FROM t ORDER BY nosuchcolumn;
+----
+Binder Error: Referenced column "nosuchcolumn" not found in FROM clause!
+
+# Upstream ends this one at the exclamation mark and puts the candidate tables on the next line.
+# rudb writes "not found in FROM clause!" instead, so only the part before it is recorded.
+statement error
+SELECT nosuchtable.a FROM t;
+----
+Binder Error: Referenced table "nosuchtable" not found
+
+# Upstream quotes the two suggestions with apostrophes and rudb quotes them with double quotes, so
+# the record stops before them.
+statement error
+SELECT a FROM t, t AS u;
+----
+Binder Error: Ambiguous reference to column name "a"
+
+# Upstream ends this sentence with a full stop and rudb does not.
+statement error
+SELECT a, b FROM t GROUP BY a;
+----
+Binder Error: column "b" must appear in the GROUP BY clause or must be part of an aggregate function
+
+statement error
+SELECT 1 UNION ALL SELECT 1, 2;
+----
+Binder Error: Set operations can only apply to expressions with the same number of result columns
+
+statement error
+SELECT * FROM (SELECT 1) AS x(a, b);
+----
+Binder Error: table "x" has 1 columns available but 2 columns specified
+
+statement error
+INSERT INTO t VALUES (1, 'one', 'extra');
+----
+has 2 columns but 3 values were supplied
+
+# A function that exists and was called with types it has no signature for. The candidate list is
+# part of the message on both sides, which is the part that makes the error useful, so it is pinned
+# as well.
+statement error
+SELECT sum(b) FROM t;
+----
+Binder Error: No function matches the given name and argument types 'sum(VARCHAR)'. You might need to add explicit type casts.
+
+# Upstream calls an integer literal INTEGER_LITERAL here and rudb calls it INTEGER, so the argument
+# types are left out and the candidate list is not.
+statement error
+SELECT strlen(1, 2);
+----
+Binder Error: No function matches the given name and argument types 'strlen(
+Candidate functions:
+strlen(col0 VARCHAR) -> BIGINT
+
+# A cast that cannot be done. Upstream says "Could not convert string 'abc' to INT32", with the
+# physical type name, and rudb says "Could not convert VARCHAR 'abc' to INTEGER", so what is pinned
+# is the kind, the opening of the sentence and the value that could not be converted.
+statement error
+SELECT 'abc'::INTEGER;
+----
+Conversion Error: Could not convert
+'abc'
+
+# Arithmetic that leaves the type, which is an error and not a wrap.
+
+statement error
+SELECT 2147483647::INTEGER + 1::INTEGER;
+----
+Out of Range Error: Overflow in addition of INT32 (2147483647 + 1)!
+
+statement error
+SELECT 9223372036854775807::BIGINT + 1::BIGINT;
+----
+Out of Range Error: Overflow in addition of INT64 (9223372036854775807 + 1)!
+
+# Division by zero, where the rule is not the one most engines have. Plain division is floating
+# point and gives infinity, and it is the integer division and the modulo that raise.
+
+query R
+SELECT 1 / 0;
+----
+inf
+
+statement error
+SELECT 1 // 0;
+----
+Invalid Input Error: Division by zero in expression (1 // 0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement error
+SELECT 1 % 0;
+----
+Invalid Input Error: Division by zero in expression (1 % 0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+# A file that is not there, through both readers and through the replacement scan. The pattern is
+# quoted in the message and the path is the one that was asked for, which is what somebody staring
+# at a typo needs to see.
+
+statement error
+SELECT * FROM read_parquet('corpus/data/nosuchfile.parquet');
+----
+IO Error: No files found that match the pattern "corpus/data/nosuchfile.parquet"
+
+statement error
+SELECT * FROM read_csv('corpus/data/nosuchfile.csv');
+----
+IO Error: No files found that match the pattern "corpus/data/nosuchfile.csv"
+
+statement error
+SELECT * FROM 'corpus/data/nosuchfile.parquet';
+----
+IO Error: No files found that match the pattern "corpus/data/nosuchfile.parquet"
+
+# The table is still there and still readable after all of that, which is the other half of the
+# claim: an error ends the statement and not the session.
+
+query IT
+SELECT a, b FROM t ORDER BY a;
+----
+1	one
+2	two
+
+statement ok
+DROP TABLE t;
