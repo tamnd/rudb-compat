@@ -207,6 +207,86 @@ impl Engine for Shell {
     }
 }
 
+/// A shell that remembers what it has been told, so that a file of statements runs as one session.
+///
+/// [`Shell`] runs every statement in a fresh process, which is what the differential corpora want,
+/// because each of their statements stands alone and a process per statement is the cheapest way to
+/// be sure of it. A sqllogictest file is the other shape: it creates a table, fills it, asks it
+/// questions and drops it, and none of that works if the process running the second statement never
+/// heard the first one.
+///
+/// The way to keep state across processes is usually a database file, and that is not available
+/// here, because rudb has no persistence until E2. So the session is rebuilt in front of every
+/// statement instead, out of the statements that printed nothing. That set is exactly the one that
+/// leaves something behind and nothing on the screen: `CREATE`, `INSERT`, `DROP`, `SET`. A statement
+/// that printed rows is not replayed, both because replaying it would put its rows in front of the
+/// next answer where the reader expects one table, and because a query has nothing to leave behind.
+///
+/// The cost is a process per statement in the file plus a replay of the file so far, which is
+/// quadratic and is fine at the size of a corpus written by hand. It would not be fine on the four
+/// thousand upstream files, and that is not what this is for: those run against the library, where
+/// a connection stays open and none of this is needed.
+#[derive(Debug, Clone)]
+pub struct Session {
+    /// The shell underneath, with no setup of its own.
+    shell: Shell,
+    /// What has been run and printed nothing, in the order it was run.
+    history: Vec<String>,
+}
+
+impl Session {
+    /// Wrap a shell so that what it is told sticks until the next reset.
+    #[must_use]
+    pub fn new(shell: Shell) -> Self {
+        Self { shell, history: Vec::new() }
+    }
+
+    /// The statements this session replays in front of the next one.
+    #[must_use]
+    pub fn history(&self) -> &[String] {
+        &self.history
+    }
+
+    /// The shell with the session in front of it, ready for one statement.
+    fn primed(&self) -> Shell {
+        self.shell.clone().with_setup(self.history.clone())
+    }
+}
+
+impl Engine for Session {
+    fn name(&self) -> &str {
+        self.shell.name()
+    }
+
+    fn version(&self) -> &str {
+        self.shell.version()
+    }
+
+    fn run(&mut self, sql: &str) -> Result<Outcome, HarnessError> {
+        let statement = sql.trim().trim_end_matches(';');
+        let outcome = self.primed().run(statement)?;
+        if let Outcome::Rows(table) = &outcome {
+            if table.width() == 0 {
+                self.history.push(statement.to_owned());
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError> {
+        // Nothing is remembered here on purpose. `accepts` answers whether the text is SQL, it
+        // calls a catalog error accepted, and a session it built itself would not change one of
+        // its answers. Running the history in front of it still matters, because a statement that
+        // needs a table is a different statement to parse when the table is there.
+        self.primed().accepts(sql)
+    }
+
+    fn reset(&mut self) -> Result<(), HarnessError> {
+        self.history.clear();
+        Ok(())
+    }
+}
+
 /// The query that asks a shell what a statement's columns are.
 fn describe(statement: &str) -> String {
     format!("SELECT column_name, column_type FROM (DESCRIBE {statement})")
@@ -247,7 +327,7 @@ fn devnull() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::Shell;
+    use super::{Session, Shell};
     use crate::engine::{Cell, Engine, Outcome};
 
     /// Every test here needs both binaries on the machine. A developer without one gets a skipped
@@ -352,6 +432,50 @@ mod tests {
             assert_eq!(table.columns[0].name, "cid", "{}", shell.name());
             assert_eq!(table.columns[0].ty, "(not describable: Parser Error)", "{}", shell.name());
             assert_eq!(table.rows[0][1], Cell::Text("a".into()), "{}", shell.name());
+        }
+    }
+
+    #[test]
+    fn a_session_holds_on_to_what_a_statement_left_behind() {
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            let mut session = Session::new(shell);
+            session.run("CREATE TABLE t (a INTEGER)").unwrap();
+            session.run("INSERT INTO t VALUES (1), (2)").unwrap();
+            let Outcome::Rows(table) = session.run("SELECT sum(a) FROM t").unwrap() else {
+                panic!("{name}: the two statements before this one should have made t");
+            };
+            assert_eq!(table.rows, vec![vec![Cell::Text("3".into())]], "{name}");
+            assert_eq!(session.history().len(), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_session_remembers_nothing_that_printed_rows_or_failed() {
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            let mut session = Session::new(shell);
+            session.run("CREATE TABLE t (a INTEGER)").unwrap();
+            session.run("SELECT 1").unwrap();
+            let Outcome::Error(_) = session.run("DROP TABLE nosuchtable").unwrap() else {
+                panic!("{name}: dropping a table that is not there is an error");
+            };
+            assert_eq!(session.history(), ["CREATE TABLE t (a INTEGER)"], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_reset_session_starts_from_an_empty_database() {
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            let mut session = Session::new(shell);
+            session.run("CREATE TABLE t (a INTEGER)").unwrap();
+            session.reset().unwrap();
+            assert!(session.history().is_empty(), "{name}");
+            let Outcome::Error(e) = session.run("SELECT a FROM t").unwrap() else {
+                panic!("{name}: t was made before the reset and should be gone");
+            };
+            assert_eq!(e.kind, "Catalog Error", "{name}");
         }
     }
 

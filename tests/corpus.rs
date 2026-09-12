@@ -14,6 +14,7 @@ use std::time::Duration;
 use rudb_compat::conform::run_path;
 use rudb_compat::isolate::{Limits, run_corpus};
 use rudb_compat::rudb::Rudb;
+use rudb_compat::shell::{Session, Shell};
 
 #[test]
 fn every_file_in_the_committed_corpus_passes() {
@@ -34,6 +35,48 @@ fn every_file_in_the_committed_corpus_passes() {
     // is pinned. Raise it when a file is added, which is the point at which somebody is looking.
     assert_eq!(summary.files, 6, "the corpus gained or lost a file");
     assert!(summary.passed > 100, "only {} records ran, which is too few", summary.passed);
+}
+
+/// The same corpus through the shell, which is the rudb somebody who is not this harness runs.
+///
+/// The library is one of the two ways into the engine and the binary is the other, and the drop in
+/// claim is about the binary. So the corpus that says what rudb can do today has to come out the
+/// same way when a shell is the thing answering, or the claim is about a library nobody has.
+///
+/// This needs a built `rudb` and skips without one, which is the same rule the rest of the harness
+/// follows for a binary it does not build itself. CI in this repository has the library and not the
+/// binary, so the run that makes this a gate is the one in the engine's own CI, which builds the
+/// shell from the commit under test and points this corpus at it.
+#[test]
+fn every_file_in_the_committed_corpus_passes_through_the_shell_too() {
+    let shell = match Shell::rudb() {
+        Ok(shell) => shell,
+        Err(e) => {
+            eprintln!("skipping, no rudb shell: {e}");
+            return;
+        }
+    };
+    let mut library = Rudb::new();
+    let through_library =
+        run_path(&mut library, Path::new("corpus/slt"), false).expect("the corpus is there");
+
+    let mut session = Session::new(shell);
+    let summary = run_path(&mut session, Path::new("corpus/slt"), false).expect("the corpus is on");
+
+    assert!(
+        summary.failures.is_empty(),
+        "{} of {} records failed through the shell\n{}",
+        summary.failed,
+        summary.attempted(),
+        summary.failures.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+    );
+    assert!(summary.skipped_files.is_empty(), "{:?}", summary.skipped_files);
+    // The same corpus and the same engine, so the two ways in have to agree on the count as well
+    // as on the outcome. A file the shell quietly did not read would otherwise pass every
+    // assertion above this one.
+    assert_eq!(summary.files, through_library.files);
+    assert_eq!(summary.passed, through_library.passed);
+    assert_eq!(summary.failed, through_library.failed);
 }
 
 /// The same corpus through the isolating runner, which is how the upstream run works.
