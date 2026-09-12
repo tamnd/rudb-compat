@@ -3,12 +3,11 @@
 --
 -- Against the pinned binary all eleven of these parse the same way on both engines, which is what
 -- the vendored grammar is for and what `the_dialect_file_agrees_in_full_against_the_pinned_binary`
--- gates on. Running them rather than parsing them is a second number and it is ten of eleven through
--- `rudb-compat run <file> --shell`, so one of these says something different once an answer has to
--- come out. That one carries the issue that tracks it, and it is the reason this file is not expected
--- to come back at a hundred percent.
+-- gates on. Running them rather than parsing them is a second number and it is eleven of eleven
+-- through `rudb-compat run <file> --shell`, which it has been since tamnd/rudb#278. The file is at a
+-- hundred percent for the first time and the thing to watch now is that it stays there.
 --
--- The library driver says nine, and the extra one is not an engine difference. It wraps a statement
+-- The library driver says ten, and the missing one is not an engine difference. It wraps a statement
 -- in a COPY to get the types out of DuckDB, which puts bytes behind the number below that runs out at
 -- its exponent marker and so asks the two engines different questions. That is
 -- tamnd/rudb-compat#25.
@@ -53,8 +52,8 @@ SELECT 'a' 'b';
 SELECT a.b.c.d FROM t;
 
 -- A ranged slice. It parses, and what a missing bound means is a question for the run. There is no
--- table t, so the binary looks for it and says catalog error where rudb refuses the slice first and
--- says not implemented, which is tamnd/rudb#278.
+-- table t, so both engines look for it and both say catalog error, which took tamnd/rudb#278: rudb
+-- used to refuse the slice before it ever went looking for the table.
 SELECT x[1:2] FROM t;
 
 -- Array distance. The newest released DuckDB takes it. The vendored v2.0 tokenizer cannot produce
