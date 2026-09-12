@@ -1,10 +1,12 @@
 -- Statements where the dialect is the whole point, and where getting one wrong is invisible until
 -- somebody runs it.
 --
--- This file is not expected to come back at a hundred percent, and that is what it is for. Two of
--- these disagree between the newest released DuckDB and the grammar rudb has vendored from the
--- v2.0 development ref, and both disagreements are upstream moving rather than rudb being wrong.
--- They are written down here so that the day a v2.0 binary exists, the run says so.
+-- Against the pinned binary all eleven of these parse the same way on both engines, which is what
+-- the vendored grammar is for and what `the_dialect_file_agrees_in_full_against_the_pinned_binary`
+-- gates on. Running them rather than parsing them is a second number and it is eight of eleven, so
+-- three of these say something different once an answer has to come out. Those three carry the
+-- issue that tracks them, and they are the reason this file is not expected to come back at a
+-- hundred percent through `rudb-compat run`.
 
 -- An operator the dialect does not name. Two or more operator characters that do not spell one of
 -- the operators the grammar lists reach OperatorLiteral and become a function call by that name.
@@ -17,8 +19,10 @@ SELECT a foo b;
 -- Both engines have to agree about what is not SQL, not only about what is.
 SELECT FROM WHERE;
 
--- One number token and not a 1 aliased e. Reading the tokenizer source rather than the docs is
--- what settled this one.
+-- One number token when there is nothing left to read and a 1 aliased e when there is. The pinned
+-- binary answers e = 1 for `SELECT 1e;` and cannot convert '1e' to a double for `SELECT 1e`, one
+-- semicolon apart, because the tokenizer gives the exponent marker back when it has input left to
+-- give it back into. rudb takes the number token both times, which is tamnd/rudb#277.
 SELECT 1e;
 
 -- Quoted identifiers keep their case, in DuckDB and here, which is the thing every other database
@@ -29,7 +33,8 @@ SELECT "Quoted Col" FROM t;
 -- matchable as a literal and are still perfectly good column names.
 SELECT ascending FROM t ORDER BY x ASCENDING;
 
--- Dollar quoting, which the grammar says nothing about, because the tokenizer owns it.
+-- Dollar quoting, which the grammar says nothing about, because the tokenizer owns it. Both engines
+-- parse it and rudb keeps the dollar signs in the string, which is tamnd/rudb#276.
 SELECT $$dollar quoted$$;
 
 -- Adjacent string literals are one string.
@@ -39,7 +44,9 @@ SELECT 'a' 'b';
 -- know which it has until it has read past the dot.
 SELECT a.b.c.d FROM t;
 
--- A ranged slice. It parses, and what a missing bound means is a question for the run.
+-- A ranged slice. It parses, and what a missing bound means is a question for the run. There is no
+-- table t, so the binary looks for it and says catalog error where rudb refuses the slice first and
+-- says not implemented, which is tamnd/rudb#278.
 SELECT x[1:2] FROM t;
 
 -- Array distance. The newest released DuckDB takes it. The vendored v2.0 tokenizer cannot produce

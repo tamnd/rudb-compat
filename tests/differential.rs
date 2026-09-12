@@ -86,6 +86,33 @@ fn the_dialect_file_agrees_in_full_against_the_pinned_binary() {
 }
 
 #[test]
+fn the_dialect_file_runs_at_eight_of_eleven_and_these_are_the_three_that_do_not() {
+    let Some(mut duckdb) = duckdb() else { return };
+    if !duckdb.is_pinned() {
+        eprintln!("skipping, the DuckDB here is not the binary the grammar was vendored from");
+        return;
+    }
+    let mut rudb = Rudb::new();
+    let text = std::fs::read_to_string("corpus/dialect.sql").unwrap();
+    let statements = statements(&text);
+    let report = rudb_compat::suite::run(&mut duckdb, &mut rudb, &statements, MessageMatch::Kind)
+        .expect("both engines should answer");
+
+    // Parsing this file agrees eleven of eleven and running it agrees eight, which are two different
+    // measurements of the same statements and both are worth having. Pinned by statement rather than
+    // by count so that the day one of these is fixed or one of the other eight breaks, it is a diff
+    // somebody reviewed rather than a number that quietly moved. The issues are tamnd/rudb#277,
+    // tamnd/rudb#276 and tamnd/rudb#278, in the order they appear here.
+    let disagreed: Vec<&str> =
+        report.cases.iter().filter(|c| !c.agreed()).map(|c| c.sql.as_str()).collect();
+    assert_eq!(
+        disagreed,
+        vec!["SELECT 1e", "SELECT $$dollar quoted$$", "SELECT x[1:2] FROM t"],
+        "the dialect run changed shape"
+    );
+}
+
+#[test]
 fn a_query_and_a_statement_that_is_not_sql_both_reach_the_full_comparison() {
     let Some(mut duckdb) = duckdb() else { return };
     let mut rudb = Rudb::new();
