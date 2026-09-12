@@ -15,7 +15,7 @@
 //! is asked to enforce its own limit is an engine that can have a bug in the enforcing. So the run
 //! is still four thousand processes with one file each, and this process still holds a clock and a
 //! cap over each of them. They are a backstop now rather than the first thing to fire, which is
-//! why the clock here is four times the one the engine was given.
+//! why the clock here is twelve times the one the engine was given.
 //!
 //! The memory cap is checked by asking `ps` rather than by setting a resource limit, because
 //! `ulimit -v` is not honoured on macOS and the alternative is a `setrlimit` call, which means
@@ -32,10 +32,14 @@ use std::time::{Duration, Instant};
 use crate::conform::{Failure, Reason, Reasons, Skips, Summary};
 use crate::engine::HarnessError;
 
-/// How long and how large one file is allowed to get.
+/// How long a statement may run and how large a file may get.
+///
+/// Neither number is used as it stands. What the engine is told and what this process enforces are
+/// both worked out from them, by [`Limits::statement`], [`Limits::deadline`] and [`Limits::budget`],
+/// and the two are deliberately not the same so that the engine reaches its limit first.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Wall clock per file.
+    /// Wall clock per statement.
     pub time: Duration,
     /// Resident set per file, in bytes.
     pub memory: u64,
@@ -45,8 +49,8 @@ impl Default for Limits {
     /// Ten seconds and two gigabytes.
     ///
     /// Both are far above what any file that works needs. The whole corpus runs in a second and a
-    /// half in one process, so a file that has been going for ten seconds on its own is not slow,
-    /// it is not going to stop. The point of the limits is to name that file, not to time anything.
+    /// half in one process, so a statement that has been going for ten seconds on its own is not
+    /// slow, it is not going to stop. The point of the limits is to name it, not to time anything.
     fn default() -> Self {
         Self { time: Duration::from_secs(10), memory: 2 * 1024 * 1024 * 1024 }
     }
@@ -54,11 +58,15 @@ impl Default for Limits {
 
 /// How much longer than one statement's clock a whole file is given before it is killed.
 ///
-/// The engine stops a statement at [`Limits::time`] and this runner stops the file at four times
-/// that, so the normal way a runaway file ends is the engine ending it. A file is a hundred quick
-/// statements and at most one that runs away, so four is room for the rare file with a few of
-/// them, and it is still a bound rather than a hope.
-const BACKSTOP: u32 = 4;
+/// The engine stops a statement at [`Limits::time`] and this runner stops the file at twelve times
+/// that, so the normal way a runaway file ends is the engine ending it.
+///
+/// Twelve because a file with ten slow statements in it is a file that exists. `max_execution_time`
+/// is four of them on purpose and `hash_join_dict_surviving` is several more by accident, and both
+/// of those are the limits working rather than the limits being missed, so a backstop that kills
+/// them is a backstop that throws away the outcome it was meant to preserve. A file that takes
+/// longer than ten runaway statements is the engine not stopping, which is what this is here for.
+const BACKSTOP: u32 = 12;
 
 impl Limits {
     /// What the engine is told, which is a limit per statement and not per file.
@@ -557,7 +565,7 @@ mod tests {
         // the files go back to having no outcome at all.
         let limits = Limits::default();
         assert_eq!(limits.statement(), Duration::from_secs(10));
-        assert_eq!(limits.deadline(), Duration::from_secs(40));
+        assert_eq!(limits.deadline(), Duration::from_secs(120));
         assert_eq!(limits.budget(), 1024 * 1024 * 1024);
         assert!(limits.statement() < limits.deadline());
         assert!(limits.budget() < limits.memory);
