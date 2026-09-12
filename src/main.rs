@@ -543,7 +543,7 @@ fn help() {
     println!("Each file in an slt run gets a process of its own, because the corpus contains");
     println!("queries that are meant to be enormous. Both limits are handed to the engine, which");
     println!("stops the statement itself and leaves a failure the report can count. This process");
-    println!("keeps a clock of its own at four times the statement limit and a cap on the size of");
+    println!("keeps a clock of its own at twelve times the statement limit and a cap on the size");
     println!("the child, and a file that reaches either of those is killed and named instead.");
     println!();
     println!("The slt command needs no DuckDB on the machine, because a sqllogictest file already");
