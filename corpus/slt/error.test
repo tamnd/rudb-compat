@@ -122,14 +122,97 @@ Binder Error: No function matches the given name and argument types 'strlen(
 Candidate functions:
 strlen(col0 VARCHAR) -> BIGINT
 
-# A cast that cannot be done. Upstream says "Could not convert string 'abc' to INT32", with the
-# physical type name, and rudb says "Could not convert VARCHAR 'abc' to INTEGER", so what is pinned
-# is the kind, the opening of the sentence and the value that could not be converted.
+# The casts that cannot be done, one per shape of failure, whole sentence pinned. This was the one
+# entry in this file cut back to a fragment, because rudb said two sentences where upstream says
+# eight, and rudb#322 closed the gap. The type names in them are the physical ones, which is why
+# none of them say INTEGER or TINYINT, and the decimal ones name the integer the decimal is stored
+# in rather than the width it was declared with.
 statement error
 SELECT 'abc'::INTEGER;
 ----
-Conversion Error: Could not convert
-'abc'
+Conversion Error: Could not convert string 'abc' to INT32
+
+statement error
+SELECT '300'::TINYINT;
+----
+Conversion Error: Could not convert string '300' to INT8
+
+statement error
+SELECT 'abc'::DECIMAL(4,1);
+----
+Conversion Error: Could not convert string "abc" to DECIMAL(4,1)
+
+statement error
+SELECT 300::INTEGER::TINYINT;
+----
+Conversion Error: Type INT32 with value 300 can't be cast because the value is out of range for the destination type INT8
+
+statement error
+SELECT 999.9::DECIMAL(4,1)::TINYINT;
+----
+Conversion Error: Failed to cast decimal value 1000 to type INT8
+
+statement error
+SELECT 200000::DECIMAL(4,1);
+----
+Conversion Error: Could not cast value 200000 to DECIMAL(4,1)
+
+statement error
+SELECT 200000.5::DECIMAL(7,1)::DECIMAL(4,1);
+----
+Conversion Error: Casting value "200000.5" to type DECIMAL(4,1) failed: value is out of range!
+
+# A pair with no cast between it is a conversion error and not a missing feature, which is what
+# makes TRY_CAST answer null for it rather than raising.
+statement error
+SELECT DATE '1970-01-01'::INTEGER;
+----
+Conversion Error: Unimplemented type for cast (DATE -> INTEGER)
+
+query T
+SELECT TRY_CAST(DATE '1970-01-01' AS INTEGER);
+----
+NULL
+
+# A written date, which fails two different ways. A day that is spelled wrong is the format one and
+# a day that does not exist is the range one, and the thirty first of April used to come back from
+# rudb as the first of May.
+statement error
+SELECT 'yesterday'::DATE;
+----
+Conversion Error: invalid date field format: "yesterday", expected format is (YYYY-MM-DD)
+
+statement error
+SELECT '2021-04-31'::DATE;
+----
+Conversion Error: date field value out of range: "2021-04-31"
+
+statement error
+SELECT '2021-02-29 10:00:00'::TIMESTAMP;
+----
+Conversion Error: timestamp field value out of range: "2021-02-29 10:00:00"
+
+statement error
+SELECT 'abc'::TIMESTAMP;
+----
+Conversion Error: invalid timestamp field format: "abc", expected format is (YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])
+
+# A date takes a time on the end and throws it away, and midnight at the end of the day is a time on
+# both sides. The date keeps the day it was written with and the timestamp rolls into the next one.
+query T
+SELECT '2020-02-29 10:30:00'::DATE;
+----
+2020-02-29
+
+query T
+SELECT '2020-01-01 24:00:00'::DATE;
+----
+2020-01-01
+
+query T
+SELECT '2020-01-01 24:00:00'::TIMESTAMP;
+----
+2020-01-02 00:00:00
 
 # Arithmetic that leaves the type, which is an error and not a wrap.
 
