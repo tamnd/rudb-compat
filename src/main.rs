@@ -75,7 +75,13 @@ fn main() -> ExitCode {
         // corpus run survives a query that does not stop, and running it by hand is only ever
         // debugging the runner rather than debugging the engine.
         Some("slt-one") => match (rest.get(1), rest.get(2)) {
-            (Some(path), Some(name)) => one_file(Path::new(path), name),
+            // The seconds and the bytes after the name are the limits the engine is opened with.
+            // They are optional so that running this by hand still works, and the runner always
+            // passes them.
+            (Some(path), Some(name)) => {
+                let (timeout, memory) = child_limits(&rest[3..]);
+                one_file(Path::new(path), name, timeout, memory)
+            }
             _ => {
                 eprintln!("rudb-compat: slt-one needs a file and the name to report it under");
                 ExitCode::FAILURE
@@ -115,6 +121,21 @@ fn valued(args: &[String], flag: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// The two numbers the runner passes a child after the file and the name.
+///
+/// A timeout in seconds and a memory budget in bytes, both worked out by the parent out of its own
+/// limits, so all that happens here is reading them. Either one missing or unreadable falls back to
+/// what the default limits would have given, which is what somebody running this by hand gets.
+fn child_limits(rest: &[&str]) -> (Duration, u64) {
+    let default = Limits::default();
+    let seconds = rest
+        .first()
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or_else(|| default.statement().as_secs());
+    let memory = rest.get(1).and_then(|arg| arg.parse().ok()).unwrap_or_else(|| default.budget());
+    (Duration::from_secs(seconds), memory)
 }
 
 /// Everything on the command line except the options this file has already read.
@@ -330,7 +351,7 @@ fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCod
 ///
 /// This is the other side of [`rudb_compat::isolate`]. It exits zero whatever the file did, so that
 /// a nonzero exit means the process itself came apart and not that a test failed.
-fn one_file(path: &Path, name: &str) -> ExitCode {
+fn one_file(path: &Path, name: &str, timeout: Duration, memory: u64) -> ExitCode {
     // Read here rather than letting the runner walk to it, so the file is reported under the name
     // the parent gave it, which is its path inside the corpus and not its basename.
     let bytes = match std::fs::read(path) {
@@ -340,7 +361,7 @@ fn one_file(path: &Path, name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut rudb = Rudb::new();
+    let mut rudb = Rudb::limited(timeout, memory);
     let summary = match String::from_utf8(bytes) {
         Ok(text) => match rudb_compat::conform::run_text(&mut rudb, name, &text) {
             Ok(summary) => summary,
@@ -516,13 +537,14 @@ fn help() {
     println!("  --shell            drive both engines as command line binaries rather than one");
     println!("                     binary and one linked library, which is what tests the drop in");
     println!("                     claim. Needs a built rudb on PATH or in RUDB_COMPAT_RUDB.");
-    println!("  --limit <seconds>  how long one file may run before it is cut off, 10 by default");
+    println!("  --limit <seconds>  how long one statement may run, 10 by default");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
     println!();
     println!("Each file in an slt run gets a process of its own, because the corpus contains");
-    println!("queries that are meant to be enormous and rudb has no memory manager to stop them");
-    println!("yet. A file that goes over either limit is killed and named rather than being left");
-    println!("to decide whether the rest of the run gets reported.");
+    println!("queries that are meant to be enormous. Both limits are handed to the engine, which");
+    println!("stops the statement itself and leaves a failure the report can count. This process");
+    println!("keeps a clock of its own at four times the statement limit and a cap on the size of");
+    println!("the child, and a file that reaches either of those is killed and named instead.");
     println!();
     println!("The slt command needs no DuckDB on the machine, because a sqllogictest file already");
     println!("carries what every statement is supposed to produce. Everything else here compares");

@@ -4,15 +4,18 @@
 //! `range(10000000000000000)` and expects the engine to give up, and `max_execution_time.test`
 //! writes `SELECT COUNT(*) FROM range(100000000) t1, range(1000) t2` and expects a timeout to cut
 //! it off. DuckDB has a memory manager and a cancellation path and answers both of those in
-//! milliseconds. rudb has neither yet, so it does what it was asked and runs until the machine
-//! stops it, which means one file out of four thousand takes the whole run down and CI publishes
-//! nothing at all.
+//! milliseconds, and rudb has both of those now, so the limits are handed to the engine and the
+//! engine is what stops the statement. That is what makes the difference between a file that has
+//! an outcome and a file that has nothing: a statement the engine stopped is an error the record
+//! can be counted against, and a process that was killed takes every record in the file with it,
+//! including the ones that had already passed.
 //!
-//! A conformance runner cannot be built on the assumption that the engine under test terminates.
-//! Not terminating is one of the behaviours it is there to measure. So the run is not one process
-//! with four thousand files in it, it is four thousand processes with one file each, and a file
-//! that goes over either limit is killed and named in the report rather than being allowed to
-//! decide whether the other four thousand and eighty three get reported.
+//! A conformance runner still cannot be built on the assumption that the engine under test
+//! terminates. Not terminating is one of the behaviours it is there to measure, and an engine that
+//! is asked to enforce its own limit is an engine that can have a bug in the enforcing. So the run
+//! is still four thousand processes with one file each, and this process still holds a clock and a
+//! cap over each of them. They are a backstop now rather than the first thing to fire, which is
+//! why the clock here is four times the one the engine was given.
 //!
 //! The memory cap is checked by asking `ps` rather than by setting a resource limit, because
 //! `ulimit -v` is not honoured on macOS and the alternative is a `setrlimit` call, which means
@@ -46,6 +49,44 @@ impl Default for Limits {
     /// it is not going to stop. The point of the limits is to name that file, not to time anything.
     fn default() -> Self {
         Self { time: Duration::from_secs(10), memory: 2 * 1024 * 1024 * 1024 }
+    }
+}
+
+/// How much longer than one statement's clock a whole file is given before it is killed.
+///
+/// The engine stops a statement at [`Limits::time`] and this runner stops the file at four times
+/// that, so the normal way a runaway file ends is the engine ending it. A file is a hundred quick
+/// statements and at most one that runs away, so four is room for the rare file with a few of
+/// them, and it is still a bound rather than a hope.
+const BACKSTOP: u32 = 4;
+
+impl Limits {
+    /// What the engine is told, which is a limit per statement and not per file.
+    ///
+    /// A statement is what the engine can put a clock on, so that is what the number becomes. A
+    /// statement that on its own takes as long as the whole file was given is the thing being
+    /// caught, and one that takes half of it twice is not, which is the right way round.
+    #[must_use]
+    pub const fn statement(self) -> Duration {
+        self.time
+    }
+
+    /// How long the whole file gets before this runner kills it.
+    #[must_use]
+    pub fn deadline(self) -> Duration {
+        self.time * BACKSTOP
+    }
+
+    /// The budget the engine charges its operators against.
+    ///
+    /// Half the resident cap, because the two count different things. The engine counts what its
+    /// operators say they are holding and the cap is the size of the process, which is that plus
+    /// the binary, the allocator's free lists and whatever the reader mapped. Setting them equal
+    /// would mean the process was over the cap while the engine still thought it had room, and the
+    /// kill from outside would win every time, which is the thing this is here to stop.
+    #[must_use]
+    pub const fn budget(self) -> u64 {
+        self.memory / 2
     }
 }
 
@@ -217,7 +258,7 @@ pub fn run_corpus(
 
     while next < files.len() || !running.is_empty() {
         while running.len() < width && next < files.len() {
-            running.push(Running::spawn(exe, &files[next], &names[next], next)?);
+            running.push(Running::spawn(exe, &files[next], &names[next], next, limits)?);
             next += 1;
         }
         let mut at = 0;
@@ -257,7 +298,13 @@ struct Running {
 }
 
 impl Running {
-    fn spawn(exe: &Path, file: &Path, name: &str, at: usize) -> Result<Self, HarnessError> {
+    fn spawn(
+        exe: &Path,
+        file: &Path,
+        name: &str,
+        at: usize,
+        limits: Limits,
+    ) -> Result<Self, HarnessError> {
         let out = std::env::temp_dir().join(format!("rudb-compat-{}-{at}.out", std::process::id()));
         let sink = File::create(&out)
             .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", out.display())))?;
@@ -268,6 +315,11 @@ impl Running {
             .arg("slt-one")
             .arg(file)
             .arg(name)
+            // The limits go with it, so the engine in the child stops a statement itself and the
+            // file comes back with an outcome. What this process does with its own clock below is
+            // the backstop for when that does not work.
+            .arg(limits.statement().as_secs().to_string())
+            .arg(limits.budget().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::from(sink))
             .stderr(Stdio::from(errors))
@@ -293,7 +345,7 @@ impl Running {
         }
 
         let alive = self.started.elapsed();
-        if alive >= limits.time {
+        if alive >= limits.deadline() {
             self.kill();
             let _ = self.take();
             return Some(self.cut(Stopped::Time(alive)));
@@ -496,6 +548,19 @@ mod tests {
         assert_eq!(back.failures[0].reason, Reason::WrongAnswer);
         assert_eq!(back.reasons().count(Reason::WrongAnswer), 1);
         assert!(back.stopped.is_empty());
+    }
+
+    #[test]
+    fn the_engine_is_given_a_tighter_limit_than_the_one_this_process_enforces() {
+        // The whole point of handing the limits down is that the engine reaches them first. If
+        // these two ever come out the other way round the kill from outside wins every time and
+        // the files go back to having no outcome at all.
+        let limits = Limits::default();
+        assert_eq!(limits.statement(), Duration::from_secs(10));
+        assert_eq!(limits.deadline(), Duration::from_secs(40));
+        assert_eq!(limits.budget(), 1024 * 1024 * 1024);
+        assert!(limits.statement() < limits.deadline());
+        assert!(limits.budget() < limits.memory);
     }
 
     #[test]
