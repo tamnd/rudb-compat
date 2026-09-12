@@ -154,6 +154,12 @@ impl fmt::Display for Cell {
 /// each other anyway, since a disagreement means the two runs did not see the same query and every
 /// value below is then lined up against the wrong column.
 ///
+/// They are the same names with one exception, and it is why [`uniquely`] exists. A header is one
+/// row of a CSV file and two columns in it cannot be told apart by name, so a writer that has to
+/// produce one makes the names unique. `DESCRIBE` is a result set rather than a header and says
+/// what the query really called them. So the check is against the names made unique the way the
+/// writer makes them, and the names kept are the ones `DESCRIBE` gave.
+///
 /// # Errors
 ///
 /// When the `DESCRIBE` is malformed, when the two disagree about how many columns there are, or
@@ -180,16 +186,41 @@ pub(crate) fn assemble(types: &[Vec<Cell>], rows: &[Vec<Cell>]) -> Result<Table,
             columns.len()
         )));
     }
-    for (at, column) in columns.iter().enumerate() {
-        if header[at] != Cell::Text(column.name.clone()) {
+    for (at, name) in uniquely(&columns).iter().enumerate() {
+        if header[at] != Cell::Text(name.clone()) {
             return Err(HarnessError::new(format!(
-                "column {at} is {} in the result and {} in the DESCRIBE",
-                header[at], column.name
+                "column {at} is {} in the result and {name} in the DESCRIBE",
+                header[at]
             )));
         }
     }
 
     Ok(Table { columns, rows: rows.iter().skip(1).cloned().collect() })
+}
+
+/// The column names as a CSV header has to spell them, which is with no two the same.
+///
+/// A name that is already taken gets `_1` after it, and if that is taken too then `_2`, and so on
+/// until one is free. The suffix is tried against everything written so far and not only against
+/// the name it came from, which is why a query with three columns called `a` and a fourth called
+/// `a_1` gets `a`, `a_1`, `a_2`, `a_1_1`. That was read off the pinned DuckDB rather than guessed,
+/// because the obvious rule and the real one disagree on exactly that case.
+///
+/// `SELECT {'a': 1}, struct_pack(a := 1)` is where this came up. Both of those are the same call
+/// written two ways, so the query has two columns called `struct_pack(a := 1)`, and the harness was
+/// reading the second one as the two engines having seen different queries.
+fn uniquely(columns: &[Column]) -> Vec<String> {
+    let mut taken: Vec<String> = Vec::with_capacity(columns.len());
+    for column in columns {
+        let mut name = column.name.clone();
+        let mut at = 1;
+        while taken.contains(&name) {
+            name = format!("{}_{at}", column.name);
+            at += 1;
+        }
+        taken.push(name);
+    }
+    taken
 }
 
 /// Something that can run a statement and say what happened.
@@ -282,7 +313,7 @@ impl std::error::Error for HarnessError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Cell, EngineError};
+    use super::{Cell, Column, EngineError, assemble, uniquely};
 
     #[test]
     fn an_error_splits_into_the_kind_duckdb_spells_and_the_rest() {
@@ -310,5 +341,47 @@ mod tests {
     #[test]
     fn a_null_is_not_an_empty_string() {
         assert_ne!(Cell::Null, Cell::Text(String::new()));
+    }
+
+    fn named(names: &[&str]) -> Vec<Column> {
+        names.iter().map(|n| Column { name: (*n).to_owned(), ty: "INTEGER".to_owned() }).collect()
+    }
+
+    #[test]
+    fn a_header_cannot_say_the_same_name_twice_so_the_second_one_is_numbered() {
+        assert_eq!(uniquely(&named(&["a", "b"])), ["a", "b"]);
+        assert_eq!(uniquely(&named(&["a", "a"])), ["a", "a_1"]);
+        assert_eq!(uniquely(&named(&["a", "a", "a"])), ["a", "a_1", "a_2"]);
+    }
+
+    #[test]
+    fn a_numbered_name_that_is_already_taken_is_numbered_again() {
+        // Measured on the pinned DuckDB, because the obvious rule says a_1 here and the real one
+        // does not: the suffix is tried against every name written so far and not only against the
+        // one it came from. `SELECT 1 AS a, 2 AS a, 3 AS a, 4 AS a_1, 5 AS a` through COPY.
+        assert_eq!(
+            uniquely(&named(&["a", "a", "a", "a_1", "a"])),
+            ["a", "a_1", "a_2", "a_1_1", "a_3"]
+        );
+    }
+
+    #[test]
+    fn the_names_that_are_kept_are_the_ones_describe_gave_and_not_the_numbered_ones() {
+        // The whole point of the numbering is to check the header against. A query that asks for
+        // the same expression twice really does have two columns of the same name, and a report
+        // that renamed one of them would be reporting on a query nobody wrote.
+        let types = vec![
+            vec![Cell::Text("column_name".into()), Cell::Text("column_type".into())],
+            vec![Cell::Text("s".into()), Cell::Text("INTEGER".into())],
+            vec![Cell::Text("s".into()), Cell::Text("INTEGER".into())],
+        ];
+        let rows = vec![
+            vec![Cell::Text("s".into()), Cell::Text("s_1".into())],
+            vec![Cell::Text("1".into()), Cell::Text("1".into())],
+        ];
+        let table = assemble(&types, &rows).expect("the header is the names made unique");
+        assert_eq!(table.columns[0].name, "s");
+        assert_eq!(table.columns[1].name, "s");
+        assert_eq!(table.rows.len(), 1);
     }
 }
