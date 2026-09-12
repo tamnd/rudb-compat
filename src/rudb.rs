@@ -11,6 +11,10 @@
 //! start from an empty database, and one file leaving a table behind for the next one is a pass
 //! that means nothing.
 //!
+//! There are two of them, and the difference is [`Optimizer`]. [`Rudb::new`] is the engine somebody
+//! embedding rudb gets and [`Rudb::unoptimized`] is the same engine with every rewrite turned off,
+//! which the corpus runs as well so the two can be required to agree.
+//!
 //! Everything here goes through the `rudb` crate and nothing else. That is a real constraint and
 //! not tidiness: this harness is the closest thing the project has to somebody embedding rudb, so
 //! the moment it reaches past the embedding API for something, the embedding API is missing
@@ -29,7 +33,23 @@ use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError,
 pub struct Rudb {
     version: String,
     config: Config,
+    optimizer: Optimizer,
     database: Database,
+}
+
+/// Whether the optimizer passes run at all.
+///
+/// Off is the interesting one. The plan the binder produced is the right answer by construction,
+/// since every pass is a rewrite that is supposed to keep the answer and only the passes can break
+/// that, so a corpus file that answers one way with them off and another way with them on has found
+/// a pass that changed an answer. That is the strongest property the harness can check without
+/// anybody writing down a new expected output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Optimizer {
+    /// Every pass runs, which is what a real query gets.
+    On,
+    /// No pass runs, which is the bound plan going straight to the executor.
+    Off,
 }
 
 impl Default for Rudb {
@@ -61,11 +81,22 @@ impl Rudb {
     /// A database opened with a configuration of the caller's own.
     #[must_use]
     pub fn with_config(config: Config) -> Self {
-        Self {
-            version: format!("rudb {}", rudb_version()),
-            config,
-            database: Database::with_config(config),
-        }
+        Self::open(config, Optimizer::On)
+    }
+
+    /// The same rudb with every optimizer pass turned off.
+    ///
+    /// Run the corpus through this as well as through [`Rudb::new`] and the two runs have to agree,
+    /// which is what `spec/09-optimizer.md` section 9.1 asks for. It costs no new expected outputs,
+    /// because the file already says what the answer is and both runs are checked against it.
+    ///
+    /// The way it is done is `SET disabled_optimizers`, with every name [`rudb::optimizers`]
+    /// publishes joined by commas, which is the setting DuckDB has and the spelling DuckDB uses. It
+    /// is reapplied on every [`Engine::reset`], because a reset opens a new database and a new
+    /// database has the passes back on.
+    #[must_use]
+    pub fn unoptimized() -> Self {
+        Self::open(Config::new(), Optimizer::Off)
     }
 
     /// The database, for a caller that wants to look at the catalog after a run.
@@ -73,6 +104,38 @@ impl Rudb {
     pub fn database(&self) -> &Database {
         &self.database
     }
+
+    /// Builds one, with the passes on or off as asked.
+    fn open(config: Config, optimizer: Optimizer) -> Self {
+        let suffix = match optimizer {
+            Optimizer::On => "",
+            Optimizer::Off => " (optimizer off)",
+        };
+        Self {
+            version: format!("rudb {}{suffix}", rudb_version()),
+            config,
+            optimizer,
+            database: opened(config, optimizer),
+        }
+    }
+}
+
+/// A fresh database, with the passes turned off if that is the engine being built.
+///
+/// # Panics
+///
+/// If rudb refuses one of the pass names rudb itself published. That is the two halves of
+/// `SET disabled_optimizers` disagreeing rather than anything a corpus file did, and the engine has
+/// a test of its own that says they agree.
+fn opened(config: Config, optimizer: Optimizer) -> Database {
+    let database = Database::with_config(config);
+    if optimizer == Optimizer::Off {
+        let names = rudb::optimizers().join(",");
+        database
+            .execute(&format!("SET disabled_optimizers = '{names}'"))
+            .expect("rudb takes the pass names rudb published");
+    }
+    database
 }
 
 /// What version of rudb we linked, which is the version being tested.
@@ -109,9 +172,9 @@ impl Engine for Rudb {
     }
 
     fn reset(&mut self) -> Result<(), HarnessError> {
-        // The configuration comes with it. A reset is the next file starting, not the limits
-        // being handed back.
-        self.database = Database::with_config(self.config);
+        // The configuration comes with it, and so does the optimizer being off. A reset is the next
+        // file starting, not the limits being handed back or the passes coming back on.
+        self.database = opened(self.config, self.optimizer);
         Ok(())
     }
 }
@@ -247,6 +310,36 @@ mod tests {
             panic!("an insert is not an error");
         };
         assert_eq!(table.width(), 0);
+    }
+
+    #[test]
+    fn the_unoptimized_engine_really_has_the_passes_off() {
+        // The plan, rather than the setting, because the setting being accepted and the setting
+        // being obeyed are two different claims and this harness cares about the second one. A
+        // constant folded addition would print as its value, and this one still prints as a call.
+        let rudb = Rudb::unoptimized();
+        let plan = rudb.database().plan("SELECT 1 + 2").expect("that plans");
+        assert!(plan.contains("\"+\""), "{plan}");
+        let optimized = Rudb::new().database().plan("SELECT 1 + 2").expect("that plans");
+        assert!(!optimized.contains("\"+\""), "{optimized}");
+    }
+
+    #[test]
+    fn the_passes_are_still_off_after_the_next_file_resets_the_database() {
+        // A reset opens a new database, and a new database has the passes back on unless somebody
+        // turns them off again. Getting this wrong would make the second corpus run quietly
+        // optimized from the first reset onwards, which is the whole check evaporating.
+        let mut rudb = Rudb::unoptimized();
+        rudb.reset().unwrap();
+        let plan = rudb.database().plan("SELECT 1 + 2").expect("that plans");
+        assert!(plan.contains("\"+\""), "{plan}");
+    }
+
+    #[test]
+    fn the_unoptimized_engine_says_so_in_its_version() {
+        // It goes in a report next to the other one, so the two have to be tellable apart.
+        assert!(Rudb::unoptimized().version().contains("optimizer off"));
+        assert!(!Rudb::new().version().contains("optimizer off"));
     }
 
     #[test]
