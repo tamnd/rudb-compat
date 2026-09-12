@@ -197,6 +197,63 @@ SELECT 'abc'::TIMESTAMP;
 ----
 Conversion Error: invalid timestamp field format: "abc", expected format is (YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])
 
+# The zone on the end of a written timestamp, which is read to check it and then thrown away because
+# a TIMESTAMP has nowhere to keep one. A sign that starts an offset and does not finish one is the
+# third sentence a timestamp has and a date has no such sentence, so the same string says the format.
+
+query T
+SELECT '2020-01-01 10:00:00+05:30'::TIMESTAMP;
+----
+2020-01-01 10:00:00
+
+query T
+SELECT '2020-01-01 10:00:00 Asia/Ho_Chi_Minh'::TIMESTAMP;
+----
+2020-01-01 10:00:00
+
+statement error
+SELECT '2020-01-01 10:00:00+5'::TIMESTAMP;
+----
+Conversion Error: timestamp field value "2020-01-01 10:00:00+5" has a timestamp that is not UTC.
+
+statement error
+SELECT '2020-01-01 10:00:00+5'::DATE;
+----
+Conversion Error: invalid date field format: "2020-01-01 10:00:00+5", expected format is (YYYY-MM-DD)
+
+statement error
+SELECT '2020-01-01 10:00:00 UTC junk'::TIMESTAMP;
+----
+Conversion Error: invalid timestamp field format: "2020-01-01 10:00:00 UTC junk", expected format is (YYYY-MM-DD HH:MM[:SS[.US]][±HH[:MM[:SS]]| ZONE])
+
+# A written time is read by a parser of its own, which has one sentence and a lot more slack. The
+# slack stops at the day: a bare clock ignores what follows it and a clock with a date in front of it
+# is read the way a timestamp is read, which is why the second of these two is refused.
+
+query T
+SELECT '12:34:56 zzz junk'::TIME;
+----
+12:34:56
+
+statement error
+SELECT '2020-01-01 12:34:56 zzz junk'::TIME;
+----
+Conversion Error: time field value out of range: "2020-01-01 12:34:56 zzz junk", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])
+
+# And the same day tells the two parsers apart the other way. A bare clock keeps the end of the day
+# it was written as, and a clock with a day in front of it is a timestamp first, so it comes back as
+# the midnight the second of January starts with.
+
+query T
+SELECT '24:00:00'::TIME;
+----
+24:00:00
+
+query T
+SELECT '2020-01-01 24:00:00'::TIME;
+----
+00:00:00
+
 # A date takes a time on the end and throws it away, and midnight at the end of the day is a time on
 # both sides. The date keeps the day it was written with and the timestamp rolls into the next one.
 query T
