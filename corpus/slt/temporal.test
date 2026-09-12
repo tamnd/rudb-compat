@@ -1,0 +1,118 @@
+# name: corpus/slt/temporal.test
+# description: Dates in the era before Christ and the order over intervals
+# group: [smoke]
+
+# The calendar the arithmetic counts in has a year zero and the era a date prints in does not, so
+# the two are a year apart and the astronomical year zero is the first year before Christ. A date at
+# or before that year prints with the era on the end of it, and it reads back either way, with the
+# era or with a sign on the year.
+
+query T
+SELECT DATE '0001-01-01 (BC)';
+----
+0001-01-01 (BC)
+
+query T
+SELECT '0000-01-01'::DATE;
+----
+0001-01-01 (BC)
+
+query T
+SELECT '-2020-03-04'::DATE;
+----
+2021-03-04 (BC)
+
+query T
+SELECT ('0000-01-01'::DATE)::VARCHAR;
+----
+0001-01-01 (BC)
+
+query T
+SELECT '2021-03-04 (BC)'::DATE = '-2020-03-04'::DATE;
+----
+true
+
+# The era sits where the time would start, so a timestamp keeps it in the middle and not on the end.
+
+query T
+SELECT '0001-01-01 (BC) 10:30:00'::TIMESTAMP;
+----
+0001-01-01 (BC) 10:30:00
+
+# The year an era is written with counts from one, so there is no year zero to write, and a sign of
+# its own on a field is not part of a date.
+
+statement error
+SELECT '0000-01-01 (BC)'::DATE;
+----
+Conversion Error: invalid date field format: "0000-01-01 (BC)", expected format is (YYYY-MM-DD)
+
+statement error
+SELECT '+2021-01-01'::DATE;
+----
+Conversion Error: invalid date field format: "+2021-01-01", expected format is (YYYY-MM-DD)
+
+# An interval is three counts, of months, of days and of microseconds, and the order over them is
+# the one length they add up to, at thirty days to a month and twenty four hours to a day. Two
+# intervals of the same length are one value everywhere the order is used, which is equality, the
+# sort, the grouping and the aggregates.
+
+query T
+SELECT INTERVAL '1 day' = INTERVAL '24 hours';
+----
+true
+
+query T
+SELECT INTERVAL '1 month' = INTERVAL '30 days';
+----
+true
+
+query T
+SELECT INTERVAL '1 year' = INTERVAL '360 days';
+----
+true
+
+query T
+SELECT INTERVAL '-1 month' = INTERVAL '-30 days';
+----
+true
+
+query T
+SELECT INTERVAL '25 hours' > INTERVAL '1 day';
+----
+true
+
+query T
+SELECT INTERVAL '2147483647 months' > INTERVAL '2147483647 days';
+----
+true
+
+query T
+SELECT min(x) FROM (VALUES (INTERVAL '25 hours'), (INTERVAL '1 day')) t(x);
+----
+1 day
+
+query I
+SELECT count(DISTINCT x) FROM (VALUES (INTERVAL '1 day'), (INTERVAL '24 hours')) t(x);
+----
+1
+
+query T
+SELECT x FROM (VALUES (INTERVAL '1 month'), (INTERVAL '1 day'), (INTERVAL '25 hours')) t(x) ORDER BY x;
+----
+1 day
+25:00:00
+1 month
+
+# The three counts are still kept apart, because a month is not thirty days when it is added to a
+# date, so two intervals that are one value print as two different strings.
+
+query T
+SELECT INTERVAL '1 month';
+----
+1 month
+
+query T
+SELECT INTERVAL '30 days';
+----
+30 days
