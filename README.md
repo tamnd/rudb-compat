@@ -14,14 +14,14 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4084 files, 12803 passed, 51427 failed, which is 19.9 percent of what was attempted
-14306 skipped, of which 13391 the file turned off, 0 in a skipped section and 915 behind a directive the runner does not implement
-7 files were cut off and are counted in neither column, which is listed above
+4096 files, 13754 passed, 50816 failed, which is 21.3 percent of what was attempted
+14314 skipped, of which 13392 the file turned off, 0 in a skipped section and 922 behind a directive the runner does not implement
+4 files cut off, of which 4 timed out, 0 went over the memory cap and 0 came apart, and they are counted in neither column
 ```
 
 That is DuckDB's own `sqllogictest` corpus at `v2.0-cyanoptera`, every `.test` file under `test/sql`, run against rudb on every commit and published on the run summary. The M2 exit criterion is above 60 percent, so the distance between those two numbers is the work list for the milestone. The skips are printed on the line underneath rather than folded into the percentage, because a record the file itself turned off with `skipif` and a record behind a directive this runner does not implement mean completely different things and neither of them is a pass.
 
-Each file gets a process of its own, with ten seconds and two gigabytes on it. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that DuckDB stops with a memory manager and a timeout that rudb does not have yet. Run in one process, a single one of those takes the whole run with it and CI publishes nothing at all. A file that goes over either limit is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for.
+Each file gets a process of its own, with ten seconds on a statement and two gigabytes on the process. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that are there to be stopped. Both limits are handed to the engine, so the normal way one of those ends is rudb raising an error the report can count against the record that asked for it. This process keeps a clock of its own at four times the statement limit and a cap on how large the child may get, as a backstop for an engine that does not stop when it is asked to. A file that reaches one of those is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for.
 
 This half of the harness needs no DuckDB on the machine. A `.test` file already carries what every statement is supposed to produce, which is what makes it something CI can run on every commit in fourteen seconds rather than a nightly job whose result nobody can attribute to a commit. The corpus is fetched rather than committed, by `rudb-compat vendor`, into `target/corpus` at the pinned ref.
 

@@ -17,7 +17,9 @@
 //! something. It used to reach into `rudb-parse` for a tokenizer and into `rudb-common` for the
 //! error type, and both of those reaches were holes in `rudb` rather than conveniences here.
 
-use rudb::{Database, Error, ErrorCode, LogicalType, RowOrder, Value};
+use std::time::Duration;
+
+use rudb::{Config, Database, Error, ErrorCode, LogicalType, RowOrder, Value};
 
 use crate::compare::Ordering;
 use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
@@ -26,6 +28,7 @@ use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError,
 #[derive(Debug)]
 pub struct Rudb {
     version: String,
+    config: Config,
     database: Database,
 }
 
@@ -39,7 +42,30 @@ impl Rudb {
     /// The rudb this crate is built against, with an empty database.
     #[must_use]
     pub fn new() -> Self {
-        Self { version: format!("rudb {}", rudb_version()), database: Database::new() }
+        Self::with_config(Config::new())
+    }
+
+    /// A database that stops a statement itself, rather than waiting to be killed from outside.
+    ///
+    /// This is what the isolating runner opens, and it is the difference between a file that has
+    /// an outcome and a file that has nothing. A corpus file that asks for a hundred million rows
+    /// runs until something stops it, and something stopping it from outside means the process is
+    /// gone along with every record in it, including the ones that had already passed. A timeout
+    /// and a budget the engine enforces turn the same file into an error per record, which is a
+    /// result, and `Reason::Stopped` is where those land.
+    #[must_use]
+    pub fn limited(timeout: Duration, memory: u64) -> Self {
+        Self::with_config(Config::new().with_query_timeout(timeout).with_memory_limit(memory))
+    }
+
+    /// A database opened with a configuration of the caller's own.
+    #[must_use]
+    pub fn with_config(config: Config) -> Self {
+        Self {
+            version: format!("rudb {}", rudb_version()),
+            config,
+            database: Database::with_config(config),
+        }
     }
 
     /// The database, for a caller that wants to look at the catalog after a run.
@@ -83,7 +109,9 @@ impl Engine for Rudb {
     }
 
     fn reset(&mut self) -> Result<(), HarnessError> {
-        self.database = Database::new();
+        // The configuration comes with it. A reset is the next file starting, not the limits
+        // being handed back.
+        self.database = Database::with_config(self.config);
         Ok(())
     }
 }

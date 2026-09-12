@@ -36,8 +36,8 @@ pub const NAMES: &[&str] = &["rudb", "duckdb"];
 /// What kind of thing went wrong, as opposed to what went wrong.
 ///
 /// `spec/14-rudb-compat.md` section 14.1 asks for the report to break failures down rather than
-/// publish one percentage, and this is the axis it breaks down on. The point is that the eight
-/// reasons below are eight different jobs for eight different people. A `Syntax` is a grammar rule
+/// publish one percentage, and this is the axis it breaks down on. The point is that the nine
+/// reasons below are nine different jobs for nine different people. A `Syntax` is a grammar rule
 /// nobody has written, an `Unbound` is usually one function, a `WrongAnswer` is a bug at
 /// `priority/p0` and the three error reasons are a message somebody has to copy exactly. A number
 /// that adds them together tells whoever reads it nothing about what to do next, which is the only
@@ -48,6 +48,13 @@ pub const NAMES: &[&str] = &["rudb", "duckdb"];
 /// drift every time somebody rewords a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Reason {
+    /// The engine stopped it, on the query timeout or on the memory budget.
+    ///
+    /// Furthest from working, because the engine did not get to an answer at all. It is a reason
+    /// of its own and not a `Runtime` because it is the only one that is not about the statement:
+    /// the same statement with a longer clock or a larger budget might pass, and grouping it with
+    /// the errors that are about the SQL would put a query that is merely slow on a list of bugs.
+    Stopped,
     /// The file expected it to work and the engine could not parse it.
     Syntax,
     /// The file expected it to work and the engine parsed it and has not built it yet.
@@ -79,7 +86,8 @@ impl Reason {
     ///
     /// Roughly from furthest from working to closest, so a report read top to bottom is read in
     /// the order the work happens in.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
+        Self::Stopped,
         Self::Syntax,
         Self::NotImplemented,
         Self::Unbound,
@@ -94,6 +102,7 @@ impl Reason {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Stopped => "stopped",
             Self::Syntax => "syntax",
             Self::NotImplemented => "not-implemented",
             Self::Unbound => "unbound",
@@ -109,6 +118,7 @@ impl Reason {
     #[must_use]
     pub const fn blurb(self) -> &'static str {
         match self {
+            Self::Stopped => "the engine stopped it, on the clock or on the memory budget",
             Self::Syntax => "the engine could not parse it",
             Self::NotImplemented => "parsed, and the engine has not built it yet",
             Self::Unbound => "a function, table, column or type the engine does not have",
@@ -136,6 +146,7 @@ impl Reason {
     #[must_use]
     pub fn of(error: &EngineError) -> Self {
         match error.kind.as_str() {
+            "Interrupt Error" | "Out of Memory Error" => Self::Stopped,
             "Parser Error" => Self::Syntax,
             "Not implemented Error" => Self::NotImplemented,
             "Catalog Error" | "Binder Error" => Self::Unbound,
@@ -1069,6 +1080,18 @@ mod tests {
         let printed = reasons.to_string();
         assert!(printed.contains("syntax"), "{printed}");
         assert!(!printed.contains("unbound"), "{printed}");
+    }
+
+    #[test]
+    fn the_two_ways_the_engine_gives_up_are_one_reason_and_it_is_not_runtime() {
+        // These two are the engine refusing rather than the engine being wrong, and they used to
+        // fall into `Runtime` with the real bugs. They only reach the report at all because the
+        // runner hands the limits down, so before that there was nothing to classify.
+        let interrupt = EngineError { kind: "Interrupt Error".into(), message: "too slow".into() };
+        let memory = EngineError { kind: "Out of Memory Error".into(), message: "too big".into() };
+        assert_eq!(Reason::of(&interrupt), Reason::Stopped);
+        assert_eq!(Reason::of(&memory), Reason::Stopped);
+        assert_eq!(Reason::Stopped.name(), "stopped");
     }
 
     #[test]
