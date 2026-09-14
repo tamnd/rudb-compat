@@ -229,12 +229,10 @@ impl Isolated {
         self.files += other.files;
         self.passed += other.passed;
         self.failed += other.failed;
-        self.skips.conditional += other.skips.conditional;
-        self.skips.mode += other.skips.mode;
-        self.skips.unsupported += other.skips.unsupported;
-        self.skips.engine += other.skips.engine;
-        self.skips.machine += other.skips.machine;
-        self.skips.unreadable += other.skips.unreadable;
+        // Through the one place that adds two of these up, rather than field by field here. A
+        // second copy of the list is a second thing to remember when a row is added, and forgetting
+        // it drops a whole row out of the report without anything failing.
+        self.skips.absorb(other.skips);
         self.skipped_files.extend(other.skipped_files);
         self.failures.extend(other.failures);
         self.stopped.extend(other.stopped);
@@ -421,12 +419,13 @@ fn resident(pid: u32) -> Option<u64> {
 pub fn encode(summary: &Summary) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "counts\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "counts\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         summary.files,
         summary.passed,
         summary.failed,
         summary.skipped.conditional,
         summary.skipped.mode,
+        summary.skipped.maybe,
         summary.skipped.unsupported,
         summary.skipped.engine,
         summary.skipped.machine,
@@ -470,10 +469,11 @@ pub fn decode(name: &str, text: &str) -> Isolated {
                 out.failed = at(2);
                 out.skips.conditional = at(3);
                 out.skips.mode = at(4);
-                out.skips.unsupported = at(5);
-                out.skips.engine = at(6);
-                out.skips.machine = at(7);
-                out.skips.unreadable = at(8);
+                out.skips.maybe = at(5);
+                out.skips.unsupported = at(6);
+                out.skips.engine = at(7);
+                out.skips.machine = at(8);
+                out.skips.unreadable = at(9);
                 counted = true;
             }
             ["skipfile", file, why] => {
@@ -552,6 +552,7 @@ mod tests {
             skipped: Skips {
                 conditional: 2,
                 mode: 1,
+                maybe: 7,
                 unsupported: 4,
                 engine: 9,
                 machine: 5,
@@ -577,7 +578,8 @@ mod tests {
         assert_eq!(back.files, 1);
         assert_eq!(back.passed, 3);
         assert_eq!(back.failed, 1);
-        assert_eq!(back.skips.total(), 21);
+        assert_eq!(back.skips.total(), 28);
+        assert_eq!(back.skips.maybe, 7);
         assert_eq!(back.skips.by_gap()[1], (crate::conform::Gap::Engine, 9));
         assert_eq!(
             back.skipped_files,
