@@ -682,6 +682,23 @@ pub fn run_under(
     Ok(summary)
 }
 
+/// What one record did, kept per record so that a second engine's run can be lined up against the
+/// first one record by record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Said {
+    /// It did what the file said it would.
+    Passed,
+    /// It did not, for this reason.
+    Failed(Reason),
+}
+
+/// What every record of a file did, by its index in the file.
+///
+/// A map rather than a list because a file can end early, on a `halt` or on an error the file said
+/// to stop on, and two engines do not have to end it at the same record. Only the records both runs
+/// reached can be compared, and a map says which those are without any counting.
+pub type Told = std::collections::BTreeMap<usize, Said>;
+
 /// Run one parsed file against one engine.
 ///
 /// The engine is reset first, so a file starts from an empty database and cannot be made to pass
@@ -691,6 +708,23 @@ pub fn run_under(
 ///
 /// When the engine itself could not be run.
 pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, HarnessError> {
+    run_file_telling(engine, file, &mut Told::new())
+}
+
+/// Run one parsed file against one engine and say what each record did.
+///
+/// This is [`run_file`] with the per record answers kept, which is what a second oracle needs and
+/// what nothing else does. `crate::oracles` runs this twice over the same file with two engines and
+/// pairs the answers up.
+///
+/// # Errors
+///
+/// When the engine itself could not be run.
+pub fn run_file_telling(
+    engine: &mut dyn Engine,
+    file: &TestFile,
+    told: &mut Told,
+) -> Result<Summary, HarnessError> {
     let mut summary = Summary { files: 1, ..Summary::default() };
     engine.reset()?;
 
@@ -823,9 +857,13 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
             continue;
         }
         match check(engine, file, record, &mut labels, &settings)? {
-            Verdict::Ran(Ok(())) => summary.passed += 1,
+            Verdict::Ran(Ok(())) => {
+                summary.passed += 1;
+                told.insert(at, Said::Passed);
+            }
             Verdict::Ran(Err(failure)) => {
                 summary.failed += 1;
+                told.insert(at, Said::Failed(failure.reason));
                 summary.failures.push(failure);
             }
             // The file named this error and said that if it happens there is nothing here worth

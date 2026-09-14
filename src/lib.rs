@@ -39,6 +39,7 @@ pub mod engine;
 pub mod functions;
 pub mod hash;
 pub mod isolate;
+pub mod oracles;
 pub mod quote;
 pub mod reduce;
 pub mod report;

@@ -16,6 +16,7 @@ use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
+use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
@@ -102,6 +103,7 @@ fn main() -> ExitCode {
         },
         Some("functions") => functions(rest.get(1).copied(), pinned),
         Some("coverage") => coverage(rest.get(1).copied(), pinned, messages, text(&args, "--out")),
+        Some("oracles") => oracles(rest.get(1).copied(), slow, refresh),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => reduce(
@@ -560,6 +562,61 @@ fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCod
     }
 }
 
+/// Run the corpus against both oracles, the file and the pinned binary, and print what they split
+/// on.
+///
+/// It exits nonzero when there is a harness bug in the answer, and only then. A stale file is not
+/// this project's problem and an engine gap is what the ordinary run already reports, but a record
+/// rudb passes that the pinned binary fails is a pass this harness has not earned, and that is
+/// exactly the thing a run like this exists to catch.
+///
+/// It always drives both engines as shells, which is not a preference. A test file is a session: it
+/// makes a table and then asks questions about it, and `crate::shell` is the only driver here that
+/// has a session, because it replays what came before in front of the next statement. The DuckDB
+/// driver spawns a fresh in-memory process per statement, so under it every record after the first
+/// `CREATE TABLE` in a file fails on the binary and passes on rudb, and this run would report the
+/// whole corpus as a harness bug. That is true, but it is one harness bug and not thousands, and
+/// reporting it thousands of times hides everything else. On the `cast` directory the shells find
+/// none and the other pair finds twenty three, all of them that.
+fn oracles(path: Option<&str>, slow: bool, refresh: bool) -> ExitCode {
+    let dir = match corpus_dir(path, refresh) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (mut duckdb, mut rudb) = match engines(true) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let both = match rudb_compat::oracles::over(&mut *rudb, &mut *duckdb, &dir, slow) {
+        Ok(both) => both,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{both}");
+    // The harness bugs in full, because the whole point of finding them is fixing them and a count
+    // is not something anybody can fix. The other two kinds are listed by file and line only,
+    // because there are tens of thousands of them and they are already on the corpus report.
+    let bugs: Vec<&Split> =
+        both.splits.iter().filter(|split| split.verdict == Verdict::Harness).collect();
+    if !bugs.is_empty() {
+        println!();
+        println!("the records this runner gets wrong");
+        for split in &bugs {
+            println!();
+            println!("{split}");
+        }
+    }
+    if bugs.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
 /// Run the corpus and write the published page from it.
 ///
 /// The same run `slt` does, because the page has to be a measurement of something that happened and
@@ -943,6 +1000,15 @@ fn help() {
     println!("                number, over one name if given and over the whole catalog if not.");
     println!("                A full sweep against the pinned binary is also written down where");
     println!("                report reads it back onto the published page.");
+    println!("  oracles [path]");
+    println!("                run the corpus against both oracles, the file and the pinned");
+    println!("                binary, and print the records they split on. A record rudb passes");
+    println!("                that the binary fails is a bug in this runner and not in the");
+    println!("                engine, and one oracle cannot see it. Exits nonzero on those and");
+    println!("                on nothing else. It always drives both engines as shells, because");
+    println!("                a test file is a session and the shell driver is the only one here");
+    println!("                that has one, so it needs a built rudb on PATH or in");
+    println!("                RUDB_COMPAT_RUDB.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!(

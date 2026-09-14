@@ -206,6 +206,27 @@ It needs `--shell`, because the shells are the only place both engines are proce
 
 Four kinds of record are deliberately not timed and the reasons are in the code beside the rule. A record that failed on either side, because timing an error path measures the error path. A record the two engines disagreed about, because that is a ratio between two different amounts of work. A record under ten milliseconds on both engines, because below that it is mostly the cost of starting a shell. And every record on a shared machine, which is why server3 does not produce these at all.
 
+## Two oracles per record
+
+Every file in the upstream corpus already says what each statement is supposed to produce, and the pinned DuckDB binary is on the machine as well, so there are two oracles for the same record and not one. Running both and lining them up record by record gives four answers rather than two, and the fourth one is the reason this exists.
+
+```
+RUDB_COMPAT_RUDB=/path/to/rudb cargo run --release -- oracles target/corpus/test/sql/cast
+```
+
+```
+32 files, 1037 records both oracles answered
+
+     437  agreed      both engines did what the file says
+     357  engine gap  rudb did not and the pinned binary did, which is the real gap
+     243  stale file  neither did, so the file is stale or the pin moved past it
+       0  harness bug rudb did and the binary did not, so this runner is wrong
+```
+
+A stale file is a note and nothing more, because a file the pinned binary itself cannot pass is not a statement about rudb. An engine gap is the real work and it is what the ordinary corpus run already reports. A harness bug is the interesting one: rudb passed a record the binary failed, which means we are running the record differently from the way the file means it, and that pass is one this harness has not earned. A run with one oracle cannot tell that case apart from a genuine pass, and it is the case that quietly inflates a pass rate. So `oracles` prints those records in full and exits nonzero on them, and on nothing else.
+
+It always drives both engines as shells rather than taking `--shell` as a choice. A test file is a session, meaning it makes a table and then asks questions about it, and the shell driver is the only one here that has a session, because it replays what came before in front of the next statement. Under the library driver DuckDB gets a fresh in memory process per statement, so every record after the first `CREATE TABLE` fails on the binary and passes on rudb and the whole corpus reads as a harness bug. That is one harness bug reported thousands of times, and it hides everything else.
+
 ## License
 
 Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE).
