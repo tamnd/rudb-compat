@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rudb_compat::Level;
-use rudb_compat::compare::MessageMatch;
+use rudb_compat::compare::{MessageMatch, Ordering, Rules};
 use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
@@ -104,6 +104,13 @@ fn main() -> ExitCode {
         Some("functions") => functions(rest.get(1).copied(), pinned),
         Some("coverage") => coverage(rest.get(1).copied(), pinned, messages, text(&args, "--out")),
         Some("oracles") => oracles(rest.get(1).copied(), slow, refresh),
+        Some("bisect") => match rest.get(1) {
+            Some(sql) => bisect(sql, messages),
+            None => {
+                eprintln!("rudb-compat: bisect needs a statement");
+                ExitCode::FAILURE
+            }
+        },
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => reduce(
@@ -268,6 +275,61 @@ fn one(sql: &str, messages: MessageMatch, through_shells: bool, measure: Measure
         Ok((report, pin)) => {
             print(&report, pin);
             verdict(&report)
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Name the optimizer pass that changed the answer to one statement.
+///
+/// It runs the statement on the pinned DuckDB once to find out what the answer should be, and then
+/// runs it on rudb once per pass with that pass turned off, and once more with all of them off. The
+/// answer is which passes off make rudb agree, or that none of them do, which says the optimizer is
+/// not where to look at all and is the answer most often wanted.
+///
+/// It exits successfully whatever it finds, including when the two engines already agree, because
+/// it is asked which pass rather than whether there is a difference and `query` is the command that
+/// answers the second question by failing.
+///
+/// It drives rudb as the linked library rather than as a shell. A `SET` only sticks in an engine
+/// that has a session, the library driver holds one connection open for the life of the run, and a
+/// bare shell would forget the `SET` before the statement after it. The DuckDB side is the pinned
+/// binary either way, since nothing is being turned off there.
+fn bisect(sql: &str, messages: MessageMatch) -> ExitCode {
+    let mut duckdb = match Duckdb::discover() {
+        Ok(duckdb) => duckdb,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let want = match duckdb.run(sql) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let rules = Rules { ordering: Ordering::Sorted, messages };
+    let mut rudb = Rudb::new();
+    let got = match rudb.run(sql) {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if rudb_compat::compare::compare(&got, &want, rules).is_empty() {
+        println!("the two engines already agree about this statement, so there is no pass to name");
+        return ExitCode::SUCCESS;
+    }
+    match rudb_compat::bisect::blame(&mut rudb, sql, &want, rules) {
+        Ok(blame) => {
+            println!("{blame}");
+            ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("rudb-compat: {e}");
@@ -1022,6 +1084,11 @@ fn help() {
     println!("                remember what they were told, because a test file makes a table and");
     println!("                then asks about it, so it needs a built rudb on PATH or in");
     println!("                RUDB_COMPAT_RUDB.");
+    println!("  bisect <sql>  name the optimizer pass that changed the answer, by running the");
+    println!("                statement again once per pass with that pass turned off, and once");
+    println!("                more with all of them off. That last run is the one to read: an");
+    println!("                answer that is still wrong with every rewrite off is wrong in the");
+    println!("                binder or the executor and the optimizer is not where to look.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!(

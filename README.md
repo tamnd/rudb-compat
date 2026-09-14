@@ -227,6 +227,24 @@ A stale file is a note and nothing more, because a file the pinned binary itself
 
 It always drives both engines as shells that remember what they were told, rather than taking `--shell` as a choice. A test file makes a table and then asks questions about it, so a driver that forgets between statements fails every record after the first one for a reason that has nothing to do with the record. The library pair forgets on one side only, because the linked rudb keeps a connection open and the DuckDB driver spawns a fresh in memory process per statement, so every record after the first `CREATE TABLE` passes on rudb and fails on the binary and the whole corpus reads as a harness bug. Two bare shells forget on both sides instead, which cancels out into a stale file rather than a harness bug, and a run where four fifths of the records are the pin failing to find a table it was never told about is a run that measures nothing. Sessions replay the statements that left something behind in front of the next one, which is the only arrangement where a whole file means anything.
 
+## Which pass changed the answer
+
+A wrong answer is a sentence and a plan, and the plan is the part nobody wants to read. rudb takes DuckDB's `SET disabled_optimizers` spelling, so the question "which rewrite did this" can be asked by running the statement again rather than by reading anything.
+
+```
+RUDB_COMPAT_RUDB=/path/to/rudb cargo run --release -- bisect "SELECT unnest([1,2,3]) AS x"
+```
+
+```
+every pass off answers the same way, so this is the binder or the executor and not the optimizer
+```
+
+It runs the statement once per pass with that pass turned off, and then once more with every pass off. The sweep is linear rather than a binary search over subsets, because the list is seven names long, seven extra runs of a statement that already ran is nothing, and a binary search finds one pass and quietly picks a side when two of them are involved.
+
+The last run is the one to read. The unoptimized plan is the right answer by construction, so a statement that is still wrong with every rewrite off is wrong in the binder or the executor, and that is worth one run because it sends somebody to the right file instead of a week of reading plans. Every difference found by hand so far has come back that way, which is a fair summary of where rudb is: the optimizer is not yet where the answers go wrong.
+
+Turning a pass off is a `SET`, so this only works through a driver that remembers what it was told, and the setting is put back after each run whatever happened, because the engine here is the one the next record uses.
+
 ## License
 
 Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE).
