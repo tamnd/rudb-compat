@@ -252,11 +252,11 @@ cargo run --release -- tlp --count 20000 --seed 1
 ```
 
 ```
-ternary logic partitioning against rudb from git
+ternary logic partitioning over the rows against rudb from git
 seed 1, which is what replays this run exactly
 
 20000 predicates, 0 the engine would not run, 20000 left
-20000 of those split into three parts that add back up to the whole, 16378 of which divided the table rather than putting every row in one part
+20000 of those split into three parts that add back up to the whole, 16378 of which divided the rows rather than putting everything in one part
 ```
 
 Three things make it worth having beside the differential loop. It runs on a machine with no DuckDB on it, which makes it a check every commit can afford. It localises, because the three parts are the same query four times over and the only thing that moved is the predicate, so a failure names the predicate rather than the query. And it tests three valued logic directly, which is the part of SQL a young engine gets wrong quietly, since a predicate that returns false where it should return unknown gives the right answer for almost every query anybody writes by hand and the wrong answer for the rest.
@@ -268,6 +268,41 @@ The table is a constant in the source rather than something generated from the s
 The count of predicates that divided the table is the number to read second. A predicate that puts every row in one part passed without testing anything, so a generator that drifts into writing those would produce a run that is green and empty, and the two numbers side by side is what makes that visible.
 
 rudb passes every predicate this has generated so far and refuses none of them, and the pinned binary passes the same predicates, which says the generator is writing SQL that means what it looks like. That leaves the failure path untested by any real run, so it is tested against an engine written for the purpose that answers every partition with the rows where the predicate is true, which is exactly what an engine that treats unknown as false does.
+
+## The same split under an aggregate and over the groups
+
+The paper has three forms and the one above is the first of them. `--form` picks which one runs, and the other two are not decoration: the `WHERE` form only ever compares row counts, so a bug that keeps the right number of rows and gets the values wrong walks straight through it.
+
+The aggregate form puts the same three predicates under the same aggregates. `SELECT count(*), sum(i), min(i), max(i), sum(j), min(j), max(j) FROM t WHERE (p)` and the same for `NOT (p)` and `(p) IS NULL`, and the three answers have to fold back to the aggregates over the whole table, with the counts and the sums added, the minimums reduced to the smallest and the maximums raised to the largest. The folding happens here rather than in a `UNION ALL` inside a subquery the way the paper writes it, because a subquery is a feature and an oracle that only works where that feature works stops working exactly when it would be useful. That choice is why the select list is seven integer aggregates and not more: summing the `DOUBLE` column here would have the harness add floats in an order the engine did not, and a `min` over the text column would have the harness decide the collation, and in both cases a disagreement would say more about the harness than about the engine.
+
+The `HAVING` form groups by an expression and partitions on the `HAVING` clause instead of the `WHERE`, so what is divided is the groups rather than the rows. The predicates are made of aggregates over the group, `count(*)`, `count` of a column, `sum` of a number, `min` and `max` of anything and `IS NULL` over those, plus the grouping expression itself, which is the only column a `HAVING` clause is allowed to name on its own. The unknown comes from somewhere different than it does in a `WHERE` clause: `max(ts) > DATE '2020-01-01'` is unknown for a group whose column was NULL in every row, and nothing in the first form reaches that.
+
+```
+cargo run --release -- tlp --form aggregate --count 20000 --seed 1
+cargo run --release -- tlp --form having --count 20000 --seed 1
+```
+
+```
+ternary logic partitioning under an aggregate against rudb from git
+seed 1, which is what replays this run exactly
+
+20000 predicates, 0 the engine would not run, 20000 left
+20000 of those split into three parts that add back up to the whole, 16378 of which divided the rows rather than putting everything in one part
+```
+
+```
+ternary logic partitioning over the groups against rudb from git
+seed 1, which is what replays this run exactly
+
+20000 predicates, 0 the engine would not run, 20000 left
+20000 of those split into three parts that add back up to the whole, 8733 of which divided the groups rather than putting everything in one part
+```
+
+Both are eight seconds. Three hundred of the same predicates go to the pinned binary in a minute each and hold there too, which is the check that says the generator writes SQL an engine means the same thing by.
+
+The `HAVING` number is the one worth looking at twice. Eight thousand of twenty thousand divided the groups, against sixteen thousand for the other two forms, and that is honest rather than a problem: a predicate over `count(*)` on a table of thirteen rows grouped a dozen ways puts every group on one side of it more often than a predicate over a column does. It is the number that would say something had gone wrong with the generator if it fell much further.
+
+The first real thing this form found was a wrong answer in rudb, filed as tamnd/rudb#540 and fixed in 0.3.10. `SELECT x, count(*) FROM t WHERE x IS NULL GROUP BY x` over two nulls and a value answered with two groups of one instead of one group of two, because a filter that drops a row hands its columns on as dictionary vectors, a dictionary keeps its nulls in the values its codes point at, and the grouping table asked the wrong level whether a row was null. Five cases in two hundred failed on it at the first seed this form ever ran.
 
 ## The optimizer against itself
 
