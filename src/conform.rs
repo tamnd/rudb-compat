@@ -22,7 +22,9 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::{Cell, Engine, EngineError, HarnessError, Outcome, Table};
 use crate::hash::hash_values;
-use crate::slt::{Directive, ParseError, QueryResult, Record, Sort, StatementResult, TestFile};
+use crate::slt::{
+    Directive, ParseError, QueryResult, Record, Setting, Sort, StatementResult, TestFile,
+};
 
 /// The names this runner answers to in a `skipif` or an `onlyif`.
 ///
@@ -720,6 +722,8 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
     // Every path the file has opened so far, which is what decides whether the next `load` or
     // `restart` is asking for an empty database or for one with history in it.
     let mut loaded: Vec<String> = Vec::new();
+    // What the file has said about the run, which lasts to the end of it.
+    let mut settings = Settings::default();
 
     for (at, record) in file.records.iter().enumerate() {
         if let Directive::Mode(mode) = &record.directive {
@@ -773,6 +777,34 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
             summary.skipped.maybe += 1;
             continue;
         }
+        // The settings a file makes about itself. A `seed` is the one that reaches the engine,
+        // because upstream turns it into a statement and a file that sets one is a file whose
+        // later answers depend on it.
+        if let Directive::Set(setting) = &record.directive {
+            settings.take(setting);
+            if let Setting::Seed(seed) = setting {
+                if let Outcome::Error(e) = engine.run(&format!("SELECT setseed({seed})"))? {
+                    let why = Skipped::Changes {
+                        what: format!("set seed {seed}, and the engine said {e}"),
+                        gap: Gap::Engine,
+                        records: runnable(&file.records[at..]),
+                    };
+                    summary.skipped.charge(&why);
+                    summary.skipped_files.push((file.name.clone(), why));
+                    return Ok(summary);
+                }
+            }
+            continue;
+        }
+        if let Directive::TestEnv { name, default } = &record.directive {
+            let value = std::env::var(name).unwrap_or_else(|_| default.clone());
+            settings.take(&Setting::Variable { name: name.clone(), value });
+            continue;
+        }
+        if let Directive::Sleep(how_long) = &record.directive {
+            std::thread::sleep(*how_long);
+            continue;
+        }
         if let Directive::Unsupported(line) = &record.directive {
             match effect(line, &mut loaded) {
                 Effect::Fresh => engine.reset()?,
@@ -790,11 +822,24 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
             }
             continue;
         }
-        match check(engine, file, record, &mut labels)? {
-            Ok(()) => summary.passed += 1,
-            Err(failure) => {
+        match check(engine, file, record, &mut labels, &settings)? {
+            Verdict::Ran(Ok(())) => summary.passed += 1,
+            Verdict::Ran(Err(failure)) => {
                 summary.failed += 1;
                 summary.failures.push(failure);
+            }
+            // The file named this error and said that if it happens there is nothing here worth
+            // running, so the rest of it is excused rather than failed. Upstream stops reading the
+            // file at the same point.
+            Verdict::Ignored(which) => {
+                let why = Skipped::Changes {
+                    what: format!("an error the file said to stop on, {which}"),
+                    gap: Gap::Excused,
+                    records: runnable(&file.records[at..]),
+                };
+                summary.skipped.charge(&why);
+                summary.skipped_files.push((file.name.clone(), why));
+                return Ok(summary);
             }
         }
     }
@@ -993,6 +1038,88 @@ fn requirement(env: bool, params: &[String]) -> String {
     if env { format!("the environment to have {what}") } else { what }
 }
 
+/// What a file has said about the run rather than about any one record.
+///
+/// Four `set` lines and a `test-env` write to this, and it lasts to the end of the file. It is not
+/// the SQL `SET`, which the engine reads and this runner never sees.
+#[derive(Debug, Clone)]
+struct Settings {
+    /// Errors that mean the rest of the file is not worth running.
+    ignore: Vec<String>,
+    /// Errors that no expected error may be satisfied by.
+    always_fail: Vec<String>,
+    /// Names the SQL below may write as `{name}` or `${name}`.
+    variables: Vec<(String, String)>,
+}
+
+impl Default for Settings {
+    /// What every file starts with, which is not nothing.
+    ///
+    /// Upstream begins with `INTERNAL` in the always fail list and no line in any file puts it
+    /// there. An internal error is the engine saying it has broken an invariant of its own, and a
+    /// file that asked for an error and got one of those did not get what it asked for.
+    fn default() -> Self {
+        Self { ignore: Vec::new(), always_fail: vec!["INTERNAL".to_owned()], variables: Vec::new() }
+    }
+}
+
+impl Settings {
+    /// Take a `set` line at its word.
+    fn take(&mut self, setting: &Setting) {
+        match setting {
+            // Both of these replace rather than add, including replacing the `INTERNAL` a file
+            // never asked for, which is what upstream does with the same line.
+            Setting::Ignore(messages) => self.ignore.clone_from(messages),
+            Setting::AlwaysFail(messages) => self.always_fail.clone_from(messages),
+            Setting::Variable { name, value } => {
+                self.variables.retain(|(seen, _)| seen != name);
+                self.variables.push((name.clone(), value.clone()));
+            }
+            // Handled where the engine is, since it is a statement and not a note.
+            Setting::Seed(_) => {}
+        }
+    }
+
+    /// Put the variables the file has set into a piece of text.
+    ///
+    /// Both spellings, because the corpus writes both and upstream replaces both. A name nothing
+    /// has set is left as it stands, which is how `{TEST_DIR}` and the rest survive to be read by
+    /// whoever does know what they mean.
+    fn fill(&self, text: &str) -> String {
+        let mut out = text.to_owned();
+        for (name, value) in &self.variables {
+            out = out.replace(&format!("${{{name}}}"), value);
+            out = out.replace(&format!("{{{name}}}"), value);
+        }
+        out
+    }
+
+    /// The `ignore_error_messages` entry this error matches, if any.
+    fn ignored(&self, error: &EngineError) -> Option<String> {
+        names(&self.ignore, error)
+    }
+
+    /// The `always_fail_error_messages` entry this error matches, if any.
+    fn internal(&self, error: &EngineError) -> Option<String> {
+        names(&self.always_fail, error)
+    }
+}
+
+/// The first entry in a list that this error's text contains.
+fn names(list: &[String], error: &EngineError) -> Option<String> {
+    let full = format!("{}: {}", error.kind, error.message);
+    list.iter().find(|entry| full.contains(entry.as_str())).cloned()
+}
+
+/// What a record did, which is one of three things and not two.
+enum Verdict {
+    /// It ran, and the file was either right or wrong about what it would do.
+    Ran(Result<(), Failure>),
+    /// It hit an error the file named in `set ignore_error_messages`, which is the file saying
+    /// that if this happens there is nothing here worth running.
+    Ignored(String),
+}
+
 /// Run one record and decide whether it did what the file said.
 ///
 /// The outer result is the harness failing and the inner one is the record failing, which is the
@@ -1002,7 +1129,8 @@ fn check(
     file: &TestFile,
     record: &Record,
     labels: &mut HashMap<String, Vec<String>>,
-) -> Result<Result<(), Failure>, HarnessError> {
+    settings: &Settings,
+) -> Result<Verdict, HarnessError> {
     let fail = |sql: &str, reason: Reason, detail: String| {
         Err(Failure {
             file: file.name.clone(),
@@ -1015,8 +1143,27 @@ fn check(
 
     match &record.directive {
         Directive::Statement { expected, sql } => {
+            let sql = &settings.fill(sql);
             let outcome = engine.run(sql)?;
-            Ok(match (expected, &outcome) {
+            if let Outcome::Error(e) = &outcome {
+                if let Some(which) = settings.ignored(e) {
+                    return Ok(Verdict::Ignored(which));
+                }
+                // An error the file said can never be the one it was asking for. Without this, a
+                // `statement error` above a statement that makes the engine break an invariant of
+                // its own is a pass, and that is the one place a passing record is worse than a
+                // failing one.
+                if let Some(which) = settings.internal(e) {
+                    if !matches!(expected, StatementResult::Ok) {
+                        return Ok(Verdict::Ran(fail(
+                            sql,
+                            Reason::ErrorClass,
+                            format!("expected an error, and it said\n{e}\nwhich contains {which}"),
+                        )));
+                    }
+                }
+            }
+            Ok(Verdict::Ran(match (expected, &outcome) {
                 // A `maybe` is excused before it reaches here, by the loop in `run_file`. The arm is
                 // upstream's reading of it, for any other caller and for the day one of the four
                 // report levels wants to count them separately.
@@ -1053,14 +1200,31 @@ fn check(
                 (StatementResult::Error(_), Outcome::Rows(_)) => {
                     fail(sql, Reason::MissedError, "expected it to fail, and it worked".to_owned())
                 }
-            })
+            }))
         }
         Directive::Query { types, sort, label, sql, expected } => {
+            let sql = &settings.fill(sql);
             let outcome = engine.run(sql)?;
+            if let Outcome::Error(e) = &outcome {
+                if let Some(which) = settings.ignored(e) {
+                    return Ok(Verdict::Ignored(which));
+                }
+                if let Some(which) = settings.internal(e) {
+                    if matches!(expected, QueryResult::Error(_)) {
+                        return Ok(Verdict::Ran(fail(
+                            sql,
+                            Reason::ErrorClass,
+                            format!("expected an error, and it said\n{e}\nwhich contains {which}"),
+                        )));
+                    }
+                }
+            }
             let table = match (&outcome, expected) {
-                (Outcome::Error(_), QueryResult::Error(None)) => return Ok(Ok(())),
+                (Outcome::Error(_), QueryResult::Error(None)) => {
+                    return Ok(Verdict::Ran(Ok(())));
+                }
                 (Outcome::Error(e), QueryResult::Error(Some(wanted))) => {
-                    return Ok(if contains(e, wanted) {
+                    return Ok(Verdict::Ran(if contains(e, wanted) {
                         Ok(())
                     } else {
                         fail(
@@ -1068,52 +1232,52 @@ fn check(
                             wrong_error(e, wanted),
                             format!("expected an error containing\n{wanted}\nand it said\n{e}"),
                         )
-                    });
+                    }));
                 }
                 (Outcome::Error(e), _) => {
-                    return Ok(fail(
+                    return Ok(Verdict::Ran(fail(
                         sql,
                         Reason::of(e),
                         format!("expected rows, and it said\n{e}"),
-                    ));
+                    )));
                 }
                 (Outcome::Rows(_), QueryResult::Error(_)) => {
-                    return Ok(fail(
+                    return Ok(Verdict::Ran(fail(
                         sql,
                         Reason::MissedError,
                         "expected it to fail, and it returned rows".to_owned(),
-                    ));
+                    )));
                 }
                 (Outcome::Rows(table), _) => table,
             };
 
             let width = types.chars().count();
             if table.width() != width {
-                return Ok(fail(
+                return Ok(Verdict::Ran(fail(
                     sql,
                     Reason::WrongAnswer,
                     format!("expected {width} columns and got {}", table.width()),
-                ));
+                )));
             }
             let values = flatten(table, types, *sort);
 
             if !label.is_empty() {
                 if let Some(previous) = labels.get(label) {
                     if previous != &values {
-                        return Ok(fail(
+                        return Ok(Verdict::Ran(fail(
                             sql,
                             Reason::WrongAnswer,
                             format!(
                                 "this is labelled {label} and does not match what the earlier query with that label returned"
                             ),
-                        ));
+                        )));
                     }
                 } else {
                     labels.insert(label.clone(), values.clone());
                 }
             }
 
-            Ok(match expected {
+            Ok(Verdict::Ran(match expected {
                 QueryResult::Lines(raw) => match wanted(raw, width, table.height()) {
                     Ok(wanted) => {
                         if values == wanted {
@@ -1145,7 +1309,7 @@ fn check(
                     }
                 }
                 QueryResult::Error(_) => unreachable!("handled above"),
-            })
+            }))
         }
         Directive::Halt
         | Directive::HashThreshold(_)
@@ -1153,7 +1317,10 @@ fn check(
         | Directive::Mode(_)
         | Directive::ResetLabel(_)
         | Directive::Continue
-        | Directive::Unsupported(_) => Ok(Ok(())),
+        | Directive::Set(_)
+        | Directive::Sleep(_)
+        | Directive::TestEnv { .. }
+        | Directive::Unsupported(_) => Ok(Verdict::Ran(Ok(()))),
     }
 }
 
@@ -1403,7 +1570,8 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 #[cfg(test)]
 mod tests {
     use super::{
-        Gap, HashMap, NAMES, Reason, Skips, Summary, VECTOR_SIZE, check, flatten, render, run_text,
+        Gap, HashMap, NAMES, Reason, Settings, Skips, Summary, VECTOR_SIZE, Verdict, check,
+        flatten, render, run_text,
     };
     use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
     use crate::slt::{Condition, Directive, Record, Sort, StatementResult, TestFile};
@@ -1752,14 +1920,73 @@ mod tests {
     }
 
     #[test]
-    fn a_directive_that_leaves_the_database_alone_skips_itself_and_nothing_else() {
-        // `set` and `sleep` are work for this runner rather than for rudb, but neither of them
-        // changes what the engine holds, so the records after them are still worth running.
+    fn a_setting_the_file_makes_is_carried_out_and_costs_the_records_after_it_nothing() {
         let text = "set ignore_error_messages HTTP\n\nstatement ok\nSELECT 1\n";
         let summary = run(vec![Outcome::Rows(Table::default())], text);
         assert_eq!(summary.passed, 1);
-        assert_eq!(summary.skipped.unsupported, 1);
+        assert_eq!(summary.skipped.total(), 0);
         assert!(summary.skipped_files.is_empty());
+    }
+
+    #[test]
+    fn an_error_the_file_said_to_stop_on_stops_it_and_is_excused_rather_than_failed() {
+        // The corpus writes this above statements that reach out to a network, so the error named
+        // is about the machine the run is on and not about the engine.
+        let text = "set ignore_error_messages HTTP Error\n\nstatement ok\nFROM 'https://x/y.csv'\n\nstatement ok\nSELECT 1\n";
+        let answers = vec![Outcome::Error(EngineError {
+            kind: "IO Error".to_owned(),
+            message: "HTTP Error: 404".to_owned(),
+        })];
+        let summary = run(answers, text);
+        assert_eq!(summary.passed, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped.conditional, 2);
+        assert_eq!(summary.skipped_files.len(), 1);
+    }
+
+    #[test]
+    fn an_internal_error_is_never_the_error_a_file_was_asking_for() {
+        // Upstream puts INTERNAL in the always fail list with no line in any file asking for it,
+        // and this is the one place where passing a record would be worse than failing it.
+        let boom = Outcome::Error(EngineError {
+            kind: "INTERNAL Error".to_owned(),
+            message: "Attempted to access index 5 in vector of size 3".to_owned(),
+        });
+        let text = "statement error\nSELECT 1\n----\nindex 5\n";
+        let summary = run(vec![boom], text);
+        assert_eq!(summary.passed, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failures[0].reason, Reason::ErrorClass);
+    }
+
+    #[test]
+    fn a_variable_the_file_set_is_put_into_the_sql_before_it_runs() {
+        let text = "set variable sf 0.01\n\nquery I\nSELECT {sf}, '${sf}'\n----\n9\n";
+        let summary = run(vec![Outcome::Rows(table(1, &["1"]))], text);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.failures[0].sql, "SELECT 0.01, '0.01'");
+    }
+
+    #[test]
+    fn a_name_nothing_set_is_left_alone_rather_than_emptied() {
+        let settings = Settings::default();
+        assert_eq!(settings.fill("COPY t TO '{TEST_DIR}/x.csv'"), "COPY t TO '{TEST_DIR}/x.csv'");
+    }
+
+    #[test]
+    fn a_seed_the_engine_will_not_take_ends_the_file_on_the_engine_row() {
+        // Everything after it is written against a sequence of random numbers this run cannot
+        // produce, so there is nothing after it to be right or wrong about.
+        let text = "set seed 0.42\n\nquery I\nSELECT random()\n----\n1\n";
+        let answers = vec![Outcome::Error(EngineError {
+            kind: "Catalog Error".to_owned(),
+            message: "Scalar Function with name setseed does not exist!".to_owned(),
+        })];
+        let summary = run(answers, text);
+        assert_eq!(summary.passed, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped_files.len(), 1);
+        assert_eq!(summary.skipped_files[0].1.gap(), Gap::Engine);
     }
 
     #[test]
@@ -1819,7 +2046,13 @@ mod tests {
             };
             let mut engine = Canned { answers: vec![answer], at: 0 };
             let mut labels = HashMap::new();
-            check(&mut engine, &file, &record, &mut labels).expect("the canned engine cannot fail")
+            let Verdict::Ran(got) =
+                check(&mut engine, &file, &record, &mut labels, &Settings::default())
+                    .expect("the canned engine cannot fail")
+            else {
+                panic!("nothing here is ignored")
+            };
+            got
         };
         assert!(read(Outcome::Rows(Table::default()), Some("duplicate key")).is_ok());
         assert!(read(boom("duplicate key value"), Some("duplicate key")).is_ok());

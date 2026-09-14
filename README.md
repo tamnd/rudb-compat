@@ -14,12 +14,12 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4096 files, 15939 passed, 56648 failed, which is 22.0 percent of what was attempted
+4096 files, 15920 passed, 56548 failed, which is 22.0 percent of what was attempted
 
-40732 records not attempted, by whose gap it is
+40827 records not attempted, by whose gap it is
       21358  excused   the file turned the record off itself
-      19297  engine    something rudb does not have, which is the real gap
-         11  harness   something this runner does not do, which is work here
+      19403  engine    something rudb does not have, which is the real gap
+          0  harness   something this runner does not do, which is work here
          66  machine   something the machine this ran on does not have
 ```
 
@@ -38,6 +38,8 @@ A directive the reader does not know is a file it cannot read at all, and there 
 A `statement maybe` is excused rather than passed, which is a deliberate difference from upstream and the reason is what the two numbers are for. DuckDB's runner asks whether the suite failed, and a `maybe` cannot fail, so passing it costs nothing there. This runner publishes a percentage, and a record that cannot fail is not evidence about the engine in either direction. There are 223 of those lines in 53 files and the loops around them make about 5970 records, and counting them was putting 4337 free passes into the number. One file, `catalog/dependencies/test_concurrent_alter.test`, is a hundred by ten loop around two of them and was 1783 passes on its own, which was nearly a tenth of everything that passed.
 
 Every file in the corpus parses now, and the last 18 were two more readings rather than two more directives. A result block is kept as the lines the file wrote and split into values against the result that came back, because a line is a whole row in some files and one value in others and nothing in the file says which. DuckDB decides it in `result_helper.cpp` from the row count the engine returned, falls back to the every line has a tab guess only when that does not fit, and fails the record when what is left does not divide by the column count. Sixteen files were being thrown away whole for a block that does not divide, which is one record that cannot be right and not a file with no outcome. And a line that ends a record is an empty line and not a blank one, which is what `test_bar.test` turns on: it draws bar charts, its first bar is the empty one, and a reader that stops at eighty spaces reads the second bar as a directive. The same reading keeps a statement whose entire body is a Unicode space, which is what `invisible_spaces.test` is about.
+
+The harness row is zero. It was 1098 before any of this and the last 11 records on it were the settings a file makes about itself, so those are carried out now rather than stepped over. `set ignore_error_messages` names errors that mean the rest of the file is not worth running, which is how a file that reaches out to a network says so, and when one fires the file stops and the rest of it is excused rather than failed. `set always_fail_error_messages` names errors no expected error may be satisfied by, and it starts with `INTERNAL` in it with no line in any file asking for that, because a `statement error` that is satisfied by the engine breaking an invariant of its own is the one place where a passing record is worse than a failing one. `set variable` and `test-env` name something the SQL below writes as `{name}`. `set seed` becomes `SELECT setseed(n)`, and rudb does not have that function yet, so 106 records in 23 files now say that on the engine row instead of being scored against a sequence of random numbers this run cannot produce. `sleep` sleeps.
 
 Each file gets a process of its own, with ten seconds on a statement and two gigabytes on the process. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that are there to be stopped. Both limits are handed to the engine, so the normal way one of those ends is rudb raising an error the report can count against the record that asked for it. This process keeps a clock of its own at twelve times the statement limit and a cap on how large the child may get, as a backstop for an engine that does not stop when it is asked to. Twelve, because a file with ten slow statements in it is a file that exists and killing it would throw away the outcome the limits were handed down to produce. A file that reaches one of those is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for. No file reaches one today, which is why there is no such line above.
 
