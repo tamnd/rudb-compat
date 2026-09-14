@@ -27,7 +27,7 @@ use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::{Session, Shell};
 use rudb_compat::sqlsmith::QUERIES;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
-use rudb_compat::tlp::CASES;
+use rudb_compat::tlp::{CASES, Form};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -123,6 +123,7 @@ fn main() -> ExitCode {
             messages,
         ),
         Some("tlp") => tlp(
+            text(&args, "--form"),
             valued(&args, "--count").map_or(CASES, |n| usize::try_from(n).unwrap_or(CASES)),
             valued(&args, "--seed"),
             pinned,
@@ -220,7 +221,7 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 10] = [
+    const VALUED: [&str; 11] = [
         "--limit",
         "--memory",
         "--out",
@@ -231,6 +232,7 @@ fn positional(args: &[String]) -> Vec<&str> {
         "--runs",
         "--group",
         "--seconds",
+        "--form",
     ];
     const PLAIN: [&str; 6] =
         ["--strict-messages", "--slow", "--refresh", "--pinned", "--shell", "--measure"];
@@ -803,7 +805,15 @@ fn sqlsmith(how_many: usize, seed: Option<u32>, messages: MessageMatch) -> ExitC
 /// It exits nonzero when anything did not add up, unlike `sqlsmith`, because there is no second
 /// engine here to be the reason for a difference. Every finding is a bug in the engine or a bug in
 /// this file, and both of those are somebody's job before the next merge.
-fn tlp(count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
+///
+/// `--form` picks which of the paper's three partitions to run and defaults to the `WHERE` one.
+/// They are three separate runs rather than one that mixes them, because a run is a number somebody
+/// quotes and a number over three forms at once says nothing about any of them.
+fn tlp(form: Option<&str>, count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
+    let Some(form) = form.map_or(Some(Form::Where), Form::named) else {
+        eprintln!("rudb-compat: --form takes where, aggregate or having");
+        return ExitCode::FAILURE;
+    };
     let mut engine: Box<dyn Engine> = if pinned {
         match Shell::duckdb() {
             Ok(shell) => Box::new(Session::new(shell)),
@@ -816,7 +826,7 @@ fn tlp(count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
         Box::new(Rudb::new())
     };
     let seed = seed.unwrap_or_else(|| u64::from(fresh_seed()));
-    match rudb_compat::tlp::run(&mut *engine, count, seed) {
+    match rudb_compat::tlp::run(&mut *engine, form, count, seed) {
         Ok(found) => {
             print!("{found}");
             if found.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
@@ -1544,14 +1554,18 @@ fn help() {
     println!("                --count and --seed, and prints the seed either way, because a");
     println!("                generated run that cannot be replayed is one nobody can fix.");
     println!("  tlp           generate predicates and split a query on each of them three ways,");
-    println!("                the rows where it is true, where it is false and where it is");
-    println!("                neither, and require the three to add back up to the query with no");
-    println!("                predicate on it. Needs no DuckDB, since the property is a property");
-    println!("                of SQL rather than an agreement between two engines. Takes --count");
-    println!("                and --seed, and --pinned to run the whole thing against DuckDB");
-    println!("                instead, which is how a finding is checked against the generator");
-    println!("                and is slow enough to be for a handful of predicates rather than");
-    println!("                for a sweep. Exits nonzero on anything that did not add up.");
+    println!("                where it is true, where it is false and where it is neither, and");
+    println!("                require the three to add back up to the query with no predicate on");
+    println!("                it. Needs no DuckDB, since the property is a property of SQL rather");
+    println!("                than an agreement between two engines. --form takes where, which");
+    println!("                partitions the rows and is the default, aggregate, which puts the");
+    println!("                three predicates under the same aggregates and adds the answers up");
+    println!("                here, or having, which partitions the groups instead of the rows.");
+    println!("                Takes --count and --seed, and --pinned to run the whole thing");
+    println!("                against DuckDB instead, which is how a finding is checked against");
+    println!("                the generator and is slow enough to be for a handful of predicates");
+    println!("                rather than for a sweep. Exits nonzero on anything that did not");
+    println!("                add up.");
     println!("  norec         generate predicates and ask each one twice, once as a filter the");
     println!("                optimizer works on and once in the select list where there is");
     println!("                nothing to push down or skip, and require the two counts to match.");

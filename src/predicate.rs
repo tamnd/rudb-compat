@@ -27,6 +27,13 @@
 //! `crate::sqlsmith` reaches and it is narrow on purpose, because what these oracles are about is
 //! three valued logic rather than grammar coverage. A generated form nothing implements produces a
 //! refusal, and a run of refusals says nothing about logic.
+//!
+//! There is a second generator beside that one, for the predicates a `HAVING` clause takes. Its
+//! leaves are `count`, `sum`, `min` and `max` compared against a literal, and the grouping
+//! expression itself, which is legal there and is the shape an engine that has confused a group key
+//! with an aggregate gets wrong. Everything above the leaves is the same. It is a separate generator
+//! rather than a flag on the first one because an aggregate is unknown for a different reason than a
+//! column is: a column is NULL in a row, and `min` is NULL because every row in the group was.
 
 /// How deep a generated predicate is allowed to nest.
 ///
@@ -89,6 +96,90 @@ impl Predicates {
     #[must_use]
     pub fn predicate(&mut self) -> String {
         self.expr(DEPTH)
+    }
+
+    /// An expression to group by, and a predicate over the aggregates of those groups.
+    ///
+    /// The two come out together because the predicate is allowed to name the grouping expression
+    /// as well as the aggregates, which is legal in a `HAVING` clause and is the shape an engine
+    /// that has confused a group key with an aggregate gets wrong. Handing the caller a grouping
+    /// expression and then asking it for a predicate separately would mean the generator no longer
+    /// knows what kind of value the key holds.
+    #[must_use]
+    pub fn groups(&mut self) -> (String, String) {
+        let field = self.rng.pick(&FIELDS);
+        let grouping = self.term(field);
+        let predicate = self.aggregated(DEPTH, field, &grouping);
+        (grouping, predicate)
+    }
+
+    /// A predicate over the aggregates of a group, allowed to nest that many more times.
+    ///
+    /// The same shape as [`Self::expr`] and weighted the same way, because what is being tested is
+    /// still three valued logic and the only thing that changed is what the leaves are made of.
+    fn aggregated(&mut self, depth: usize, field: Field, grouping: &str) -> String {
+        if depth == 0 {
+            return self.aggregate(field, grouping);
+        }
+        match self.rng.below(8) {
+            0..=3 => self.aggregate(field, grouping),
+            4 => format!("NOT ({})", self.aggregated(depth - 1, field, grouping)),
+            5 => {
+                let left = self.aggregated(depth - 1, field, grouping);
+                let right = self.aggregated(depth - 1, field, grouping);
+                format!("({left}) AND ({right})")
+            }
+            6 => {
+                let left = self.aggregated(depth - 1, field, grouping);
+                let right = self.aggregated(depth - 1, field, grouping);
+                format!("({left}) OR ({right})")
+            }
+            _ => format!("({}) IS NULL", self.aggregated(depth - 1, field, grouping)),
+        }
+    }
+
+    /// A comparison of one aggregate, or of the group key, with nothing else inside it.
+    ///
+    /// `count` is the only one of these that is never NULL, and every other arm is a comparison of
+    /// something that is NULL for a group whose column was NULL all the way down. That is where the
+    /// unknown comes from in this form, and it comes from somewhere different than it does in a
+    /// `WHERE` clause, which is the reason this form is worth running beside that one.
+    ///
+    /// The group key arm brackets the grouping expression and the reason is not style. `NOT b` is
+    /// one of the expressions [`Self::term`] writes, and a `HAVING` clause may only name the
+    /// grouping expression or an aggregate, so `NOT b = true` is a binder error: it parses as
+    /// `NOT (b = true)` and the `b` inside it is a bare column that is not the group key. Two
+    /// predicates in every two hundred were refused for exactly that until the brackets went in,
+    /// and a refusal that comes from the generator writing SQL nobody meant tests nothing.
+    fn aggregate(&mut self, field: Field, grouping: &str) -> String {
+        match self.rng.below(7) {
+            0 => format!("count(*) {} {}", self.operator(), self.rng.pick(&COUNTS)),
+            1 => {
+                let of = self.rng.pick(&FIELDS);
+                format!("count({}) {} {}", of.name, self.operator(), self.rng.pick(&COUNTS))
+            }
+            2 => {
+                let of = self.numeric();
+                format!("sum({}) {} {}", of.name, self.operator(), self.literal(of.kind))
+            }
+            3 | 4 => {
+                let of = self.rng.pick(&FIELDS);
+                let which = self.rng.pick(&["min", "max"]);
+                format!("{which}({}) {} {}", of.name, self.operator(), self.literal(of.kind))
+            }
+            5 => {
+                let of = self.rng.pick(&FIELDS);
+                let which = self.rng.pick(&["min", "max"]);
+                format!("{which}({}) IS {}NULL", of.name, self.negation())
+            }
+            _ => format!("({grouping}) {} {}", self.operator(), self.literal(field.kind)),
+        }
+    }
+
+    /// One of the three columns `sum` will take, which is the only aggregate here that is fussy.
+    fn numeric(&mut self) -> Field {
+        let numbers: Vec<&Field> = FIELDS.iter().filter(|f| f.kind.group() == 0).collect();
+        *self.rng.pick(&numbers)
     }
 
     /// A predicate that is allowed to nest that many more times.
@@ -259,6 +350,13 @@ impl Predicates {
 /// The patterns the text column is matched against.
 const PATTERNS: [&str; 6] = ["'a%'", "'%b%'", "'_bc'", "'ABC'", "'%'", "'two'"];
 
+/// The numbers a `count` is compared against.
+///
+/// Zero and one are the two that matter, since a group with nothing in it and a group with one row
+/// in it are where an engine that counts NULLs wrong shows up. Thirteen is the whole table, which is
+/// the boundary the other end.
+const COUNTS: [&str; 6] = ["0", "1", "2", "3", "7", "13"];
+
 /// One column a predicate can be written about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Field {
@@ -382,6 +480,38 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn every_generated_group_predicate_names_a_column_an_aggregate_or_the_group_key() {
+        let mut predicates = Predicates::from_seed(13);
+        for _ in 0..2000 {
+            let (grouping, predicate) = predicates.groups();
+            let text = format!("{grouping} {predicate}");
+            for word in unquoted(&text).split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+                let known = word.is_empty()
+                    || word.chars().next().is_some_and(|c| c.is_ascii_digit())
+                    || KNOWN.split(' ').any(|known| known == word)
+                    || AGGREGATES.split(' ').any(|known| known == word);
+                assert!(known, "{word} is not a column, a keyword or an aggregate: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn sum_is_only_ever_asked_for_over_a_column_that_holds_a_number() {
+        // sum of a string is an error on both engines, so a generator that wrote one would turn a
+        // run into refusals and the summary line would still look fine.
+        let mut predicates = Predicates::from_seed(17);
+        for _ in 0..2000 {
+            let (_, predicate) = predicates.groups();
+            for over in ["sum(s)", "sum(b)", "sum(d)", "sum(ts)"] {
+                assert!(!predicate.contains(over), "{over} is not a sum: {predicate}");
+            }
+        }
+    }
+
+    /// The aggregates a group predicate is allowed to call.
+    const AGGREGATES: &str = "count sum min max";
 
     /// The predicate with what is inside the string literals taken out.
     ///
