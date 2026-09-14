@@ -153,7 +153,7 @@ The benchmark suites, which are modest in count and exercise real plan shapes. C
 
 That one needs the corpus, which is fourteen gigabytes and is not in this repository, so it skips with the reason printed unless somebody points `RUDB_COMPAT_HITS` at the file or `RUDB_BENCH_DATA` at the directory holding it. Asking for it by hand is deliberate. A machine that happens to have the file in the usual place should not have `cargo test` turn into a run of a hundred million rows through forty three queries twice, which takes hours and is a decision somebody makes rather than one they discover. The hundred thousand row partition works too and is what most runs use, and it answers a weaker question, because ties at a `LIMIT` are rarer on a smaller file.
 
-A corpus of real queries scraped from public repositories and notebooks, which is what the usage weighting is computed from and which contains shapes nobody would have thought to generate.
+A corpus of real queries scraped from public repositories and notebooks, which is what the usage weighting is computed from and which contains shapes nobody would have thought to generate. The first eight hundred of those are here already, because upstream's benchmark suite is a pile of queries somebody wrote to get an answer rather than to break an engine, and `rudb-compat queries` reads them and says which of the catalog they call.
 
 Generated queries, from a grammar-based generator over a random schema, in the spirit of SQLancer and SQLsmith. This is where the volume is and where most of the wrong answers will come from.
 
@@ -260,6 +260,20 @@ It runs the statement once per pass with that pass turned off, and then once mor
 The last run is the one to read. The unoptimized plan is the right answer by construction, so a statement that is still wrong with every rewrite off is wrong in the binder or the executor, and that is worth one run because it sends somebody to the right file instead of a week of reading plans. Every difference found by hand so far has come back that way, which is a fair summary of where rudb is: the optimizer is not yet where the answers go wrong.
 
 Turning a pass off is a `SET`, so this only works through a driver that remembers what it was told, and the setting is put back after each run whatever happened, because the engine here is the one the next record uses.
+
+## Which of the catalog is worth anything
+
+Every percentage this project publishes is unweighted, and says so, because nobody has the weights. The weights have to come from queries somebody wrote because they wanted an answer, and the nearest thing to a pile of those already in the vendored clone is upstream's own benchmark suite. It is ClickBench, the join order benchmark over IMDB, TPC-H, TPC-DS, h2oai, LDBC, the JSON benchmarks, the taxi data and several hundred micro benchmarks.
+
+```
+rudb-compat queries --pinned --limit 40
+```
+
+That reads eight hundred and forty five distinct queries and counts what they call. A hundred and thirty four names out of the eleven hundred and fifty nine in the catalog appear in one of them and a thousand and twenty five appear in none, and the top of the list is `sum`, `min`, `count`, `position`, `substr` and `avg` by a distance. That is the whole point of the exercise. A suite that treats all eleven hundred names as equally important spends most of its effort on functions nobody has ever called, and there was no way to say which those were until this could be run.
+
+Nothing here is run against an engine. The loads in that suite build tables of a hundred million rows, and a histogram does not need them, so this reads the files and counts and stops. A pass rate over these queries wants the loads cut down to a size a test can carry, which is a separate job.
+
+Two counts are deliberately short. A query that appears in five benchmark files at five scale factors is one query, because five measurements of one query are not five queries and counting them that way would weight the histogram towards the two suites that are parameterised that way. And a name counts only when the bracket comes straight after it, so an operator scores nothing and `EXTRACT` and `CAST` score nothing, which means both read here as unused. Both of those want a parser rather than a scan over text, and a number nobody can check by reading a file is worse than a number that is honest about what it left out.
 
 ## License
 

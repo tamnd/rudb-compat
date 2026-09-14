@@ -17,6 +17,7 @@ use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::oracles::{Split, Verdict};
+use rudb_compat::queries::{Histogram, histogram};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
@@ -116,6 +117,11 @@ fn main() -> ExitCode {
             valued(&args, "--count").map_or(QUERIES, |n| usize::try_from(n).unwrap_or(QUERIES)),
             valued(&args, "--seed").and_then(|n| u32::try_from(n).ok()),
             messages,
+        ),
+        Some("queries") => queries(
+            refresh,
+            pinned,
+            valued(&args, "--limit").map_or(NAMES, |n| usize::try_from(n).unwrap_or(NAMES)),
         ),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
@@ -866,6 +872,73 @@ fn functions(name: Option<&str>, require: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// How many names a histogram prints before it stops, unless `--limit` says otherwise.
+const NAMES: usize = 40;
+
+/// Read the real query corpus and print what it calls.
+///
+/// Nothing is run here. The benchmark loads in that suite build tables of a hundred million rows,
+/// and what this is for is the histogram rather than a pass rate, so it reads the queries and counts
+/// what is in them and stops. The corpus is upstream's own benchmark suite, which is the nearest
+/// thing available to a thousand queries somebody wrote because they wanted an answer rather than
+/// because they wanted to break an engine.
+///
+/// It wants the pinned binary for the same reason `functions` does. The histogram is over the
+/// catalog, so a catalog from another build would count a name this one does not have and would
+/// report as unused a name it does.
+fn queries(refresh: bool, require: bool, limit: usize) -> ExitCode {
+    let mut duckdb = match Duckdb::discover() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if duckdb.pin() != Pin::Pinned {
+        eprintln!("rudb-compat: this is not the pinned DuckDB, so this catalog is another one's");
+        if require {
+            return ExitCode::FAILURE;
+        }
+    }
+    let read = rudb_compat::vendor::checkout(Path::new(root()), refresh)
+        .and_then(|dir| rudb_compat::queries::read(&dir));
+    let (corpus, catalog) = match (read, rudb_compat::functions::catalog(&mut duckdb)) {
+        (Ok(corpus), Ok(catalog)) => (corpus, catalog),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_queries(&histogram(&corpus, &catalog), catalog.len(), limit);
+    ExitCode::SUCCESS
+}
+
+/// Print a histogram, most used name first.
+fn print_queries(found: &Histogram, overloads: usize, limit: usize) {
+    println!("queries   {}", found.queries);
+    println!("called    {} of {} names", found.used.len(), found.names);
+    println!("unused    {}", found.unused);
+    println!("overloads {overloads}, which is what those names come to when the types are counted");
+    println!();
+    println!("suites");
+    for (group, how_many) in &found.groups {
+        println!("  {how_many:>6}  {group}");
+    }
+    println!();
+    println!("calls   queries  name");
+    for (name, calls, queries) in found.used.iter().take(limit) {
+        println!("{calls:>5}  {queries:>8}  {name}");
+    }
+    if found.used.len() > limit {
+        println!("and {} more names, which --limit will show", found.used.len() - limit);
+    }
+    println!();
+    println!("Nothing here was run. These are the queries as written, counted, because what this");
+    println!("corpus is for is saying which of the catalog is worth anything rather than saying");
+    println!("what passes. A name counts when it is written as a call, so an operator and a");
+    println!("function spelled as a keyword score nothing and read here as unused.");
+}
+
 /// Run the generated calls on both engines and print the function coverage number.
 ///
 /// A name narrows it to that name's overloads, which is how somebody works on one function without
@@ -1162,6 +1235,11 @@ fn help() {
     println!("                them to both engines, grouped by what rudb said about them. Takes");
     println!("                --count and --seed, and prints the seed either way, because a");
     println!("                generated run that cannot be replayed is one nobody can fix.");
+    println!("  queries       read upstream's benchmark suite, which is a thousand queries");
+    println!("                somebody wrote because they wanted an answer, and print how often");
+    println!("                each name in the catalog is called and how many of them are called");
+    println!("                nowhere. Nothing is run, because what this corpus is for is the");
+    println!("                weights rather than a pass rate. Takes --limit.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!(
