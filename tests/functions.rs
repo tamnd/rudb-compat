@@ -30,6 +30,14 @@ fn duckdb() -> Option<Duckdb> {
 #[test]
 fn every_value_in_the_boundary_table_is_one_duckdb_accepts() {
     let Some(mut duckdb) = duckdb() else { return };
+    // Against the pin and nothing else, the same as the catalog below it. Which literals parse is a
+    // property of a DuckDB rather than of the table, and it moves: the released 1.5 refuses
+    // `''::BIT` and the pin takes it, so running this against whatever binary is on the machine
+    // fails for a reason that is not a bug here and not a bug in either engine.
+    if !duckdb.is_pinned() {
+        eprintln!("skipping, which literals parse is a property of the pin");
+        return;
+    }
     let mut refused = Vec::new();
     for ty in TYPES {
         let set = boundaries(ty).expect("a type on the list has a set");

@@ -4,11 +4,19 @@
 //! and never edited by hand, with eleven numbers on it, each with a denominator and a provenance,
 //! and no single headline percentage anywhere. This module writes that page.
 //!
-//! Four of the eleven have nothing behind them today: statement coverage, function coverage, the
-//! five error levels and the three resource ratios. They are printed under a heading that says so
-//! and names what would produce each one, rather than being left off the page or printed as a
-//! zero. A zero is a measurement and a missing measurement is not, and the difference between the
-//! two is the whole of section 1.2.
+//! Three of the eleven have nothing behind them today: statement coverage, the five error levels
+//! and the three resource ratios. They are printed under a heading that says so and names what
+//! would produce each one, rather than being left off the page or printed as a zero. A zero is a
+//! measurement and a missing measurement is not, and the difference between the two is the whole of
+//! section 1.2.
+//!
+//! Function coverage is the fourth of those and it is measured now, but not by this command. The
+//! sweep behind it is every generated call to every overload in the catalog put to both engines,
+//! which is forty minutes, and this page comes out of a corpus run that takes a fraction of that.
+//! So `rudb-compat coverage` writes one row down beside the pages and this page reads the most
+//! recent one back and says when and where it was measured. A number carried from another run is
+//! worth having and is not the same thing as a number out of this run, and the page says which it
+//! is looking at.
 //!
 //! The provenance is gathered best effort. Every field that cannot be found says what it could not
 //! find, because a page that refuses to be written because git is not on the machine is worse than
@@ -20,6 +28,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::conform::Reason;
+use crate::coverage::{Coverage, Tally, Untested};
 use crate::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use crate::engine::{Engine, HarnessError};
 use crate::isolate::Isolated;
@@ -54,6 +63,36 @@ pub const COLUMNS: [&str; 17] = [
     "skip_harness",
     "skip_machine",
     "wrong_answers",
+];
+
+/// The file every function sweep appends one row to, beside the pages.
+///
+/// A file of its own rather than more columns on [`SERIES`], because the two runs happen at
+/// different rates. A corpus run is minutes and goes on every commit, a sweep is most of an hour and
+/// goes when somebody asks for it, and putting them in one table would mean a row with half of it
+/// empty every time either one ran without the other.
+pub const SWEEPS: &str = "coverage.tsv";
+
+/// The columns of that file, in order.
+pub const SWEEP_COLUMNS: [&str; 18] = [
+    "when",
+    "machine",
+    "rudb",
+    "rudb_commit",
+    "compat_commit",
+    "duckdb",
+    "names",
+    "names_passed",
+    "names_failed",
+    "names_untested",
+    "overloads",
+    "overloads_passed",
+    "overloads_failed",
+    "overloads_untested",
+    "crashes",
+    "no_boundary",
+    "kind_not_called",
+    "volatile",
 ];
 
 /// Everything about the run that is not a number out of it.
@@ -167,6 +206,21 @@ impl Provenance {
         }
     }
 
+    /// The same, for a run that read no corpus.
+    ///
+    /// The function sweep builds its own calls out of the catalog, so the corpus rows on it are not
+    /// unknown, they do not apply, and those are different things to say. Everything else about the
+    /// machine and the two engines is gathered the same way, because that is what makes the sweep
+    /// comparable to the corpus run beside it.
+    #[must_use]
+    pub fn of_machine(root: &Path, rudb: &str) -> Self {
+        let mut p = Self::gather(root, Path::new("none"), rudb);
+        p.corpus_commit = "none".to_owned();
+        p.corpus_path = "none, this run generated its own calls".to_owned();
+        p.seed = "none, the calls come from a fixed table of boundary values".to_owned();
+        p
+    }
+
     /// The name of the file this run's page goes in.
     ///
     /// The instant first so that a directory of them sorts into the order they were run in, and the
@@ -185,6 +239,113 @@ impl Provenance {
     }
 }
 
+/// One function coverage sweep, as it is written down and read back.
+///
+/// This is the whole of what a sweep leaves behind for the page. The failing calls themselves are
+/// not in it and are not meant to be: they go to whoever ran the sweep, in full and one per line,
+/// and what belongs in a series is the counts and enough provenance to say what they are counts of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sweep {
+    /// When the sweep ran, in UTC.
+    pub stamp: String,
+    /// The machine it ran on.
+    pub host: String,
+    /// The rudb version it put the calls to.
+    pub rudb: String,
+    /// The commit that rudb was built from.
+    pub rudb_commit: String,
+    /// The commit of this harness, with a note when the tree was dirty.
+    pub compat_commit: String,
+    /// What the DuckDB on the other side of it called itself.
+    pub duckdb_version: String,
+    /// Over the distinct function names.
+    pub names: Tally,
+    /// Over the overload rows.
+    pub overloads: Tally,
+    /// How many calls made an engine come apart rather than answer.
+    pub crashes: usize,
+    /// How many overloads each untested reason accounts for, in the order they are printed.
+    pub reasons: Vec<(Untested, usize)>,
+}
+
+impl Sweep {
+    /// The most recent sweep recorded beside the pages in a directory, if there is one.
+    ///
+    /// The last row that parses, read from the bottom, so the header and any row a half written file
+    /// left behind are stepped over rather than reported. No sweep at all is nothing rather than an
+    /// error, because a machine that has never run one is the ordinary case and a page still comes
+    /// out of it.
+    #[must_use]
+    pub fn latest(dir: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(dir.join(SWEEPS)).ok()?;
+        text.lines().rev().find_map(Self::parse)
+    }
+
+    /// One row of the file, back into the counts it was written from.
+    fn parse(row: &str) -> Option<Self> {
+        let fields: Vec<&str> = row.split('\t').collect();
+        if fields.len() != SWEEP_COLUMNS.len() {
+            return None;
+        }
+        let mut reasons = Vec::with_capacity(Untested::ALL.len());
+        for why in Untested::ALL {
+            reasons.push((why, number(&fields, column(why))?));
+        }
+        Some(Self {
+            stamp: word(&fields, "when")?.to_owned(),
+            host: word(&fields, "machine")?.to_owned(),
+            rudb: word(&fields, "rudb")?.to_owned(),
+            rudb_commit: word(&fields, "rudb_commit")?.to_owned(),
+            compat_commit: word(&fields, "compat_commit")?.to_owned(),
+            duckdb_version: word(&fields, "duckdb")?.to_owned(),
+            names: tally(&fields, "names")?,
+            overloads: tally(&fields, "overloads")?,
+            crashes: number(&fields, "crashes")?,
+            reasons,
+        })
+    }
+
+    /// Whether this sweep measured the same engine on the same machine as the run beside it.
+    ///
+    /// Two numbers on one page that came from two different builds are two facts and not one
+    /// measurement, and the page has to say so where it happens rather than leave a reader to
+    /// compare two commits in the provenance block themselves.
+    #[must_use]
+    pub fn matches(&self, p: &Provenance) -> bool {
+        self.rudb_commit == p.rudb_commit && self.host == p.host
+    }
+}
+
+/// Which column of the sweep file an untested reason is counted in.
+const fn column(why: Untested) -> &'static str {
+    match why {
+        Untested::NoBoundarySet => "no_boundary",
+        Untested::KindNotCalled => "kind_not_called",
+        Untested::Volatile => "volatile",
+    }
+}
+
+/// One named field of a row, or nothing when the name is not a column.
+fn word<'a>(fields: &[&'a str], name: &str) -> Option<&'a str> {
+    let at = SWEEP_COLUMNS.iter().position(|column| *column == name)?;
+    fields.get(at).copied()
+}
+
+/// One named field of a row as a count.
+fn number(fields: &[&str], name: &str) -> Option<usize> {
+    word(fields, name)?.parse().ok()
+}
+
+/// The four columns of one tally, which are its name and its name with three suffixes.
+fn tally(fields: &[&str], what: &str) -> Option<Tally> {
+    Some(Tally {
+        total: number(fields, what)?,
+        passed: number(fields, &format!("{what}_passed"))?,
+        failed: number(fields, &format!("{what}_failed"))?,
+        untested: number(fields, &format!("{what}_untested"))?,
+    })
+}
+
 /// The page itself.
 ///
 /// A [`fmt::Display`] rather than a function that returns a string, because then the tests read the
@@ -193,13 +354,24 @@ impl Provenance {
 pub struct Page<'a> {
     run: &'a Isolated,
     provenance: &'a Provenance,
+    sweep: Option<&'a Sweep>,
 }
 
 impl<'a> Page<'a> {
     /// The page for one corpus run.
     #[must_use]
     pub const fn of(run: &'a Isolated, provenance: &'a Provenance) -> Self {
-        Self { run, provenance }
+        Self { run, provenance, sweep: None }
+    }
+
+    /// The same page with the most recent function sweep carried onto it.
+    ///
+    /// Optional because a machine that has never run one still gets a page, and function coverage
+    /// goes back to being named under the numbers nothing measures yet rather than being left off.
+    #[must_use]
+    pub const fn with(mut self, sweep: Option<&'a Sweep>) -> Self {
+        self.sweep = sweep;
+        self
     }
 }
 
@@ -291,6 +463,69 @@ impl fmt::Display for Page<'_> {
         }
         writeln!(f)?;
 
+        if let Some(sweep) = self.sweep {
+            writeln!(f, "## Function coverage")?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Not measured by this run. The sweep behind this number puts every generated call to every overload in duckdb_functions() to both engines and takes about forty minutes, and this page comes out of a corpus run, so the number below is the most recent sweep written down beside these pages and it is carried here rather than computed here."
+            )?;
+            writeln!(f)?;
+            let line = |f: &mut fmt::Formatter<'_>, what: &str, tally: &Tally| {
+                writeln!(
+                    f,
+                    "    {what:<12}{:>6} of {:<6}{:>5.1} percent, with {} failed and {} never tested",
+                    tally.passed,
+                    tally.total,
+                    tally.share() * 100.0,
+                    tally.failed,
+                    tally.untested
+                )
+            };
+            line(f, "names", &sweep.names)?;
+            line(f, "overloads", &sweep.overloads)?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "An overload that was never tested is a gap in this harness rather than a gap in the engine, and there are three of those. They are counted against the denominator all the same, because a name nothing tested is a name nobody can claim."
+            )?;
+            writeln!(f)?;
+            for (why, count) in &sweep.reasons {
+                writeln!(f, "    {count:>7}  {}", why.name())?;
+            }
+            writeln!(f)?;
+            if sweep.crashes > 0 {
+                writeln!(
+                    f,
+                    "{} calls made one of the two engines panic rather than answer, and every one of those is a bug in the engine that panicked rather than a difference between the two.",
+                    sweep.crashes
+                )?;
+                writeln!(f)?;
+            }
+            writeln!(
+                f,
+                "This is the unweighted number. The weighted one section 1.1 also asks for needs the real query corpus to weight by, and that corpus does not exist yet."
+            )?;
+            writeln!(f)?;
+            writeln!(f, "    measured    {} on {}", sweep.stamp, sweep.host)?;
+            writeln!(f, "    engine      {} at {}", sweep.rudb, sweep.rudb_commit)?;
+            writeln!(f, "    rudb-compat {}", sweep.compat_commit)?;
+            writeln!(f, "    duckdb      {}", sweep.duckdb_version)?;
+            writeln!(f)?;
+            if sweep.matches(p) {
+                writeln!(
+                    f,
+                    "That is the same engine build on the same machine as the corpus numbers above, so this page is one measurement."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "That is not the engine build and machine the corpus numbers above came from, so the two halves of this page are two measurements and not one."
+                )?;
+            }
+            writeln!(f)?;
+        }
+
         writeln!(f, "## What this page does not say yet")?;
         writeln!(f)?;
         writeln!(
@@ -299,6 +534,9 @@ impl fmt::Display for Page<'_> {
         )?;
         writeln!(f)?;
         for (what, needs) in MISSING {
+            if what == FUNCTIONS && self.sweep.is_some() {
+                continue;
+            }
             writeln!(f, "    {what:<20}{needs}")?;
         }
         writeln!(f)?;
@@ -325,15 +563,20 @@ impl fmt::Display for Page<'_> {
     }
 }
 
+/// The row of [`MISSING`] that a recorded sweep takes off the list.
+const FUNCTIONS: &str = "function coverage";
+
 /// The four numbers section 11.2 asks for that nothing here computes yet.
 ///
 /// Kept as data rather than as paragraphs so that deleting a row is the whole of the work when one
-/// of them starts being measured, and so that a reader can see there are four of them.
+/// of them starts being measured, and so that a reader can see there are four of them. Function
+/// coverage is still on the list, because a page written on a machine that has never run a sweep has
+/// nothing to carry and the honest thing to print then is what it would take.
 const MISSING: [(&str, &str); 4] = [
     ("statement coverage", "over the 36 statements in section 1.1, needs the per statement suite"),
     (
-        "function coverage",
-        "over the 1159 names in duckdb_functions() on the pin, weighted and unweighted, needs the signature driven differential in section 10.1",
+        FUNCTIONS,
+        "over the 1159 names in duckdb_functions() on the pin, weighted and unweighted, needs a sweep beside these pages, which `rudb-compat coverage --out` writes",
     ),
     (
         "error levels",
@@ -349,6 +592,41 @@ const MISSING: [(&str, &str); 4] = [
 #[must_use]
 pub fn header() -> String {
     COLUMNS.join("\t")
+}
+
+/// The header line of the sweep file.
+#[must_use]
+pub fn sweep_header() -> String {
+    SWEEP_COLUMNS.join("\t")
+}
+
+/// One sweep as a row of that file.
+///
+/// The same fields in the same order as [`SWEEP_COLUMNS`], which a test checks, and which
+/// [`Sweep::parse`] reads back by name rather than by position so that the two cannot drift apart
+/// without the test noticing first.
+#[must_use]
+pub fn sweep_row(coverage: &Coverage, p: &Provenance) -> String {
+    let mut fields = vec![
+        p.stamp.clone(),
+        p.host.clone(),
+        p.rudb.clone(),
+        p.rudb_commit.clone(),
+        p.compat_commit.clone(),
+        p.duckdb_version.clone(),
+    ];
+    for tally in [&coverage.names, &coverage.overloads] {
+        fields.push(tally.total.to_string());
+        fields.push(tally.passed.to_string());
+        fields.push(tally.failed.to_string());
+        fields.push(tally.untested.to_string());
+    }
+    fields.push(coverage.crashes.to_string());
+    for why in Untested::ALL {
+        let count = coverage.reasons.iter().find(|(one, _)| *one == why).map_or(0, |(_, n)| *n);
+        fields.push(count.to_string());
+    }
+    fields.join("\t")
 }
 
 /// One run as a row of the series file.
@@ -389,18 +667,40 @@ pub fn row(run: &Isolated, p: &Provenance) -> String {
 /// # Errors
 ///
 /// When the directory cannot be made or either file cannot be written.
-pub fn write(dir: &Path, run: &Isolated, p: &Provenance) -> Result<PathBuf, HarnessError> {
+pub fn write(
+    dir: &Path,
+    run: &Isolated,
+    p: &Provenance,
+    sweep: Option<&Sweep>,
+) -> Result<PathBuf, HarnessError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
     let page = dir.join(p.filename());
-    std::fs::write(&page, Page::of(run, p).to_string())
+    std::fs::write(&page, Page::of(run, p).with(sweep).to_string())
         .map_err(|e| HarnessError::new(format!("cannot write {}: {e}", page.display())))?;
-    append(&dir.join(SERIES), &row(run, p))?;
+    append(&dir.join(SERIES), &header(), &row(run, p))?;
     Ok(page)
 }
 
-/// Add one row to the series, starting the file with its header when it is not there yet.
-fn append(path: &Path, row: &str) -> Result<(), HarnessError> {
+/// Write one function sweep down beside the pages, and say which file it went in.
+///
+/// No page of its own. A sweep is a handful of counts and a great many failing calls, the calls go
+/// to whoever ran it, and the counts belong on the page the corpus run writes rather than on a
+/// second page nobody would read beside the first.
+///
+/// # Errors
+///
+/// When the directory cannot be made or the file cannot be appended to.
+pub fn record(dir: &Path, coverage: &Coverage, p: &Provenance) -> Result<PathBuf, HarnessError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
+    let file = dir.join(SWEEPS);
+    append(&file, &sweep_header(), &sweep_row(coverage, p))?;
+    Ok(file)
+}
+
+/// Add one row to a file, starting it with its header when it is not there yet.
+fn append(path: &Path, header: &str, row: &str) -> Result<(), HarnessError> {
     use std::io::Write as _;
     let fresh = !path.exists();
     let mut file = std::fs::OpenOptions::new()
@@ -408,7 +708,7 @@ fn append(path: &Path, row: &str) -> Result<(), HarnessError> {
         .append(true)
         .open(path)
         .map_err(|e| HarnessError::new(format!("cannot open {}: {e}", path.display())))?;
-    let text = if fresh { format!("{}\n{row}\n", header()) } else { format!("{row}\n") };
+    let text = if fresh { format!("{header}\n{row}\n") } else { format!("{row}\n") };
     file.write_all(text.as_bytes())
         .map_err(|e| HarnessError::new(format!("cannot write {}: {e}", path.display())))
 }
@@ -540,8 +840,14 @@ fn parts(unix: u64) -> (i64, u32, u32, u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::{COLUMNS, Page, Provenance, header, parts, pinned, row, short, stamp};
+    use super::{
+        COLUMNS, Page, Provenance, SWEEP_COLUMNS, Sweep, header, parts, pinned, row, short, stamp,
+        sweep_header, sweep_row,
+    };
+    use std::path::Path;
+
     use crate::conform::{Failure, Reason, Skips};
+    use crate::coverage::{Coverage, Tally, Untested};
     use crate::isolate::Isolated;
 
     fn provenance() -> Provenance {
@@ -622,6 +928,120 @@ mod tests {
             assert!(page.contains(missing), "{missing} is not named\n{page}");
         }
         assert!(page.contains("What this page does not say yet"), "{page}");
+    }
+
+    /// The numbers off the first full sweep, which ran on server2 in September.
+    fn measured() -> Coverage {
+        Coverage {
+            names: Tally { total: 1159, passed: 16, failed: 622, untested: 521 },
+            overloads: Tally { total: 3245, passed: 42, failed: 1386, untested: 1817 },
+            reasons: vec![
+                (Untested::NoBoundarySet, 245),
+                (Untested::KindNotCalled, 1538),
+                (Untested::Volatile, 34),
+            ],
+            crashes: 12,
+            failing: vec![("add".to_owned(), 42, 43)],
+        }
+    }
+
+    fn sweep() -> Sweep {
+        Sweep::parse(&sweep_row(&measured(), &provenance())).expect("the row it just wrote")
+    }
+
+    #[test]
+    fn a_sweep_beside_the_pages_puts_the_function_coverage_number_on_one() {
+        let sweep = sweep();
+        let page = Page::of(&run(), &provenance()).with(Some(&sweep)).to_string();
+        assert!(page.contains("## Function coverage"), "{page}");
+        assert!(page.contains("16 of 1159"), "the number is not beside what it is over\n{page}");
+        assert!(page.contains("1.4 percent, with 622 failed and 521 never tested"), "{page}");
+        assert!(page.contains("42 of 3245"), "{page}");
+        assert!(page.contains("1.3 percent, with 1386 failed and 1817 never tested"), "{page}");
+        assert!(page.contains("1538  a kind the generator does not call yet"), "{page}");
+        assert!(page.contains("12 calls made one of the two engines panic"), "{page}");
+        assert!(page.contains("unweighted"), "{page}");
+    }
+
+    #[test]
+    fn the_number_a_sweep_carried_is_not_named_as_one_nothing_measures() {
+        let sweep = sweep();
+        let page = Page::of(&run(), &provenance()).with(Some(&sweep)).to_string();
+        let missing = page.split("## What this page does not say yet").nth(1).expect("the heading");
+        assert!(!missing.contains("function coverage"), "{missing}");
+        for still in ["statement coverage", "error levels", "resource ratios"] {
+            assert!(missing.contains(still), "{still} came off the list too\n{missing}");
+        }
+    }
+
+    #[test]
+    fn a_sweep_from_another_build_says_it_is_not_the_same_measurement() {
+        let same = sweep();
+        let page = Page::of(&run(), &provenance()).with(Some(&same)).to_string();
+        assert!(page.contains("so this page is one measurement"), "{page}");
+
+        let mut other = sweep();
+        other.rudb_commit = "0000000000".to_owned();
+        let page = Page::of(&run(), &provenance()).with(Some(&other)).to_string();
+        assert!(page.contains("two measurements and not one"), "{page}");
+    }
+
+    #[test]
+    fn a_run_with_nothing_crashing_leaves_the_crash_sentence_off_the_page() {
+        let mut quiet = measured();
+        quiet.crashes = 0;
+        let sweep = Sweep::parse(&sweep_row(&quiet, &provenance())).expect("a row");
+        let page = Page::of(&run(), &provenance()).with(Some(&sweep)).to_string();
+        assert!(!page.contains("panic"), "{page}");
+    }
+
+    #[test]
+    fn a_sweep_row_has_exactly_the_fields_its_header_says_it_has() {
+        let row = sweep_row(&measured(), &provenance());
+        assert_eq!(sweep_header().split('\t').count(), SWEEP_COLUMNS.len());
+        assert_eq!(row.split('\t').count(), SWEEP_COLUMNS.len(), "{row}");
+        assert!(!row.contains('\n'), "a row that is two rows\n{row}");
+    }
+
+    #[test]
+    fn a_sweep_reads_back_as_the_counts_it_was_written_from() {
+        let coverage = measured();
+        let sweep = sweep();
+        assert_eq!(sweep.names, coverage.names);
+        assert_eq!(sweep.overloads, coverage.overloads);
+        assert_eq!(sweep.reasons, coverage.reasons);
+        assert_eq!(sweep.crashes, coverage.crashes);
+        assert_eq!(sweep.host, "server2");
+        assert_eq!(sweep.rudb_commit, "cfdf975e68");
+    }
+
+    #[test]
+    fn a_row_that_is_not_one_is_stepped_over_rather_than_read_as_zeroes() {
+        assert_eq!(Sweep::parse(&sweep_header()), None, "the header is not a sweep");
+        assert_eq!(Sweep::parse(""), None);
+        let short = sweep_row(&measured(), &provenance()).replace("\t12\t", "\t");
+        assert_eq!(Sweep::parse(&short), None, "a row missing a field is not half a sweep");
+    }
+
+    #[test]
+    fn the_last_sweep_written_is_the_one_that_comes_back() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(Sweep::latest(&dir), None, "a machine that never swept carries nothing");
+
+        let mut older = measured();
+        older.names.passed = 1;
+        super::record(&dir, &older, &provenance()).expect("a directory it can make");
+        super::record(&dir, &measured(), &provenance()).expect("the same directory again");
+
+        let read = Sweep::latest(&dir).expect("two of them were written");
+        assert_eq!(read.names.passed, 16, "the older one came back");
+        let text = std::fs::read_to_string(dir.join(super::SWEEPS)).expect("the file");
+        assert_eq!(text.lines().count(), 3, "a header and two rows\n{text}");
+        assert!(text.starts_with(&sweep_header()), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
