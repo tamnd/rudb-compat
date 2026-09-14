@@ -33,6 +33,25 @@ use crate::slt::{Directive, ParseError, QueryResult, Record, Sort, StatementResu
 /// and every one of those would be a failure that means nothing.
 pub const NAMES: &[&str] = &["rudb", "duckdb"];
 
+/// rudb's vector size, which is what a `require vector_size` line is asking about.
+///
+/// It mirrors `rudb_vector::VECTOR_SIZE`, which the `rudb` facade does not re-export, so this
+/// repeats the number rather than reading it. The direction of a drift is the thing to know. If
+/// rudb grows its vector and this stays where it is, the runner skips files it could have run,
+/// which shows up as a skip count that will not go down. If rudb shrinks its vector and this stays,
+/// the runner attempts files written for a larger one, which shows up as failures. Both are
+/// visible, and the first is the one that happens.
+const VECTOR_SIZE: usize = 1024;
+
+/// The things the corpus requires that rudb has without loading anything.
+///
+/// DuckDB ships these as extensions and the corpus asks for them by name. rudb has no extension
+/// mechanism at all, so the question is not whether the extension is loaded but whether the
+/// capability is there, and for parquet it is: `read_parquet` and the parquet reader are in the
+/// engine. A name that lands here wrongly costs a wall of failures with a reason on each, and a
+/// name missing from here costs a silently smaller corpus, so the short list is the safe one.
+const BUILT_IN: &[&str] = &["parquet"];
+
 /// What kind of thing went wrong, as opposed to what went wrong.
 ///
 /// `spec/14-rudb-compat.md` section 14.1 asks for the report to break failures down rather than
@@ -442,12 +461,16 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
     let mut summary = Summary { files: 1, ..Summary::default() };
     engine.reset()?;
 
-    // A `require` anywhere in the file disables the whole file, which is how the format works: the
-    // requirement is about the build and not about the record it happens to sit above.
+    // A `require` the harness cannot satisfy disables the whole file, which is how the format
+    // works: the requirement is about the build and not about the record it happens to sit above.
+    // A `require` it can satisfy is not a skip at all, and most of them can be satisfied.
     for record in &file.records {
-        if let Directive::Require(what) = &record.directive {
-            summary.skipped_files.push((file.name.clone(), Skipped::Requires(what.clone())));
-            return Ok(summary);
+        if let Directive::Require { env, params } = &record.directive {
+            if !have(*env, params) {
+                let what = requirement(*env, params);
+                summary.skipped_files.push((file.name.clone(), Skipped::Requires(what)));
+                return Ok(summary);
+            }
         }
     }
 
@@ -468,7 +491,7 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
         if matches!(record.directive, Directive::Halt) {
             break;
         }
-        if matches!(record.directive, Directive::HashThreshold(_)) {
+        if matches!(record.directive, Directive::HashThreshold(_) | Directive::Require { .. }) {
             continue;
         }
         if skipping {
@@ -493,6 +516,89 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
     }
 
     Ok(summary)
+}
+
+/// Whether this harness has what a `require` line is asking for.
+///
+/// This follows `CheckRequire` in DuckDB's own `test/sqlite/sqllogic_test_runner.cpp`, and it is
+/// worth following closely rather than approximating, because most of what the corpus requires is
+/// not a feature at all. `require skip_reload` tells DuckDB's runner not to reopen the database in
+/// the middle of the file. `require noforcestorage` tells it not to run the file in the mode that
+/// writes everything to disk first. `require no_alternative_verify` and `require
+/// no_vector_verification` turn off debug modes, and `require no_extension_autoloading` turns off
+/// a convenience. Upstream's own runner answers yes to every one of those on an ordinary build and
+/// runs the file. Reading them as a missing feature and skipping the file, which is what this
+/// runner did before, put several hundred files of the corpus behind directives that never meant
+/// anything here, and every record in them was invisible to the pass rate.
+///
+/// Answering no is the expensive direction and answering yes is the honest one. A file that runs
+/// and fails produces a failure with a reason on it, which is a job for somebody. A file that is
+/// skipped produces nothing and makes the pass rate look better, which is the failure mode the
+/// whole report is built to avoid.
+fn have(env: bool, params: &[String]) -> bool {
+    // `require-env` asks whether an environment variable is set, and when it has a second argument
+    // whether it holds that value. Every one of these in the corpus points at a machine somebody
+    // else has, an extension repository or a secrets store, so in practice they are all missing,
+    // but the question is answerable so it gets answered rather than assumed.
+    if env {
+        let Some(name) = params.first() else { return false };
+        let Ok(value) = std::env::var(name) else { return false };
+        return params.get(1).is_none_or(|wanted| &value == wanted);
+    }
+
+    let Some(first) = params.first() else { return false };
+    let what = first.to_ascii_lowercase();
+    let size = || params.get(1).and_then(|p| p.parse::<usize>().ok());
+    match what.as_str() {
+        // Guards on how DuckDB was built or on the mode its runner is in. None of them describe
+        // anything this harness does, so all of them are satisfied, which is the same answer
+        // upstream gives on an ordinary build.
+        "notmusl"
+        | "nothreadsan"
+        | "strinline"
+        | "noforcestorage"
+        | "no_force_storage"
+        | "skip_reload"
+        | "no_alternative_verify"
+        | "no_latest_storage"
+        | "no_vector_verification"
+        | "no_extension_autoloading" => true,
+
+        // Guards on the platform, read off the target rather than off a build flag.
+        "notmingw" | "notwindows" => !cfg!(windows),
+        "mingw" | "windows" => cfg!(windows),
+        "64bit" => cfg!(target_pointer_width = "64"),
+
+        // The size of the vector the engine works a chunk at a time in. `vector_size` is a floor
+        // and `exact_vector_size` is an equality, which is upstream's reading and not ours.
+        "vector_size" => size().is_some_and(|wanted| VECTOR_SIZE >= wanted),
+        "exact_vector_size" => size().is_some_and(|wanted| VECTOR_SIZE == wanted),
+
+        // rudb keeps its tables in memory and has no block size for a file to match, so a file
+        // that pins one is asking about something that does not exist here.
+        "block_size" => false,
+
+        // How much memory or disk the machine has. Answerable on Linux by reading `/proc`, and not
+        // answerable portably without a second dependency this crate will not take. The files
+        // behind these ask for eight to forty gigabytes, so they would be stopped on the memory
+        // budget anyway, and a skip that names the requirement beats a stop that names a number.
+        "ram" | "disk_space" => false,
+
+        // Settings DuckDB's own runner is only sometimes started with, and that are off by default
+        // there too.
+        "allow_unsigned_extensions" | "vacuum_rebuild_indexes" => false,
+
+        // An eighty bit float, which rudb does not have and does not intend to.
+        "longdouble" => false,
+
+        other => BUILT_IN.contains(&other),
+    }
+}
+
+/// How a requirement is worded in the report, which is how the file wrote it.
+fn requirement(env: bool, params: &[String]) -> String {
+    let what = params.join(" ");
+    if env { format!("the environment to have {what}") } else { what }
 }
 
 /// Run one record and decide whether it did what the file said.
@@ -631,7 +737,7 @@ fn check(
         }
         Directive::Halt
         | Directive::HashThreshold(_)
-        | Directive::Require(_)
+        | Directive::Require { .. }
         | Directive::Mode(_)
         | Directive::Unsupported(_) => Ok(Ok(())),
     }
@@ -831,7 +937,7 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 
 #[cfg(test)]
 mod tests {
-    use super::{NAMES, Reason, Skips, Summary, flatten, render, run_text};
+    use super::{NAMES, Reason, Skips, Summary, VECTOR_SIZE, flatten, render, run_text};
     use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
     use crate::slt::{Condition, Sort};
 
@@ -950,10 +1056,85 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_requires_something_is_skipped_whole() {
-        let summary = run(Vec::new(), "require parquet\n\nstatement ok\nSELECT 1\n");
+    fn a_file_that_requires_something_we_do_not_have_is_skipped_whole() {
+        let summary = run(Vec::new(), "require icu\n\nstatement ok\nSELECT 1\n");
         assert_eq!(summary.skipped_files.len(), 1);
         assert_eq!(summary.attempted(), 0);
+    }
+
+    #[test]
+    fn the_modes_duckdbs_runner_is_not_in_are_not_missing_features_and_do_not_skip_a_file() {
+        // These are the largest group of `require` lines in the corpus and none of them is about a
+        // feature. Upstream's own runner answers yes to every one of them on an ordinary build.
+        for what in [
+            "skip_reload",
+            "noforcestorage",
+            "no_force_storage",
+            "no_alternative_verify",
+            "no_latest_storage",
+            "no_vector_verification",
+            "no_extension_autoloading EXPECTED: it explains itself",
+            "nothreadsan",
+            "notmusl",
+            "strinline",
+        ] {
+            let text = format!("require {what}\n\nstatement ok\nSELECT 1\n");
+            let summary = run(vec![Outcome::Rows(Table::default())], &text);
+            assert!(summary.skipped_files.is_empty(), "{what}");
+            assert_eq!(summary.passed, 1, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_satisfied_require_is_not_counted_as_a_record_that_passed() {
+        // The directive is not work, so counting it would add one free pass to every file that
+        // carries one, and the corpus carries about fifteen hundred of them.
+        let summary = run(Vec::new(), "require skip_reload\n");
+        assert_eq!(summary.passed, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped.total(), 0);
+    }
+
+    #[test]
+    fn a_vector_size_is_a_floor_and_an_exact_vector_size_is_an_equality() {
+        let runs = |what: &str| {
+            let text = format!("require {what}\n\nstatement ok\nSELECT 1\n");
+            run(vec![Outcome::Rows(Table::default())], &text).skipped_files.is_empty()
+        };
+        assert!(runs("vector_size 64"));
+        assert!(runs(&format!("vector_size {VECTOR_SIZE}")));
+        assert!(!runs(&format!("vector_size {}", VECTOR_SIZE * 2)));
+        assert!(runs(&format!("exact_vector_size {VECTOR_SIZE}")));
+        assert!(!runs("exact_vector_size 2"));
+    }
+
+    #[test]
+    fn an_extension_rudb_has_the_capability_of_is_not_a_reason_to_skip_a_file() {
+        // rudb has no extensions, so the question a `require parquet` asks is whether the reader is
+        // in the engine rather than whether an extension is loaded, and it is.
+        let summary = run(
+            vec![Outcome::Rows(Table::default())],
+            "require parquet\n\nstatement ok\nSELECT 1\n",
+        );
+        assert!(summary.skipped_files.is_empty());
+        assert_eq!(summary.passed, 1);
+    }
+
+    #[test]
+    fn a_require_env_is_answered_from_the_environment_and_not_assumed() {
+        // Answered rather than hard coded to missing, because a run with the variable set is a run
+        // that should attempt the file.
+        let name = "RUDB_COMPAT_A_VARIABLE_NOBODY_SETS";
+        assert!(!super::have(true, &[name.to_owned()]));
+        assert!(!super::have(true, &["PATH".to_owned(), "not what PATH holds".to_owned()]));
+        assert!(super::have(true, &["PATH".to_owned()]));
+    }
+
+    #[test]
+    fn the_report_says_what_the_file_asked_for_and_not_just_that_it_asked() {
+        let summary = run(Vec::new(), "require vector_size 4096\n\nstatement ok\nSELECT 1\n");
+        let (_, why) = &summary.skipped_files[0];
+        assert_eq!(why.to_string(), "requires vector_size 4096");
     }
 
     #[test]

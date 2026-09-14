@@ -71,8 +71,20 @@ pub enum Directive {
     /// Only relevant when writing a file, since a record that is hashed says so. It is carried
     /// because a run that rewrites expectations needs it and dropping it would lose it.
     HashThreshold(usize),
-    /// `require <feature>`, which skips the whole file when the feature is missing.
-    Require(String),
+    /// `require <what> [argument]`, which can turn the whole file off.
+    ///
+    /// The words are kept apart rather than joined, because several of them take an argument and
+    /// the argument is what decides the answer. `require vector_size 2048` and `require
+    /// vector_size 64` are the same requirement of two very different sizes, and a runner that
+    /// reads the line as one string cannot tell them apart.
+    Require {
+        /// Whether the line said `require-env`, which asks about the environment the run is in
+        /// rather than about the engine or the build.
+        env: bool,
+        /// The words after the directive, lowercased nowhere, because the argument of a
+        /// `require-env` is an environment variable name and case matters in one.
+        params: Vec<String>,
+    },
     /// `mode <name>`, which sets a parser or runner mode for the rest of the file.
     Mode(String),
     /// Something the format has and this runner does not do: `sleep`, `restart`, `load`, `unzip`
@@ -307,7 +319,10 @@ fn one(lines: &[&str], at: &mut usize) -> Result<Option<Record>, ParseError> {
         "query" => query(lines, at, &rest, number)?,
         "halt" => Directive::Halt,
         "hash-threshold" => Directive::HashThreshold(number_arg(rest.first().copied(), number)?),
-        "require" | "require-env" => Directive::Require(rest.join(" ")),
+        "require" | "require-env" => Directive::Require {
+            env: first == "require-env",
+            params: rest.iter().map(|word| (*word).to_owned()).collect(),
+        },
         "mode" => Directive::Mode(rest.join(" ")),
         "sleep" | "restart" | "reconnect" | "load" | "unzip" | "set" => {
             Directive::Unsupported(trimmed.to_owned())
@@ -788,6 +803,23 @@ SELECT a FROM t
             conditions,
             vec![&Condition::Never, &Condition::Never, &Condition::Always, &Condition::Always]
         );
+    }
+
+    #[test]
+    fn a_requirement_keeps_its_argument_apart_from_its_name() {
+        let file = parse("x.test", "require vector_size 2048\n").unwrap();
+        let Directive::Require { env, params } = &file.records[0].directive else {
+            panic!("a require");
+        };
+        assert!(!env);
+        assert_eq!(params, &["vector_size".to_owned(), "2048".to_owned()]);
+
+        let file = parse("x.test", "require-env LOCAL_EXTENSION_REPO\n").unwrap();
+        let Directive::Require { env, params } = &file.records[0].directive else {
+            panic!("a require");
+        };
+        assert!(env);
+        assert_eq!(params, &["LOCAL_EXTENSION_REPO".to_owned()]);
     }
 
     #[test]
