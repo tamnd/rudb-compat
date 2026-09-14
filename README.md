@@ -227,6 +227,22 @@ A stale file is a note and nothing more, because a file the pinned binary itself
 
 It always drives both engines as shells that remember what they were told, rather than taking `--shell` as a choice. A test file makes a table and then asks questions about it, so a driver that forgets between statements fails every record after the first one for a reason that has nothing to do with the record. The library pair forgets on one side only, because the linked rudb keeps a connection open and the DuckDB driver spawns a fresh in memory process per statement, so every record after the first `CREATE TABLE` passes on rudb and fails on the binary and the whole corpus reads as a harness bug. Two bare shells forget on both sides instead, which cancels out into a stale file rather than a harness bug, and a run where four fifths of the records are the pin failing to find a table it was never told about is a run that measures nothing. Sessions replay the statements that left something behind in front of the next one, which is the only arrangement where a whole file means anything.
 
+## Upstream's own generator
+
+DuckDB ships a `sqlsmith` extension and runs it against itself as a public fuzzer, so there is a generated query source here with no generator to write. It produces deep joins, correlated subqueries in select lists, `tablesample` clauses and casts to types nobody would write, which is a fair description of the part of the grammar a corpus of hand written tests does not reach.
+
+```
+RUDB_COMPAT_SQLSMITH=/usr/local/bin/duckdb-v1.5.1 rudb-compat sqlsmith --count 200 --seed 1
+```
+
+The generator is not the pinned binary, and that is not a workaround. Extension binaries are published for releases and the pin is a development commit, so `INSTALL sqlsmith` against the pin is a 404. It does not matter, because what comes out of a generator is SQL text and text has no version. Every statement it writes is still put to the pinned binary and to rudb, which is where the version matters.
+
+What does depend on the generator is the shape of what it writes, since sqlsmith builds queries out of the catalog and the function list of the database it is running in. So the tables are fixed in the code rather than taken from whatever database somebody points it at.
+
+A query both engines refused is counted apart from the rest. The generator is a different build from the pin and a share of what it produces names something the pin has never heard of. The pin refuses those, rudb refuses them for a different reason, and the two reasons side by side look exactly like an error kind divergence while saying nothing about compatibility. In a corpus somebody wrote on purpose, two different error kinds is a real finding. Here it is the generator talking to itself, and counting it would make the largest group on the page the one group nobody can act on.
+
+The seed is printed whether it was given or not, because a generated run whose findings cannot be replayed is a generated run whose findings do not get fixed.
+
 ## Which pass changed the answer
 
 A wrong answer is a sentence and a plan, and the plan is the part nobody wants to read. rudb takes DuckDB's `SET disabled_optimizers` spelling, so the question "which rewrite did this" can be asked by running the statement again rather than by reading anything.

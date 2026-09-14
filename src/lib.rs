@@ -48,6 +48,7 @@ pub mod resource;
 pub mod rudb;
 pub mod shell;
 pub mod slt;
+pub mod sqlsmith;
 pub mod suite;
 pub mod vendor;
 
