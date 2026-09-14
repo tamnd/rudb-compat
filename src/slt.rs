@@ -24,6 +24,8 @@
 //! file wrong, and both of those want a person rather than a silently smaller pass rate.
 
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 /// One record from a `.test` file, after loops are expanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +89,20 @@ pub enum Directive {
     },
     /// `mode <name>`, which sets a parser or runner mode for the rest of the file.
     Mode(String),
+    /// `reset label <name>`, which forgets a result two queries were told to share.
+    ///
+    /// A file writes this when it reuses a label across iterations of a loop, so that the second
+    /// iteration compares its two queries against each other rather than against the first
+    /// iteration's. Dropping it would turn that into a wrong answer report on a record that is
+    /// fine.
+    ResetLabel(String),
+    /// `continue`, which ends the iteration of the loop it is in.
+    ///
+    /// Only ever written under a condition, because a `continue` that always fires would make the
+    /// rest of the loop body dead. The loop is expanded by this parser, so the usual case is
+    /// settled there and this is what is left when the condition is about the engine rather than
+    /// about the loop.
+    Continue,
     /// Something the format has and this runner does not do: `sleep`, `restart`, `load`, `unzip`
     /// and the rest.
     ///
@@ -139,11 +155,13 @@ pub enum StatementResult {
     Ok,
     /// It has to fail, and if there is text after the `----` the error has to contain it.
     Error(Option<String>),
-    /// Either is fine.
+    /// Either is fine, and when it fails the error has to be the one named.
     ///
     /// The corpus uses this where the answer depends on a build option or on the order two
-    /// concurrent things happened in. A `maybe` that fails is not a pass, it is not counted.
-    Maybe,
+    /// concurrent things happened in. It carries a `----` the same way `error` does, and upstream's
+    /// parser refuses a `maybe` without one, so reading the directive and leaving the `----` behind
+    /// is how twenty nine files in the corpus came back as unreadable.
+    Maybe(Option<String>),
 }
 
 /// What a `query` record expects.
@@ -208,16 +226,43 @@ impl std::error::Error for ParseError {}
 /// When a directive is not one this parser knows, when a record is missing the part after its
 /// `----`, or when a loop is not closed.
 pub fn parse(name: &str, text: &str) -> Result<TestFile, ParseError> {
+    parse_under(None, name, text)
+}
+
+/// Read a `.test` file that may pull another one in with `include`.
+///
+/// The root is the directory an `include` path is relative to, which is the top of the corpus and
+/// not the directory the file is in. With no root an `include` is an error, the same as any other
+/// directive this parser cannot carry out, because a parse with no corpus around it has nowhere to
+/// look and quietly dropping the line would run a file that is missing its setup.
+///
+/// # Errors
+///
+/// Everything [`parse`] fails on, and an `include` whose file is not there or does not parse.
+pub fn parse_under(root: Option<&Path>, name: &str, text: &str) -> Result<TestFile, ParseError> {
     let lines: Vec<&str> = text.lines().collect();
     let mut at = 0usize;
-    let records = block(&lines, &mut at, false)?;
+    let records = block(root, &lines, &mut at, false, 0)?;
     Ok(TestFile { name: name.to_owned(), records })
 }
 
+/// How deep one `include` may reach through another.
+///
+/// The corpus goes one deep. The limit is here so that a file that includes itself is an error with
+/// a line number on it rather than a stack overflow in a test runner.
+const NESTING: usize = 8;
+
 /// Read records until the end of the input, or until an `endloop` when one is expected.
 ///
-/// The recursion is the loop nesting, which the corpus does go three deep on.
-fn block(lines: &[&str], at: &mut usize, inside_loop: bool) -> Result<Vec<Record>, ParseError> {
+/// The recursion is the loop nesting, which the corpus does go three deep on, and the `include`
+/// nesting, which it does not.
+fn block(
+    root: Option<&Path>,
+    lines: &[&str],
+    at: &mut usize,
+    inside_loop: bool,
+    depth: usize,
+) -> Result<Vec<Record>, ParseError> {
     let mut out = Vec::new();
     while *at < lines.len() {
         let line = lines[*at];
@@ -249,19 +294,27 @@ fn block(lines: &[&str], at: &mut usize, inside_loop: bool) -> Result<Vec<Record
                 let from = number_arg(words.next(), number)?;
                 let to = number_arg(words.next(), number)?;
                 *at += 1;
-                let body = block(lines, at, true)?;
+                let body = block(root, lines, at, true, depth)?;
                 for i in from..to {
-                    out.extend(substitute(&body, &name, &i.to_string()));
+                    out.extend(iteration(&body, &name, &i.to_string()));
                 }
             }
             "foreach" | "concurrentforeach" => {
                 let name = words.next().unwrap_or("").to_owned();
                 let values: Vec<String> = words.flat_map(expand_collection).collect();
                 *at += 1;
-                let body = block(lines, at, true)?;
+                let body = block(root, lines, at, true, depth)?;
                 for value in &values {
-                    out.extend(substitute(&body, &name, value));
+                    out.extend(iteration(&body, &name, value));
                 }
+            }
+            // Labels that pick out a subset of the corpus to run. They say nothing about what the
+            // file does, so the line carries no record.
+            "tags" => *at += 1,
+            "include" => {
+                let path = words.next().unwrap_or("");
+                *at += 1;
+                out.extend(include(root, path, number, depth)?);
             }
             _ => {
                 let record = one(lines, at)?;
@@ -279,6 +332,56 @@ fn block(lines: &[&str], at: &mut usize, inside_loop: bool) -> Result<Vec<Record
         });
     }
     Ok(out)
+}
+
+/// Read the file an `include` names and hand back its records to be spliced in where it stood.
+///
+/// The path is relative to the top of the corpus, not to the file doing the including, which is
+/// what DuckDB's own parser does in `IncludeFile`. Every use of it in the corpus today points at
+/// the same tpch setup template, which is a `require tpch` and a `CALL dbgen`, so what this buys
+/// is fifteen files moving from unreadable, which reads as a bug in this parser, to requiring
+/// something rudb does not have, which is what is actually true of them.
+fn include(
+    root: Option<&Path>,
+    path: &str,
+    number: usize,
+    depth: usize,
+) -> Result<Vec<Record>, ParseError> {
+    let fail = |message: String| ParseError { line: number, message };
+    if depth >= NESTING {
+        return Err(fail(format!("an include nested more than {NESTING} deep")));
+    }
+    let Some(root) = root else {
+        return Err(fail("an include with no corpus to look in".to_owned()));
+    };
+    let full = root.join(path);
+    let text = fs::read_to_string(&full)
+        .map_err(|e| fail(format!("the included {} could not be read, {e}", full.display())))?;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut at = 0usize;
+    // The included file is read as a whole file rather than as a continuation, so a loop it opens
+    // has to close inside it. That is upstream's rule too and the template obeys it.
+    block(Some(root), &lines, &mut at, false, depth + 1)
+        .map_err(|e| fail(format!("the included {path} does not parse, {e}")))
+}
+
+/// One turn of a loop, with the variable put in and a `continue` taken at its word.
+///
+/// `continue` ends the iteration it is in. The loop is expanded here rather than interpreted, so an
+/// iteration is a stretch of records this function is holding and ending it is a truncation. The
+/// condition on the `continue` is the loop variable in every use of it in the corpus, and
+/// [`substitute`] has already settled that into [`Condition::Always`] or [`Condition::Never`], so
+/// by this point the question is answerable. A condition naming an engine rather than the loop is
+/// left alone for the runner, because this is the wrong place to know which engine is running.
+fn iteration(body: &[Record], name: &str, value: &str) -> Vec<Record> {
+    let mut out = substitute(body, name, value);
+    let stop = out.iter().position(|record| {
+        record.directive == Directive::Continue && record.condition == Condition::Always
+    });
+    if let Some(stop) = stop {
+        out.truncate(stop);
+    }
+    out
 }
 
 /// Read one record, starting at a line that is neither blank nor a comment.
@@ -324,7 +427,17 @@ fn one(lines: &[&str], at: &mut usize) -> Result<Option<Record>, ParseError> {
             params: rest.iter().map(|word| (*word).to_owned()).collect(),
         },
         "mode" => Directive::Mode(rest.join(" ")),
-        "sleep" | "restart" | "reconnect" | "load" | "unzip" | "set" => {
+        "continue" => Directive::Continue,
+        "reset" => match (rest.first().copied(), rest.get(1).copied()) {
+            (Some("label"), Some(name)) => Directive::ResetLabel(name.to_owned()),
+            _ => {
+                return Err(ParseError {
+                    line: number,
+                    message: "a reset is reset label followed by a name".to_owned(),
+                });
+            }
+        },
+        "sleep" | "restart" | "reconnect" | "load" | "unzip" | "set" | "test-env" => {
             Directive::Unsupported(trimmed.to_owned())
         }
         other => {
@@ -349,7 +462,7 @@ fn statement(
     let sql = sql_body(lines, at);
     let expected = match kind {
         "ok" => StatementResult::Ok,
-        "maybe" => StatementResult::Maybe,
+        "maybe" => StatementResult::Maybe(tail(lines, at)),
         "error" => StatementResult::Error(tail(lines, at)),
         other => {
             return Err(ParseError {
@@ -826,5 +939,99 @@ SELECT a FROM t
     fn a_comment_and_a_blank_line_carry_no_record() {
         let file = parse("x.test", "# a note\n\n# another\n").unwrap();
         assert!(file.records.is_empty());
+    }
+
+    #[test]
+    fn a_maybe_takes_its_result_block_the_same_way_an_error_does() {
+        // Twenty nine files in the corpus came back as unreadable because this did not. The
+        // directive was read, the `----` under it was left where it was, and the next pass over the
+        // file found a line reading `----` and called it a directive it did not know.
+        let file = parse("x.test", "statement maybe\nINSERT INTO t VALUES (1)\n----\n\n").unwrap();
+        assert_eq!(file.records.len(), 1);
+        let Directive::Statement { expected, .. } = &file.records[0].directive else {
+            panic!("a statement");
+        };
+        assert_eq!(*expected, StatementResult::Maybe(None));
+
+        let text = "statement maybe\nINSERT INTO t VALUES (1)\n----\nConstraint Error\n";
+        let file = parse("x.test", text).unwrap();
+        let Directive::Statement { expected, .. } = &file.records[0].directive else {
+            panic!("a statement");
+        };
+        assert_eq!(*expected, StatementResult::Maybe(Some("Constraint Error".to_owned())));
+    }
+
+    #[test]
+    fn a_tags_line_is_about_which_files_to_run_and_carries_no_record() {
+        let file = parse("x.test", "tags release\n\nstatement ok\nSELECT 1\n").unwrap();
+        assert_eq!(file.records.len(), 1);
+    }
+
+    #[test]
+    fn a_reset_names_the_label_it_forgets() {
+        let file = parse("x.test", "reset label expected_res\n").unwrap();
+        assert_eq!(file.records[0].directive, Directive::ResetLabel("expected_res".to_owned()));
+        assert!(parse("x.test", "reset something_else\n").is_err());
+    }
+
+    #[test]
+    fn a_continue_ends_the_turn_of_the_loop_it_fires_on_and_leaves_the_others_whole() {
+        // The corpus writes this under a condition on the loop variable, which is settled when the
+        // loop is expanded, so by the time the runner sees the records the skipped turn is simply
+        // not in them.
+        let text = "\
+foreach col a b
+
+onlyif col=b
+continue
+
+statement ok
+SELECT {col}
+
+endloop
+";
+        let file = parse("x.test", text).unwrap();
+        let sql: Vec<&str> = file
+            .records
+            .iter()
+            .filter_map(|record| match &record.directive {
+                Directive::Statement { sql, .. } => Some(sql.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sql, ["SELECT a"]);
+    }
+
+    #[test]
+    fn an_include_with_no_corpus_to_look_in_is_an_error_and_not_a_line_that_is_dropped() {
+        // Dropping it would run a file that is missing its setup and then report on what happened,
+        // which is a worse answer than saying the parser could not do it.
+        let e = parse("x.test", "include test/sql/tpch/tpch_setup.test_template\n").unwrap_err();
+        assert_eq!(e.line, 1);
+        assert!(e.message.contains("include"), "{}", e.message);
+    }
+
+    #[test]
+    fn an_include_puts_the_records_of_the_named_file_where_the_line_stood() {
+        // Under the crate's own target directory rather than the machine's temporary one, so a run
+        // leaves nothing behind anywhere the next run does not already clean.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join("include");
+        let inner = root.join("test").join("sql").join("setup");
+        std::fs::create_dir_all(&inner).unwrap();
+        let template = inner.join("template.test_template");
+        std::fs::write(&template, "require tpch\n\nstatement ok\nCALL dbgen(sf=0)\n").unwrap();
+
+        let text = "statement ok\nSELECT 1\n\ninclude test/sql/setup/template.test_template\n";
+        let file = super::parse_under(Some(&root), "x.test", text).unwrap();
+        assert_eq!(file.records.len(), 3);
+        assert!(matches!(file.records[1].directive, Directive::Require { .. }));
+        let Directive::Statement { sql, .. } = &file.records[2].directive else {
+            panic!("a statement");
+        };
+        assert_eq!(sql, "CALL dbgen(sf=0)");
+
+        let e = super::parse_under(Some(&root), "x.test", "include nowhere.test\n").unwrap_err();
+        assert!(e.message.contains("could not be read"), "{}", e.message);
+        std::fs::remove_file(&template).unwrap();
     }
 }

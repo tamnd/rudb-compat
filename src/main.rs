@@ -409,8 +409,11 @@ fn one_file(path: &Path, name: &str, timeout: Duration, memory: u64) -> ExitCode
         }
     };
     let mut rudb = Rudb::limited(timeout, memory);
+    // An `include` path is written from the top of the corpus, and this process was handed one file
+    // rather than the directory, so the top is found from where the file sits.
+    let top = path.parent().and_then(rudb_compat::conform::corpus_top);
     let summary = match String::from_utf8(bytes) {
-        Ok(text) => match rudb_compat::conform::run_text(&mut rudb, name, &text) {
+        Ok(text) => match rudb_compat::conform::run_under(&mut rudb, top.as_deref(), name, &text) {
             Ok(summary) => summary,
             Err(e) => {
                 eprintln!("rudb-compat: {e}");

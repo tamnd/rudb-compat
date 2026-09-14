@@ -14,11 +14,11 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4096 files, 15807 passed, 56100 failed, which is 22.0 percent of what was attempted
+4096 files, 15838 passed, 56291 failed, which is 22.0 percent of what was attempted
 
-28763 records not attempted, by whose gap it is
-      13801  excused   the file turned the record off itself
-      14885  engine    something rudb does not have, which is the real gap
+40732 records not attempted, by whose gap it is
+      21358  excused   the file turned the record off itself
+      19297  engine    something rudb does not have, which is the real gap
          11  harness   something this runner does not do, which is work here
          66  machine   something the machine this ran on does not have
 ```
@@ -32,6 +32,10 @@ A `require` line is read the way DuckDB's own runner reads it, in `test/sqlite/s
 What is left behind a real `require` is mostly one of four things, and all four are now on the engine row with a count: an extension rudb does not have, of which `json`, `icu` and `httpfs` are the largest, a `vector_size` above rudb's 1024, a `block_size`, which rudb has none of because it keeps its tables in memory, and the `tpch` and `tpcds` generators.
 
 A file stops where the database changes out from under it. Six hundred files in the corpus write something, say `restart`, and then check that what they wrote is still there, which is the whole point of the file. rudb keeps its tables in memory and cannot reopen a database, so running past the `restart` leaves the data exactly where it was and every check after it passes for precisely the reason the file was written to rule out. This runner now ends the file at the directive and puts the records after it on the engine row, named. That moved 4834 records onto that row, took 602 passes and 3573 failures out of the columns they did not belong in, and took the harness row from 1098 down to 11, because almost everything that row held was rudb having no storage rather than work in this repository. The one thing it does not end on is a `load` of a path under the corpus scratch directory that nothing has written to yet, which is an empty database however you open it, and that is most of the six hundred.
+
+A directive the reader does not know is a file it cannot read at all, and there were 68 of those. Six more directives are read now. `statement maybe` takes a result block the way an error does, `include` reads the named file in where the line stood, `reset label` forgets a result two queries were told to share, `tags` names which files a run wants and carries nothing, `continue` ends the turn of the loop it fires on, and `test-env` is carried like the other directives about the world outside the file. That took the unreadable files from 68 to 18 and brought 4412 records onto the engine row, which is what those files were always going to say once anybody could read them.
+
+A `statement maybe` is excused rather than passed, which is a deliberate difference from upstream and the reason is what the two numbers are for. DuckDB's runner asks whether the suite failed, and a `maybe` cannot fail, so passing it costs nothing there. This runner publishes a percentage, and a record that cannot fail is not evidence about the engine in either direction. There are 223 of those lines in 53 files and the loops around them make about 5970 records, and counting them was putting 4337 free passes into the number. One file, `catalog/dependencies/test_concurrent_alter.test`, is a hundred by ten loop around two of them and was 1783 passes on its own, which was nearly a tenth of everything that passed.
 
 Each file gets a process of its own, with ten seconds on a statement and two gigabytes on the process. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that are there to be stopped. Both limits are handed to the engine, so the normal way one of those ends is rudb raising an error the report can count against the record that asked for it. This process keeps a clock of its own at twelve times the statement limit and a cap on how large the child may get, as a backstop for an engine that does not stop when it is asked to. Twelve, because a file with ten slow statements in it is a file that exists and killing it would throw away the outcome the limits were handed down to produce. A file that reaches one of those is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for. No file reaches one today, which is why there is no such line above.
 

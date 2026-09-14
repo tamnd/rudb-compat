@@ -338,13 +338,17 @@ pub enum Skipped {
         /// How many records were behind it.
         records: usize,
     },
-    /// A directive that replaces the database the engine is talking to, which this run cannot
-    /// follow, so everything after it was not attempted.
+    /// A directive this run cannot follow and cannot safely ignore, so everything after it was not
+    /// attempted.
     ///
     /// This is the one that used to be silent. A `restart` means the file is about to check that
     /// what it wrote is still there after the database was reopened from its file. Carrying the
     /// directive and then running past it leaves the database exactly as it was, so every one of
     /// those checks passes, and it passes for the reason the file was written to rule out.
+    ///
+    /// The rule generalises past the database. Anything that changes which records come next, and
+    /// which this runner cannot work out, stops the file here rather than letting the records after
+    /// it be scored against a state nobody set up.
     Changes {
         /// The line, worded as the file wrote it.
         what: String,
@@ -417,6 +421,16 @@ pub struct Skips {
     pub conditional: usize,
     /// Inside a `mode skip` block, which is how a file turns off a section it knows is broken.
     pub mode: usize,
+    /// A `statement maybe`, which is the file saying it does not know what should happen.
+    ///
+    /// Counted here rather than as a pass, which is a deliberate difference from upstream and the
+    /// reason is what the two numbers are for. DuckDB's runner asks whether the suite failed, and a
+    /// `maybe` cannot fail, so passing it costs nothing there. This runner publishes a percentage,
+    /// and a record that cannot fail is not evidence about the engine in either direction. One file
+    /// in the corpus, `catalog/dependencies/test_concurrent_alter.test`, is a hundred by ten loop
+    /// around two `maybe` statements, and counting them put 1783 free passes into the number, which
+    /// was nearly a tenth of everything that passed.
+    pub maybe: usize,
     /// Behind a directive this runner does not implement, such as `load` or `restart`.
     ///
     /// Every one of these is a record nobody has run, so it is work for the harness rather than
@@ -440,6 +454,7 @@ impl Skips {
     pub fn total(self) -> usize {
         self.conditional
             + self.mode
+            + self.maybe
             + self.unsupported
             + self.engine
             + self.machine
@@ -454,7 +469,7 @@ impl Skips {
     #[must_use]
     pub fn by_gap(self) -> [(Gap, usize); Gap::ALL.len()] {
         [
-            (Gap::Excused, self.conditional + self.mode),
+            (Gap::Excused, self.conditional + self.mode + self.maybe),
             (Gap::Engine, self.engine),
             (Gap::Harness, self.unsupported + self.unreadable),
             (Gap::Machine, self.machine),
@@ -486,9 +501,13 @@ impl Skips {
     }
 
     /// Add another set of skips to this one.
-    fn absorb(&mut self, other: Self) {
+    ///
+    /// The one place that does it, so that a row added to this struct is added to every total by
+    /// the compiler rather than by somebody remembering.
+    pub fn absorb(&mut self, other: Self) {
         self.conditional += other.conditional;
         self.mode += other.mode;
+        self.maybe += other.maybe;
         self.unsupported += other.unsupported;
         self.engine += other.engine;
         self.machine += other.machine;
@@ -591,13 +610,14 @@ pub fn run_path(engine: &mut dyn Engine, path: &Path, slow: bool) -> Result<Summ
     files.sort();
 
     let root = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+    let top = corpus_top(root);
     let mut summary = Summary::default();
     for file in &files {
         let name = file.strip_prefix(root).unwrap_or(file).display().to_string();
         let bytes = std::fs::read(file)
             .map_err(|e| HarnessError::new(format!("cannot read {}: {e}", file.display())))?;
         match String::from_utf8(bytes) {
-            Ok(text) => summary.absorb(run_text(engine, &name, &text)?),
+            Ok(text) => summary.absorb(run_under(engine, top.as_deref(), &name, &text)?),
             Err(_) => {
                 summary.files += 1;
                 summary.skipped_files.push((name, Skipped::NotText));
@@ -607,14 +627,48 @@ pub fn run_path(engine: &mut dyn Engine, path: &Path, slow: bool) -> Result<Summ
     Ok(summary)
 }
 
-/// Read one file's text and run it.
+/// The top of the corpus, which is where an `include` path starts from.
+///
+/// A run is normally pointed at `test/sql` inside the corpus, and an `include` writes the whole path
+/// from above `test`, which is what DuckDB's own parser does. Rather than count directories up, this
+/// walks up until it finds one with `test/sql` under it, so pointing the run at a subdirectory two
+/// levels down still finds the same top. `None` when there is no corpus shape around the path,
+/// which is what a run over a directory of loose files looks like, and there an `include` is an
+/// error with a line number rather than a silently missing setup.
+#[must_use]
+pub fn corpus_top(root: &Path) -> Option<PathBuf> {
+    let mut at = Some(root);
+    while let Some(dir) = at {
+        if dir.join("test").join("sql").is_dir() {
+            return Some(dir.to_owned());
+        }
+        at = dir.parent();
+    }
+    None
+}
+
+/// Read one file's text and run it, with no corpus around it.
 ///
 /// # Errors
 ///
 /// When the engine itself could not be run, which is a broken harness and not a failing test.
 pub fn run_text(engine: &mut dyn Engine, name: &str, text: &str) -> Result<Summary, HarnessError> {
+    run_under(engine, None, name, text)
+}
+
+/// Read one file's text and run it, resolving an `include` under the given corpus top.
+///
+/// # Errors
+///
+/// When the engine itself could not be run, which is a broken harness and not a failing test.
+pub fn run_under(
+    engine: &mut dyn Engine,
+    top: Option<&Path>,
+    name: &str,
+    text: &str,
+) -> Result<Summary, HarnessError> {
     let mut summary = Summary { files: 1, ..Summary::default() };
-    let file = match crate::slt::parse(name, text) {
+    let file = match crate::slt::parse_under(top, name, text) {
         Ok(file) => file,
         Err(e) => {
             summary.skipped_files.push((name.to_owned(), Skipped::Unreadable(e)));
@@ -682,12 +736,41 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
         if matches!(record.directive, Directive::HashThreshold(_) | Directive::Require { .. }) {
             continue;
         }
+        // Forgetting a shared result, so the next turn of a loop compares its own pair of queries
+        // rather than the first turn's. Unconditional, because the corpus never puts a condition on
+        // one and because a label that is half forgotten is worse than either answer.
+        if let Directive::ResetLabel(name) = &record.directive {
+            labels.remove(name);
+            continue;
+        }
         if skipping {
             summary.skipped.mode += 1;
             continue;
         }
         if !record.condition.applies_to(NAMES) {
             summary.skipped.conditional += 1;
+            continue;
+        }
+        // A `continue` ends the turn of the loop it is in. Every one in the corpus is conditional on
+        // the loop variable and the parser settles those when it expands the loop, so one that
+        // reaches here is conditional on the engine instead, and by now the loop is flat and the
+        // end of the turn is not something this runner can find. Stopping is the only answer that
+        // does not score the rest of the file against a state the file said to skip.
+        if matches!(record.directive, Directive::Continue) {
+            let why = Skipped::Changes {
+                what: "continue".to_owned(),
+                gap: Gap::Harness,
+                records: runnable(&file.records[at..]),
+            };
+            summary.skipped.charge(&why);
+            summary.skipped_files.push((file.name.clone(), why));
+            return Ok(summary);
+        }
+        // The file said it does not know what should happen, so there is nothing here to be right
+        // or wrong about. See [`Skips::maybe`] for why this is not a pass.
+        if let Directive::Statement { expected: StatementResult::Maybe(_), .. } = &record.directive
+        {
+            summary.skipped.maybe += 1;
             continue;
         }
         if let Directive::Unsupported(line) = &record.directive {
@@ -934,7 +1017,24 @@ fn check(
         Directive::Statement { expected, sql } => {
             let outcome = engine.run(sql)?;
             Ok(match (expected, &outcome) {
-                (StatementResult::Ok, Outcome::Rows(_)) | (StatementResult::Maybe, _) => Ok(()),
+                // A `maybe` is excused before it reaches here, by the loop in `run_file`. The arm is
+                // upstream's reading of it, for any other caller and for the day one of the four
+                // report levels wants to count them separately.
+                (StatementResult::Ok, Outcome::Rows(_)) | (StatementResult::Maybe(None), _) => {
+                    Ok(())
+                }
+                (StatementResult::Maybe(Some(_)), Outcome::Rows(_)) => Ok(()),
+                (StatementResult::Maybe(Some(wanted)), Outcome::Error(e)) => {
+                    if contains(e, wanted) {
+                        Ok(())
+                    } else {
+                        fail(
+                            sql,
+                            wrong_error(e, wanted),
+                            format!("expected it to work or say\n{wanted}\nand it said\n{e}"),
+                        )
+                    }
+                }
                 (StatementResult::Ok, Outcome::Error(e)) => {
                     fail(sql, Reason::of(e), format!("expected it to work, and it said\n{e}"))
                 }
@@ -1048,6 +1148,8 @@ fn check(
         | Directive::HashThreshold(_)
         | Directive::Require { .. }
         | Directive::Mode(_)
+        | Directive::ResetLabel(_)
+        | Directive::Continue
         | Directive::Unsupported(_) => Ok(Ok(())),
     }
 }
@@ -1246,9 +1348,11 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 
 #[cfg(test)]
 mod tests {
-    use super::{Gap, NAMES, Reason, Skips, Summary, VECTOR_SIZE, flatten, render, run_text};
+    use super::{
+        Gap, HashMap, NAMES, Reason, Skips, Summary, VECTOR_SIZE, check, flatten, render, run_text,
+    };
     use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
-    use crate::slt::{Condition, Sort};
+    use crate::slt::{Condition, Directive, Record, Sort, StatementResult, TestFile};
 
     /// An engine that answers from a script, so the runner can be tested without a database.
     #[derive(Debug, Default)]
@@ -1573,6 +1677,88 @@ mod tests {
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.skipped.unsupported, 2);
+        assert_eq!(summary.skipped_files[0].1.gap(), Gap::Harness);
+    }
+
+    #[test]
+    fn a_maybe_is_the_file_saying_it_does_not_know_so_it_is_excused_and_not_passed() {
+        // A `statement maybe` cannot fail, so counting it as a pass puts a number in the report
+        // that no engine had to earn. One corpus file is a thousand of them.
+        let boom = |message: &str| {
+            Outcome::Error(EngineError {
+                kind: "Constraint Error".to_owned(),
+                message: message.to_owned(),
+            })
+        };
+        let text = "statement maybe\nINSERT INTO t VALUES (1)\n----\nduplicate key\n";
+        for answer in [Outcome::Rows(Table::default()), boom("duplicate key value"), boom("other")]
+        {
+            let summary = run(vec![answer], text);
+            assert_eq!(summary.passed, 0);
+            assert_eq!(summary.failed, 0);
+            assert_eq!(summary.skipped.maybe, 1);
+        }
+    }
+
+    #[test]
+    fn a_maybe_read_upstreams_way_works_or_says_what_it_says_it_will_and_nothing_else() {
+        // The reading itself, for the day a report level wants to count these rather than excuse
+        // them. A file writes `statement maybe` where the answer depends on a build option or on
+        // which of two concurrent things happened first, and writes the error it would give under
+        // the `----`. Accepting any error at all would turn a new bug in that statement into a pass.
+        let boom = |message: &str| {
+            Outcome::Error(EngineError {
+                kind: "Constraint Error".to_owned(),
+                message: message.to_owned(),
+            })
+        };
+        let read = |answer: Outcome, wanted: Option<&str>| {
+            let file = TestFile { name: "x.test".to_owned(), records: Vec::new() };
+            let record = Record {
+                line: 1,
+                condition: Condition::Always,
+                directive: Directive::Statement {
+                    sql: "INSERT INTO t VALUES (1)".to_owned(),
+                    expected: StatementResult::Maybe(wanted.map(str::to_owned)),
+                },
+            };
+            let mut engine = Canned { answers: vec![answer], at: 0 };
+            let mut labels = HashMap::new();
+            check(&mut engine, &file, &record, &mut labels).expect("the canned engine cannot fail")
+        };
+        assert!(read(Outcome::Rows(Table::default()), Some("duplicate key")).is_ok());
+        assert!(read(boom("duplicate key value"), Some("duplicate key")).is_ok());
+        assert!(read(boom("out of memory"), Some("duplicate key")).is_err());
+
+        // With nothing under the `----` anything goes, which is what the fuzzer files in the corpus
+        // mean by it.
+        assert!(read(boom("whatever"), None).is_ok());
+    }
+
+    #[test]
+    fn a_reset_label_makes_the_next_pair_of_queries_answer_to_each_other() {
+        // Without it the second turn of the loop is compared against the first turn's result and a
+        // file that is doing exactly what it means to do is reported as a wrong answer.
+        let shared = |a: &str, b: &str| {
+            format!(
+                "query I nosort lbl\nSELECT 1\n----\n{a}\n\nreset label lbl\n\nquery I nosort lbl\nSELECT 2\n----\n{b}\n"
+            )
+        };
+        let answers = vec![Outcome::Rows(table(1, &["7"])), Outcome::Rows(table(1, &["9"]))];
+        let summary = run(answers, &shared("7", "9"));
+        assert_eq!(summary.passed, 2);
+        assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn a_continue_the_parser_could_not_settle_stops_the_file_rather_than_being_ignored() {
+        // The parser settles a `continue` on a loop variable when it expands the loop, so one that
+        // reaches the runner is conditional on the engine and the end of its turn is no longer in
+        // the records. Running on would score the rest of the file against a state the file said to
+        // skip.
+        let text = "loop i 0 1\n\nonlyif duckdb\ncontinue\n\nstatement ok\nSELECT 1\n\nendloop\n";
+        let summary = run(vec![Outcome::Rows(Table::default())], text);
+        assert_eq!(summary.passed, 0);
         assert_eq!(summary.skipped_files[0].1.gap(), Gap::Harness);
     }
 
