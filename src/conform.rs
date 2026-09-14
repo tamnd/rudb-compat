@@ -1114,13 +1114,16 @@ fn check(
             }
 
             Ok(match expected {
-                QueryResult::Values(wanted) => {
-                    if &values == wanted {
-                        Ok(())
-                    } else {
-                        fail(sql, Reason::WrongAnswer, difference(wanted, &values, width))
+                QueryResult::Lines(raw) => match wanted(raw, width, table.height()) {
+                    Ok(wanted) => {
+                        if values == wanted {
+                            Ok(())
+                        } else {
+                            fail(sql, Reason::WrongAnswer, difference(&wanted, &values, width))
+                        }
                     }
-                }
+                    Err(why) => fail(sql, Reason::WrongAnswer, why),
+                },
                 QueryResult::Hash { count, digest } => {
                     if values.len() != *count {
                         fail(
@@ -1269,6 +1272,57 @@ pub fn render(cell: &Cell, letter: char) -> String {
     }
 }
 
+/// Split a result block into the values it means, which takes the result that came back to decide.
+///
+/// A line under a `----` is a whole row in some files and one value in others, and nothing in the
+/// file says which. The old readers guessed from the text, which works until a file writes a row of
+/// three values where one of them happens to contain a tab, and then the guess is wrong and there
+/// is nothing the reader can do about it. DuckDB does not guess. `result_helper.cpp` counts the
+/// rows the engine actually returned and calls the block row-wise when there is a line per row and
+/// more than one column, falls back to the every line has a tab guess only when that does not fit,
+/// and fails the record when what is left does not divide by the column count.
+///
+/// Deciding it here rather than in the parser is also what stops a badly written block taking a
+/// whole file with it. Sixteen files in the corpus have a result block that does not divide, and as
+/// a parse error that was sixteen files with no outcome at all rather than sixteen records that
+/// fail.
+///
+/// The error is the text for the failure report, because there is no other place for it to go.
+pub fn wanted(raw: &[String], columns: usize, rows: usize) -> Result<Vec<String>, String> {
+    if columns == 0 {
+        return Ok(raw.to_vec());
+    }
+
+    let mut row_wise = columns > 1 && raw.len() == rows;
+    if !row_wise {
+        row_wise = !raw.is_empty() && raw.iter().all(|line| line.contains('\t'));
+    }
+
+    if row_wise {
+        let mut out = Vec::with_capacity(raw.len() * columns);
+        for (at, line) in raw.iter().enumerate() {
+            let values: Vec<&str> = line.split('\t').collect();
+            if values.len() != columns {
+                return Err(format!(
+                    "row {} of the expected result has {} values under a query of {columns} columns",
+                    at + 1,
+                    values.len()
+                ));
+            }
+            out.extend(values.into_iter().map(str::to_owned));
+        }
+        return Ok(out);
+    }
+
+    if raw.len() % columns != 0 {
+        return Err(format!(
+            "{} values under a query of {columns} columns, which is not a whole number of rows",
+            raw.len()
+        ));
+    }
+    Ok(raw.to_vec())
+}
+
 /// A readable account of how two lists of values differ.
 ///
 /// Printed as rows rather than as a flat list, because a result that is off by one column reads as
@@ -1403,6 +1457,47 @@ mod tests {
         let summary = run(answers, "query I\nSELECT a FROM t\n----\n1\n2\n");
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn a_line_per_row_is_told_from_a_line_per_value_by_the_result_and_not_by_the_text() {
+        // Four values over two columns, written both ways, against the same two row result.
+        let answers = || vec![Outcome::Rows(table(2, &["1", "2", "3", "4"]))];
+        let stacked = run(answers(), "query II\nSELECT a, b FROM t\n----\n1\n2\n3\n4\n");
+        assert_eq!(stacked.passed, 1);
+        let rowwise = run(answers(), "query II\nSELECT a, b FROM t\n----\n1\t2\n3\t4\n");
+        assert_eq!(rowwise.passed, 1);
+
+        // The same two lines against a two row result are two rows, and against a four row result
+        // they are two of the four values, which is the whole reason this is not decided by the
+        // parser. Both are wrong answers here and neither is a file the reader cannot read.
+        let four = vec![Outcome::Rows(table(2, &["1", "2", "3", "4"]))];
+        let summary = run(four, "query II\nSELECT a, b FROM t\n----\n1\n2\n");
+        assert_eq!(summary.failed, 1);
+    }
+
+    #[test]
+    fn a_result_block_that_does_not_divide_fails_the_record_and_leaves_the_file_alone() {
+        // Three values under two columns. Sixteen corpus files do this, and as a parse error it
+        // took the whole file with it.
+        let text = "query II\nSELECT a, b FROM t\n----\n1\n2\n3\n\nquery I\nSELECT 9\n----\n9\n";
+        let answers = vec![Outcome::Rows(table(2, &["1", "2"])), Outcome::Rows(table(1, &["9"]))];
+        let summary = run(answers, text);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.passed, 1);
+        assert!(
+            summary.failures[0].detail.contains("whole number of rows"),
+            "{}",
+            summary.failures[0].detail
+        );
+    }
+
+    #[test]
+    fn a_row_with_the_wrong_number_of_values_in_it_says_which_row() {
+        let answers = vec![Outcome::Rows(table(2, &["1", "2", "3", "4"]))];
+        let summary = run(answers, "query II\nSELECT a, b FROM t\n----\n1\t2\n3\t4\t5\n");
+        assert_eq!(summary.failed, 1);
+        assert!(summary.failures[0].detail.contains("row 2"), "{}", summary.failures[0].detail);
     }
 
     #[test]

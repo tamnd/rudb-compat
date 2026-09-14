@@ -167,8 +167,12 @@ pub enum StatementResult {
 /// What a `query` record expects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryResult {
-    /// The values in full, already flattened row by row and left to right.
-    Values(Vec<String>),
+    /// The result block as the file wrote it, one entry per line.
+    ///
+    /// Not split into values here, because a line is a row in some files and a value in others and
+    /// nothing in the file says which. DuckDB decides it against the result that came back, so the
+    /// decision belongs where the result is. See [`crate::conform::wanted`].
+    Lines(Vec<String>),
     /// `N values hashing to H`, which is what a result too long to write out becomes.
     Hash {
         /// How many values, which is checked before the digest is.
@@ -471,7 +475,7 @@ fn statement(
             });
         }
     };
-    if sql.trim().is_empty() {
+    if sql.is_empty() {
         return Err(ParseError {
             line: number,
             message: "a statement with no SQL under it".to_owned(),
@@ -506,7 +510,7 @@ fn query(
     let label = if failing { String::new() } else { rest.get(2).copied().unwrap_or("").to_owned() };
 
     let sql = sql_body(lines, at);
-    if sql.trim().is_empty() {
+    if sql.is_empty() {
         return Err(ParseError {
             line: number,
             message: "a query with no SQL under it".to_owned(),
@@ -523,44 +527,18 @@ fn query(
         });
     }
 
-    let column_count = types.chars().count();
     let raw = result_lines(lines, at);
-    let expected = expectation(&raw, column_count, number)?;
-    Ok(Directive::Query { types, sort, label, sql, expected })
+    Ok(Directive::Query { types, sort, label, sql, expected: expectation(raw) })
 }
 
 /// Turn the lines under a `----` into what the query is supposed to produce.
-fn expectation(
-    raw: &[String],
-    column_count: usize,
-    number: usize,
-) -> Result<QueryResult, ParseError> {
+fn expectation(raw: Vec<String>) -> QueryResult {
     if raw.len() == 1 {
         if let Some(hash) = parse_hash(&raw[0]) {
-            return Ok(hash);
+            return hash;
         }
     }
-
-    // A row per line with tabs between the values, or a value per line. DuckDB writes the second
-    // and the older files in the corpus are the first, so both have to be read, and a tab anywhere
-    // decides it. A tab inside a value would be read wrong, and a value with a tab in it cannot be
-    // written in this format at all, so there is nothing to lose.
-    let values: Vec<String> = if raw.iter().any(|line| line.contains('\t')) {
-        raw.iter().flat_map(|line| line.split('\t').map(str::to_owned)).collect()
-    } else {
-        raw.to_vec()
-    };
-
-    if column_count > 0 && values.len() % column_count != 0 {
-        return Err(ParseError {
-            line: number,
-            message: format!(
-                "{} values under a query of {column_count} columns, which is not a whole number of rows",
-                values.len()
-            ),
-        });
-    }
-    Ok(QueryResult::Values(values))
+    QueryResult::Lines(raw)
 }
 
 /// `N values hashing to H`, or nothing.
@@ -577,17 +555,36 @@ fn parse_hash(line: &str) -> Option<QueryResult> {
     Some(QueryResult::Hash { count, digest })
 }
 
-/// The SQL under a directive, which runs to a `----` or a blank line or the end.
+/// A line the way upstream's parser sees it, which is without the carriage return a Windows
+/// checkout leaves behind and with nothing else taken off.
+fn plain(line: &str) -> &str {
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// Whether a line ends the record it is inside.
 ///
-/// A line that is exactly `endloop` also ends it. The corpus almost always leaves a blank line
-/// before one, and where it does not, swallowing the `endloop` into the SQL turns the rest of the
-/// file into one unclosed loop. No statement in any dialect is a single line reading `endloop`, so
-/// there is nothing this costs.
+/// Empty means empty, and not blank. `sqllogic_parser.cpp` asks `line.empty()`, so a line of eighty
+/// spaces is content and a line of nothing is a separator. That is not a detail. `test_bar.test`
+/// draws bar charts and its first bar is the empty one, so a reader that ends the result at a blank
+/// line reads the second bar as a directive and throws the file away.
+fn ends_record(line: &str) -> bool {
+    plain(line).is_empty()
+}
+
+/// The SQL under a directive, which runs to a `----` or an empty line or a comment or the end.
+///
+/// A comment ends it because upstream's `ExtractStatement` stops at `EmptyOrComment`, so a `#` at
+/// the start of a line inside a statement is the end of that statement and not part of the SQL.
+///
+/// A line that is exactly `endloop` also ends it, which is ours rather than upstream's. The corpus
+/// almost always leaves a blank line before one, and where it does not, swallowing the `endloop`
+/// into the SQL turns the rest of the file into one unclosed loop. No statement in any dialect is a
+/// single line reading `endloop`, so there is nothing this costs.
 fn sql_body(lines: &[&str], at: &mut usize) -> String {
     let mut out: Vec<&str> = Vec::new();
     while let Some(line) = lines.get(*at) {
-        let trimmed = line.trim();
-        if trimmed == "----" || trimmed.is_empty() || trimmed == "endloop" {
+        let line = plain(line);
+        if line == "----" || line.is_empty() || line.starts_with('#') || line.trim() == "endloop" {
             break;
         }
         out.push(line);
@@ -598,16 +595,16 @@ fn sql_body(lines: &[&str], at: &mut usize) -> String {
 
 /// The lines after a `----`, or none when there is no `----`.
 fn result_lines(lines: &[&str], at: &mut usize) -> Vec<String> {
-    if lines.get(*at).map(|l| l.trim()) != Some("----") {
+    if lines.get(*at).map(|l| plain(l)) != Some("----") {
         return Vec::new();
     }
     *at += 1;
     let mut out = Vec::new();
     while let Some(line) = lines.get(*at) {
-        if line.trim().is_empty() {
+        if ends_record(line) {
             break;
         }
-        out.push((*line).to_owned());
+        out.push(plain(line).to_owned());
         *at += 1;
     }
     out
@@ -700,7 +697,7 @@ fn substitute(body: &[Record], name: &str, value: &str) -> Vec<Record> {
                 Directive::Query { sql, expected, .. } => {
                     *sql = put(sql);
                     match expected {
-                        QueryResult::Values(values) => {
+                        QueryResult::Lines(values) => {
                             for value in values.iter_mut() {
                                 *value = put(value);
                             }
@@ -763,26 +760,62 @@ SELECT a FROM t
             panic!("the second record is a query");
         };
         assert_eq!(types, "I");
-        assert_eq!(*expected, QueryResult::Values(vec!["1".to_owned(), "2".to_owned()]));
+        assert_eq!(*expected, QueryResult::Lines(vec!["1".to_owned(), "2".to_owned()]));
     }
 
     #[test]
-    fn a_row_per_line_with_tabs_is_read_as_values_and_so_is_a_value_per_line() {
+    fn a_result_block_is_kept_as_lines_because_the_parser_cannot_tell_a_row_from_a_value() {
         let tabbed = parse("x.test", "query II\nSELECT 1, 2\n----\n1\t2\n").unwrap();
         let stacked = parse("x.test", "query II\nSELECT 1, 2\n----\n1\n2\n").unwrap();
-        let expected = QueryResult::Values(vec!["1".to_owned(), "2".to_owned()]);
-        for file in [tabbed, stacked] {
+        let blocks = [vec!["1\t2".to_owned()], vec!["1".to_owned(), "2".to_owned()]];
+        for (file, lines) in [tabbed, stacked].into_iter().zip(blocks) {
             let Directive::Query { expected: got, .. } = &file.records[0].directive else {
                 panic!("a query");
             };
-            assert_eq!(*got, expected);
+            assert_eq!(*got, QueryResult::Lines(lines));
         }
     }
 
     #[test]
-    fn a_result_that_is_not_a_whole_number_of_rows_is_a_broken_file_and_not_a_failing_test() {
-        let error = parse("x.test", "query II\nSELECT 1, 2\n----\n1\n2\n3\n").unwrap_err();
-        assert!(error.message.contains("whole number of rows"), "{}", error.message);
+    fn a_result_that_is_not_a_whole_number_of_rows_is_still_a_file_this_reader_can_read() {
+        // It is one record that cannot be right rather than a file with no outcome at all, which
+        // is the same call DuckDB makes and it makes it against the result rather than the text.
+        let file = parse("x.test", "query II\nSELECT 1, 2\n----\n1\n2\n3\n").unwrap();
+        assert_eq!(file.records.len(), 1);
+    }
+
+    #[test]
+    fn a_line_of_spaces_is_a_value_and_only_a_line_of_nothing_ends_the_record() {
+        // `test_bar.test` draws bar charts and the first bar is the empty one, so this is the
+        // difference between reading the file and throwing it away.
+        let text = "query I\nSELECT bar(x)\n----\n   \n###\n\nstatement ok\nSELECT 1\n";
+        let file = parse("x.test", text).unwrap();
+        assert_eq!(file.records.len(), 2);
+        let Directive::Query { expected, .. } = &file.records[0].directive else {
+            panic!("a query");
+        };
+        assert_eq!(*expected, QueryResult::Lines(vec!["   ".to_owned(), "###".to_owned()]));
+    }
+
+    #[test]
+    fn sql_that_is_nothing_but_a_space_no_keyboard_has_is_still_sql() {
+        // `invisible_spaces.test` writes a statement whose whole body is U+2000, and asks for it to
+        // be accepted. Trimming the body the way Rust trims it makes that an empty statement and
+        // loses the file, and the line upstream draws is between nothing and anything at all.
+        let file = parse("x.test", "statement ok\n\u{2000}\n").unwrap();
+        let Directive::Statement { sql, .. } = &file.records[0].directive else {
+            panic!("a statement");
+        };
+        assert_eq!(sql, "\u{2000}");
+    }
+
+    #[test]
+    fn a_comment_ends_the_sql_above_it_the_way_upstream_ends_it() {
+        let file = parse("x.test", "statement ok\nSELECT 1\n# and that is all\n").unwrap();
+        let Directive::Statement { sql, .. } = &file.records[0].directive else {
+            panic!("a statement");
+        };
+        assert_eq!(sql, "SELECT 1");
     }
 
     #[test]
@@ -892,10 +925,7 @@ SELECT a FROM t
             panic!("a query");
         };
         assert_eq!(sql, "SELECT typeof(1::INTEGER), 'INTEGER'");
-        assert_eq!(
-            *expected,
-            QueryResult::Values(vec!["INTEGER".to_owned(), "INTEGER".to_owned()])
-        );
+        assert_eq!(*expected, QueryResult::Lines(vec!["INTEGER".to_owned(), "INTEGER".to_owned()]));
     }
 
     #[test]
