@@ -6,9 +6,9 @@
 //!
 //! What is here is the differential loop and the corpus runner and nothing above either of them.
 //! The differential loop is two engines, one statement at a time, the full result set compared,
-//! and a list of differences with enough in each one to reproduce it by hand. The reducer, the
-//! bisector and the query generators from section 14.2 all hang off it and none of them exists
-//! yet.
+//! and a list of differences with enough in each one to reproduce it by hand. The reducer in
+//! `crate::reduce` hangs off it, and the bisector and the query generators from section 14.2 hang
+//! off it too and neither of them exists yet.
 //!
 //! There is a second loop beside it. A sqllogictest file already carries what every statement is
 //! supposed to produce, so `crate::conform` runs one against rudb alone and reports a pass rate,
@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ask;
 pub mod compare;
 pub mod conform;
 pub mod coverage;
@@ -39,6 +40,7 @@ pub mod functions;
 pub mod hash;
 pub mod isolate;
 pub mod quote;
+pub mod reduce;
 pub mod report;
 pub mod resource;
 pub mod rudb;
