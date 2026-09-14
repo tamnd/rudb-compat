@@ -82,6 +82,18 @@ SELECT date_part('microsecond', TIME '12:34:56.789')
 110 bytes down to 52, in 5 steps out of 38 candidates
 ```
 
+Point it at a file with more than one statement in it and it reduces every one of them and groups what comes out. That is the shape a real run has. A corpus sweep produces thousands of failing statements and they are not thousands of bugs, they are a few dozen bugs each found by every query that happens to touch one, and a list with one line per failure is a list nobody reads twice. The key is the reduced statement itself, byte for byte, with no normalising on top, which works because the reduction has already done the normalising that matters: literals are down to `''` and `0`, every clause that did not contribute is gone, and every column the failure did not need has been dropped. Two queries that fail for the same reason arrive at the same text. Folding `SELECT f(a)` and `SELECT f(b)` together would be a judgement about what makes two bugs one bug, and this does not make it.
+
+```
+$ rudb-compat reduce --file failures.sql
+412 statements, 6 agreed, 406 differed, 3 distinct cases
+
+   301  6f1b1c0d2e9a4f5b8c7d6e5f4a3b2c1d
+        SELECT date_part('', TIME '')
+        only the right engine errored, Binder Error
+        found in: SELECT a, date_part('microsecond', TIME '12:34:56.789') FROM t
+```
+
 It cuts on tokens and clause boundaries rather than on the parse tree, and the reason is worth saying rather than hiding. rudb parses into an arena AST, but the nodes carry no spans and there is no printer, so from outside the parser there is no way to say which bytes a node came from or to turn a node back into SQL. Tokens and bracket depth get most of the way there, because the cuts that matter are clause boundaries and items of a list at a depth and both of those are visible without a tree. Cutting on nodes needs one of those two things in rudb first, which is tamnd/rudb#519.
 
 The DuckDB side is a real binary built at a named commit, found on `PATH` or named by `RUDB_COMPAT_DUCKDB`. `rudb-compat duckdb` prints which one it found and whether it is the commit rudb vendors its grammar from.
