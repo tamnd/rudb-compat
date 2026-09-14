@@ -232,6 +232,9 @@ impl Isolated {
         self.skips.conditional += other.skips.conditional;
         self.skips.mode += other.skips.mode;
         self.skips.unsupported += other.skips.unsupported;
+        self.skips.engine += other.skips.engine;
+        self.skips.machine += other.skips.machine;
+        self.skips.unreadable += other.skips.unreadable;
         self.skipped_files.extend(other.skipped_files);
         self.failures.extend(other.failures);
         self.stopped.extend(other.stopped);
@@ -418,13 +421,16 @@ fn resident(pid: u32) -> Option<u64> {
 pub fn encode(summary: &Summary) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "counts\t{}\t{}\t{}\t{}\t{}\t{}\n",
+        "counts\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
         summary.files,
         summary.passed,
         summary.failed,
         summary.skipped.conditional,
         summary.skipped.mode,
-        summary.skipped.unsupported
+        summary.skipped.unsupported,
+        summary.skipped.engine,
+        summary.skipped.machine,
+        summary.skipped.unreadable
     ));
     for (name, why) in &summary.skipped_files {
         out.push_str(&format!("skipfile\t{}\t{}\n", escape(name), escape(&why.to_string())));
@@ -453,13 +459,21 @@ pub fn decode(name: &str, text: &str) -> Isolated {
     for line in text.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         match parts.as_slice() {
-            ["counts", files, passed, failed, conditional, mode, unsupported] => {
-                out.files = files.parse().unwrap_or(0);
-                out.passed = passed.parse().unwrap_or(0);
-                out.failed = failed.parse().unwrap_or(0);
-                out.skips.conditional = conditional.parse().unwrap_or(0);
-                out.skips.mode = mode.parse().unwrap_or(0);
-                out.skips.unsupported = unsupported.parse().unwrap_or(0);
+            // Read by position with a default for anything short, rather than matched on a fixed
+            // width. A child built from a different tree than the parent is not supposed to happen,
+            // and when it does, losing the whole line would drop a file's failures out of the count
+            // and make the pass rate go up because the two halves of the harness disagree.
+            ["counts", rest @ ..] => {
+                let at = |n: usize| rest.get(n).and_then(|v| v.parse().ok()).unwrap_or(0);
+                out.files = at(0);
+                out.passed = at(1);
+                out.failed = at(2);
+                out.skips.conditional = at(3);
+                out.skips.mode = at(4);
+                out.skips.unsupported = at(5);
+                out.skips.engine = at(6);
+                out.skips.machine = at(7);
+                out.skips.unreadable = at(8);
                 counted = true;
             }
             ["skipfile", file, why] => {
@@ -535,8 +549,22 @@ mod tests {
             files: 1,
             passed: 3,
             failed: 1,
-            skipped: Skips { conditional: 2, mode: 1, unsupported: 4 },
-            skipped_files: vec![("a.test".to_owned(), Skipped::Requires("parquet".to_owned()))],
+            skipped: Skips {
+                conditional: 2,
+                mode: 1,
+                unsupported: 4,
+                engine: 9,
+                machine: 5,
+                unreadable: 0,
+            },
+            skipped_files: vec![(
+                "a.test".to_owned(),
+                Skipped::Requires {
+                    what: "icu".to_owned(),
+                    gap: crate::conform::Gap::Engine,
+                    records: 9,
+                },
+            )],
             failures: vec![Failure {
                 file: "b.test".to_owned(),
                 line: 12,
@@ -549,8 +577,12 @@ mod tests {
         assert_eq!(back.files, 1);
         assert_eq!(back.passed, 3);
         assert_eq!(back.failed, 1);
-        assert_eq!(back.skips.total(), 7);
-        assert_eq!(back.skipped_files, vec![("a.test".to_owned(), "requires parquet".to_owned())]);
+        assert_eq!(back.skips.total(), 21);
+        assert_eq!(back.skips.by_gap()[1], (crate::conform::Gap::Engine, 9));
+        assert_eq!(
+            back.skipped_files,
+            vec![("a.test".to_owned(), "requires icu, and 9 records went with it".to_owned())]
+        );
         assert_eq!(back.failures[0].sql, "SELECT 1,\n  2");
         assert_eq!(back.failures[0].detail, "wanted 1\tgot 2");
         assert_eq!(back.failures[0].reason, Reason::WrongAnswer);
