@@ -262,11 +262,82 @@ impl fmt::Display for Failure {
     }
 }
 
+/// Whose gap a skipped record is.
+///
+/// This is the split `spec/sql/duckdb/11-the-number.md` asks for, and without it the skip count is
+/// one number covering four different situations that mean opposite things. A record the file
+/// itself turned off is nobody's problem. A record behind a feature rudb does not have is on the
+/// rudb schedule. A record behind a directive this runner does not implement is work here, and it
+/// is the one that quietly makes the pass rate look better than it is, because it is the only kind
+/// that can be removed without the engine improving at all. A record the machine could not host is
+/// none of those and would be misleading in any of their rows.
+///
+/// The four are never added together into one headline. Adding them is exactly what made the old
+/// skip count unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gap {
+    /// The file turned the record off itself, with a `skipif`, an `onlyif` or a `mode skip`.
+    Excused,
+    /// The engine does not have what the record needs. The real gap, and the one that goes down
+    /// when rudb gets better.
+    Engine,
+    /// The harness does not do what the record needs. Work here, not there.
+    Harness,
+    /// The machine the run is on does not have it: not Windows, not enough memory, an environment
+    /// variable pointing at a service somebody else runs.
+    Machine,
+}
+
+impl Gap {
+    /// Every gap, in the order the report prints them.
+    pub const ALL: [Self; 4] = [Self::Excused, Self::Engine, Self::Harness, Self::Machine];
+
+    /// The short name used in the report and in the wire format.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Excused => "excused",
+            Self::Engine => "engine",
+            Self::Harness => "harness",
+            Self::Machine => "machine",
+        }
+    }
+
+    /// What the name means, for the line the report prints next to the count.
+    #[must_use]
+    pub const fn blurb(self) -> &'static str {
+        match self {
+            Self::Excused => "the file turned the record off itself",
+            Self::Engine => "something rudb does not have, which is the real gap",
+            Self::Harness => "something this runner does not do, which is work here",
+            Self::Machine => "something the machine this ran on does not have",
+        }
+    }
+}
+
+impl fmt::Display for Gap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Why a whole file was not run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Skipped {
-    /// A `require` for something that is not here.
-    Requires(String),
+    /// A `require` for something that is not here, with whose gap that is and how many records
+    /// went with it.
+    ///
+    /// The count is the point. A file skipped whole used to contribute nothing to the skip count
+    /// and nothing to the denominator, so several hundred files worth of records were in neither
+    /// column and no line of the report said so.
+    Requires {
+        /// What the file asked for, worded as the file wrote it.
+        what: String,
+        /// Whose gap it is.
+        gap: Gap,
+        /// How many records were behind it.
+        records: usize,
+    },
     /// The file does not parse, which is a problem with the harness or with the vendoring.
     Unreadable(ParseError),
     /// The file is not text.
@@ -277,10 +348,40 @@ pub enum Skipped {
     NotText,
 }
 
+impl Skipped {
+    /// Whose gap it is that the file did not run.
+    ///
+    /// A file that does not parse and a file that is not text are both this runner, whatever is in
+    /// them. The corpus is vendored from a release DuckDB's own runner reads end to end.
+    #[must_use]
+    pub const fn gap(&self) -> Gap {
+        match self {
+            Self::Requires { gap, .. } => *gap,
+            Self::Unreadable(_) | Self::NotText => Gap::Harness,
+        }
+    }
+
+    /// How many records were behind it, where that is known.
+    ///
+    /// Zero for a file that could not be read, because a file that did not parse has no records to
+    /// count and guessing from its line count would put a made up number in a report whose whole
+    /// point is that every number in it was computed.
+    #[must_use]
+    pub const fn records(&self) -> usize {
+        match self {
+            Self::Requires { records, .. } => *records,
+            Self::Unreadable(_) | Self::NotText => 0,
+        }
+    }
+}
+
 impl fmt::Display for Skipped {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Requires(what) => write!(f, "requires {what}"),
+            Self::Requires { what, records, .. } => {
+                let each = if *records == 1 { "record" } else { "records" };
+                write!(f, "requires {what}, and {records} {each} went with it")
+            }
             Self::Unreadable(e) => write!(f, "does not parse, {e}"),
             Self::NotText => f.write_str("is not valid UTF-8"),
         }
@@ -288,6 +389,9 @@ impl fmt::Display for Skipped {
 }
 
 /// Records that were not attempted, by reason.
+///
+/// The reasons are kept apart rather than totalled because they belong to different people, and
+/// [`Skips::by_gap`] is where that is said in one number per person.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Skips {
     /// A `skipif` or an `onlyif` that does not name this engine.
@@ -299,13 +403,54 @@ pub struct Skips {
     /// Every one of these is a record nobody has run, so it is work for the harness rather than
     /// for the engine, and it is the number to watch when the pass rate looks better than it is.
     pub unsupported: usize,
+    /// In a file that asked for something rudb does not have.
+    pub engine: usize,
+    /// In a file that asked for something the machine does not have.
+    pub machine: usize,
+    /// In a file this runner could not read at all.
+    ///
+    /// Always zero today, because a file that did not parse has no records to count. It is a field
+    /// rather than a missing one so that the gap totals and the file list cannot drift apart if
+    /// that ever changes.
+    pub unreadable: usize,
 }
 
 impl Skips {
-    /// All three together, for a caller that only wants the total.
+    /// Every one of them together, for a caller that only wants the total.
     #[must_use]
     pub fn total(self) -> usize {
-        self.conditional + self.mode + self.unsupported
+        self.conditional
+            + self.mode
+            + self.unsupported
+            + self.engine
+            + self.machine
+            + self.unreadable
+    }
+
+    /// How many records each gap accounts for.
+    ///
+    /// Returned in [`Gap::ALL`] order rather than sorted by size, because these four are read as a
+    /// fixed set of columns over a series of runs and a row moving because it grew is a row that is
+    /// hard to follow.
+    #[must_use]
+    pub fn by_gap(self) -> [(Gap, usize); Gap::ALL.len()] {
+        [
+            (Gap::Excused, self.conditional + self.mode),
+            (Gap::Engine, self.engine),
+            (Gap::Harness, self.unsupported + self.unreadable),
+            (Gap::Machine, self.machine),
+        ]
+    }
+
+    /// Count one file's records against the gap that kept the file from running.
+    fn charge(&mut self, why: &Skipped) {
+        let records = why.records();
+        match why.gap() {
+            Gap::Engine => self.engine += records,
+            Gap::Machine => self.machine += records,
+            Gap::Harness => self.unreadable += records,
+            Gap::Excused => self.conditional += records,
+        }
     }
 
     /// Add another set of skips to this one.
@@ -313,19 +458,19 @@ impl Skips {
         self.conditional += other.conditional;
         self.mode += other.mode;
         self.unsupported += other.unsupported;
+        self.engine += other.engine;
+        self.machine += other.machine;
+        self.unreadable += other.unreadable;
     }
 }
 
 impl fmt::Display for Skips {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} skipped, of which {} the file turned off, {} in a skipped section and {} behind a directive the runner does not implement",
-            self.total(),
-            self.conditional,
-            self.mode,
-            self.unsupported
-        )
+        writeln!(f, "{} records not attempted, by whose gap it is", self.total())?;
+        for (gap, count) in self.by_gap() {
+            writeln!(f, "    {count:>7}  {:<10}{}", gap.name(), gap.blurb())?;
+        }
+        Ok(())
     }
 }
 
@@ -466,9 +611,17 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
     // A `require` it can satisfy is not a skip at all, and most of them can be satisfied.
     for record in &file.records {
         if let Directive::Require { env, params } = &record.directive {
-            if !have(*env, params) {
-                let what = requirement(*env, params);
-                summary.skipped_files.push((file.name.clone(), Skipped::Requires(what)));
+            if let Some(gap) = have(*env, params) {
+                // The records go on the skip count rather than nowhere. A file skipped whole used
+                // to contribute to neither the skip count nor the denominator, so the corpus
+                // silently got smaller and no line of the report said by how much.
+                let why = Skipped::Requires {
+                    what: requirement(*env, params),
+                    gap,
+                    records: runnable(file),
+                };
+                summary.skipped.charge(&why);
+                summary.skipped_files.push((file.name.clone(), why));
                 return Ok(summary);
             }
         }
@@ -518,7 +671,8 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
     Ok(summary)
 }
 
-/// Whether this harness has what a `require` line is asking for.
+/// Whether this harness has what a `require` line is asking for, and when it does not, whose gap
+/// that is.
 ///
 /// This follows `CheckRequire` in DuckDB's own `test/sqlite/sqllogic_test_runner.cpp`, and it is
 /// worth following closely rather than approximating, because most of what the corpus requires is
@@ -535,20 +689,23 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
 /// and fails produces a failure with a reason on it, which is a job for somebody. A file that is
 /// skipped produces nothing and makes the pass rate look better, which is the failure mode the
 /// whole report is built to avoid.
-fn have(env: bool, params: &[String]) -> bool {
+fn have(env: bool, params: &[String]) -> Option<Gap> {
     // `require-env` asks whether an environment variable is set, and when it has a second argument
     // whether it holds that value. Every one of these in the corpus points at a machine somebody
     // else has, an extension repository or a secrets store, so in practice they are all missing,
     // but the question is answerable so it gets answered rather than assumed.
     if env {
-        let Some(name) = params.first() else { return false };
-        let Ok(value) = std::env::var(name) else { return false };
-        return params.get(1).is_none_or(|wanted| &value == wanted);
+        let met = params
+            .first()
+            .and_then(|name| std::env::var(name).ok())
+            .is_some_and(|value| params.get(1).is_none_or(|wanted| *wanted == value));
+        return (!met).then_some(Gap::Machine);
     }
 
-    let Some(first) = params.first() else { return false };
+    let Some(first) = params.first() else { return Some(Gap::Harness) };
     let what = first.to_ascii_lowercase();
     let size = || params.get(1).and_then(|p| p.parse::<usize>().ok());
+    let unless = |met: bool, gap: Gap| (!met).then_some(gap);
     match what.as_str() {
         // Guards on how DuckDB was built or on the mode its runner is in. None of them describe
         // anything this harness does, so all of them are satisfied, which is the same answer
@@ -562,37 +719,59 @@ fn have(env: bool, params: &[String]) -> bool {
         | "no_alternative_verify"
         | "no_latest_storage"
         | "no_vector_verification"
-        | "no_extension_autoloading" => true,
+        | "no_extension_autoloading" => None,
 
-        // Guards on the platform, read off the target rather than off a build flag.
-        "notmingw" | "notwindows" => !cfg!(windows),
-        "mingw" | "windows" => cfg!(windows),
-        "64bit" => cfg!(target_pointer_width = "64"),
+        // Guards on the platform, read off the target rather than off a build flag. A file that
+        // needs an operating system this is not running on is the machine and not the engine, and
+        // it would come back if the run moved.
+        "notmingw" | "notwindows" => unless(!cfg!(windows), Gap::Machine),
+        "mingw" | "windows" => unless(cfg!(windows), Gap::Machine),
+        "64bit" => unless(cfg!(target_pointer_width = "64"), Gap::Machine),
 
         // The size of the vector the engine works a chunk at a time in. `vector_size` is a floor
         // and `exact_vector_size` is an equality, which is upstream's reading and not ours.
-        "vector_size" => size().is_some_and(|wanted| VECTOR_SIZE >= wanted),
-        "exact_vector_size" => size().is_some_and(|wanted| VECTOR_SIZE == wanted),
+        "vector_size" => unless(size().is_some_and(|wanted| VECTOR_SIZE >= wanted), Gap::Engine),
+        "exact_vector_size" => {
+            unless(size().is_some_and(|wanted| VECTOR_SIZE == wanted), Gap::Engine)
+        }
 
         // rudb keeps its tables in memory and has no block size for a file to match, so a file
         // that pins one is asking about something that does not exist here.
-        "block_size" => false,
+        "block_size" => Some(Gap::Engine),
 
         // How much memory or disk the machine has. Answerable on Linux by reading `/proc`, and not
         // answerable portably without a second dependency this crate will not take. The files
         // behind these ask for eight to forty gigabytes, so they would be stopped on the memory
         // budget anyway, and a skip that names the requirement beats a stop that names a number.
-        "ram" | "disk_space" => false,
+        "ram" | "disk_space" => Some(Gap::Machine),
 
         // Settings DuckDB's own runner is only sometimes started with, and that are off by default
         // there too.
-        "allow_unsigned_extensions" | "vacuum_rebuild_indexes" => false,
+        "allow_unsigned_extensions" | "vacuum_rebuild_indexes" => Some(Gap::Engine),
 
         // An eighty bit float, which rudb does not have and does not intend to.
-        "longdouble" => false,
+        "longdouble" => Some(Gap::Engine),
 
-        other => BUILT_IN.contains(&other),
+        other => unless(BUILT_IN.contains(&other), Gap::Engine),
     }
+}
+
+/// How many records a file would have put in front of the engine.
+///
+/// Everything down to a `halt` that is not a directive. A `skipif` and a `load` are counted, because
+/// they are records the run would have reached and had an answer about, and leaving them out would
+/// make a file skipped whole look smaller than the same file skipped record by record.
+fn runnable(file: &TestFile) -> usize {
+    file.records
+        .iter()
+        .take_while(|record| !matches!(record.directive, Directive::Halt))
+        .filter(|record| {
+            matches!(
+                record.directive,
+                Directive::Statement { .. } | Directive::Query { .. } | Directive::Unsupported(_)
+            )
+        })
+        .count()
 }
 
 /// How a requirement is worded in the report, which is how the file wrote it.
@@ -937,7 +1116,7 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 
 #[cfg(test)]
 mod tests {
-    use super::{NAMES, Reason, Skips, Summary, VECTOR_SIZE, flatten, render, run_text};
+    use super::{Gap, NAMES, Reason, Skips, Summary, VECTOR_SIZE, flatten, render, run_text};
     use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
     use crate::slt::{Condition, Sort};
 
@@ -1125,16 +1304,68 @@ mod tests {
         // Answered rather than hard coded to missing, because a run with the variable set is a run
         // that should attempt the file.
         let name = "RUDB_COMPAT_A_VARIABLE_NOBODY_SETS";
-        assert!(!super::have(true, &[name.to_owned()]));
-        assert!(!super::have(true, &["PATH".to_owned(), "not what PATH holds".to_owned()]));
-        assert!(super::have(true, &["PATH".to_owned()]));
+        assert_eq!(super::have(true, &[name.to_owned()]), Some(Gap::Machine));
+        assert_eq!(
+            super::have(true, &["PATH".to_owned(), "not what PATH holds".to_owned()]),
+            Some(Gap::Machine)
+        );
+        assert_eq!(super::have(true, &["PATH".to_owned()]), None);
     }
 
     #[test]
-    fn the_report_says_what_the_file_asked_for_and_not_just_that_it_asked() {
-        let summary = run(Vec::new(), "require vector_size 4096\n\nstatement ok\nSELECT 1\n");
+    fn the_report_says_what_the_file_asked_for_and_how_many_records_went_with_it() {
+        let text =
+            "require vector_size 4096\n\nstatement ok\nSELECT 1\n\nquery I\nSELECT 2\n----\n2\n";
+        let summary = run(Vec::new(), text);
         let (_, why) = &summary.skipped_files[0];
-        assert_eq!(why.to_string(), "requires vector_size 4096");
+        assert_eq!(why.to_string(), "requires vector_size 4096, and 2 records went with it");
+        assert_eq!(why.gap(), Gap::Engine);
+        assert_eq!(summary.skipped.engine, 2);
+        assert_eq!(
+            summary.skipped.by_gap(),
+            [(Gap::Excused, 0), (Gap::Engine, 2), (Gap::Harness, 0), (Gap::Machine, 0)]
+        );
+    }
+
+    #[test]
+    fn a_file_skipped_whole_puts_its_records_on_the_skip_count_rather_than_nowhere() {
+        // Before this they were in neither the skip count nor the denominator, so the corpus got
+        // quietly smaller and no line of the report said by how much.
+        let summary =
+            run(Vec::new(), "require icu\n\nstatement ok\nSELECT 1\n\nstatement ok\nSELECT 2\n");
+        assert_eq!(summary.attempted(), 0);
+        assert_eq!(summary.skipped.total(), 2);
+        assert_eq!(summary.skipped.engine, 2);
+    }
+
+    #[test]
+    fn the_gap_a_requirement_falls_in_is_the_one_that_would_close_it() {
+        // The split is the whole point. A missing extension goes down when rudb gets better, an
+        // operating system does not, and a file this runner cannot read is work here. Adding them
+        // together is what made the old skip count unreadable.
+        let cases = [
+            ("icu", Gap::Engine),
+            ("block_size 262144", Gap::Engine),
+            ("vector_size 65536", Gap::Engine),
+            ("ram 16gb", Gap::Machine),
+            ("windows", Gap::Machine),
+        ];
+        for (what, want) in cases {
+            let text = format!("require {what}\n\nstatement ok\nSELECT 1\n");
+            let summary = run(Vec::new(), &text);
+            assert_eq!(summary.skipped_files[0].1.gap(), want, "{what}");
+        }
+        assert_eq!(super::Skipped::NotText.gap(), Gap::Harness);
+    }
+
+    #[test]
+    fn the_records_behind_a_file_that_could_not_be_read_are_not_guessed_at() {
+        // A file that did not parse has no records to count, and putting its line count in the
+        // report would be a made up number in the one place every number is computed.
+        let summary = run(Vec::new(), "frobnicate 3\n");
+        assert_eq!(summary.skipped_files.len(), 1);
+        assert_eq!(summary.skipped_files[0].1.records(), 0);
+        assert_eq!(summary.skipped.total(), 0);
     }
 
     #[test]

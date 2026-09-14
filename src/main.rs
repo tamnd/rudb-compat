@@ -528,7 +528,8 @@ fn print_corpus(engine: &Rudb, total: &Isolated) {
         total.failed,
         total.rate() * 100.0
     );
-    println!("{}", total.skips);
+    println!();
+    print!("{}", total.skips);
     if !total.stopped.is_empty() {
         println!("{}, and they are counted in neither column", total.cut_off());
     }
