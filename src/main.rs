@@ -20,7 +20,7 @@ use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
-use rudb_compat::shell::Shell;
+use rudb_compat::shell::{Session, Shell};
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -421,6 +421,17 @@ fn engines(through_shells: bool) -> Result<Pair, HarnessError> {
     Ok((Box::new(Duckdb::discover()?), Box::new(Rudb::new())))
 }
 
+/// Both engines as shells that remember what they were told.
+///
+/// A test file is a session. It makes a table and then asks questions about it, so a driver that
+/// forgets between statements fails every record after the first one for a reason that has nothing
+/// to do with the record. `crate::shell::Session` is the only thing here that does not forget,
+/// because it replays the statements that left something behind in front of the next one, and it is
+/// the only driver a whole file can be run through and mean anything.
+fn sessions() -> Result<Pair, HarnessError> {
+    Ok((Box::new(Session::new(Shell::duckdb()?)), Box::new(Session::new(Shell::rudb()?))))
+}
+
 /// Compare every statement in a file.
 fn suite(
     path: &str,
@@ -570,14 +581,16 @@ fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCod
 /// rudb passes that the pinned binary fails is a pass this harness has not earned, and that is
 /// exactly the thing a run like this exists to catch.
 ///
-/// It always drives both engines as shells, which is not a preference. A test file is a session: it
-/// makes a table and then asks questions about it, and `crate::shell` is the only driver here that
-/// has a session, because it replays what came before in front of the next statement. The DuckDB
-/// driver spawns a fresh in-memory process per statement, so under it every record after the first
-/// `CREATE TABLE` in a file fails on the binary and passes on rudb, and this run would report the
-/// whole corpus as a harness bug. That is true, but it is one harness bug and not thousands, and
-/// reporting it thousands of times hides everything else. On the `cast` directory the shells find
-/// none and the other pair finds twenty three, all of them that.
+/// It always drives both engines through `sessions`, which is not a preference. A test file makes a
+/// table and then asks questions about it, so a driver that forgets between statements fails every
+/// record after the first one for a reason that has nothing to do with the record. The library pair
+/// forgets on one side only, because the linked rudb keeps a connection open and the DuckDB driver
+/// spawns a fresh in memory process per statement, so under it every record after the first
+/// `CREATE TABLE` passes on rudb and fails on the binary and the whole corpus reads as a harness
+/// bug. That is one harness bug reported thousands of times and it hides everything else. Two bare
+/// shells forget on both sides instead, which cancels out into a stale file rather than a harness
+/// bug, and a run where four fifths of the records are the pin failing to find a table it was never
+/// told about is a run that measures nothing.
 fn oracles(path: Option<&str>, slow: bool, refresh: bool) -> ExitCode {
     let dir = match corpus_dir(path, refresh) {
         Ok(dir) => dir,
@@ -586,7 +599,7 @@ fn oracles(path: Option<&str>, slow: bool, refresh: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let (mut duckdb, mut rudb) = match engines(true) {
+    let (mut duckdb, mut rudb) = match sessions() {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("rudb-compat: {e}");
@@ -1005,9 +1018,9 @@ fn help() {
     println!("                binary, and print the records they split on. A record rudb passes");
     println!("                that the binary fails is a bug in this runner and not in the");
     println!("                engine, and one oracle cannot see it. Exits nonzero on those and");
-    println!("                on nothing else. It always drives both engines as shells, because");
-    println!("                a test file is a session and the shell driver is the only one here");
-    println!("                that has one, so it needs a built rudb on PATH or in");
+    println!("                on nothing else. It always drives both engines as shells that");
+    println!("                remember what they were told, because a test file makes a table and");
+    println!("                then asks about it, so it needs a built rudb on PATH or in");
     println!("                RUDB_COMPAT_RUDB.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
