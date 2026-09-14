@@ -21,6 +21,22 @@
 //!
 //! The types come from a second COPY over `DESCRIBE`, in the same process and the same session, so
 //! a temporary view or a setting made by the setup statements is visible to both.
+//!
+//! ## Why a statement that is not a query takes a different path
+//!
+//! Both of those wrappers take a query and nothing else. `COPY (CREATE TABLE t(i INT)) TO` is a
+//! parser error and so is `DESCRIBE CREATE TABLE t(i INT)`, and the same goes for every INSERT,
+//! UPDATE, DELETE, SET, PRAGMA, CALL, EXPLAIN and transaction control statement. Wrapping one of
+//! those anyway does not produce a wrong answer, it produces a parser error attributed to DuckDB,
+//! which is worse: it says the pinned binary cannot parse its own CREATE TABLE. So [`describable`]
+//! decides first, and a statement that is not a query is run bare and reported as having succeeded
+//! with no rows.
+//!
+//! That last part is a real limitation and not a detail. `PRAGMA`, `CALL`, `EXPLAIN` and an
+//! `INSERT ... RETURNING` all return rows and all of them come back here as none, because the CLI
+//! has no way to wrap them that keeps the CSV shape the rest of this file depends on. Every other
+//! non-query statement returns nothing anyway, which is the overwhelming majority of them, so this
+//! is the smaller of the two wrongs by a long way. tamnd/rudb-compat#57 has the rest.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -203,19 +219,24 @@ impl Engine for Duckdb {
         let said_at = self.scratch.join(format!("said-{n}.txt"));
 
         let statement = sql.trim().trim_end_matches(';');
+        let query = describable(statement);
         let mut command = Command::new(&self.binary);
         command.arg("-batch").arg(&self.database);
         for setup in &self.setup {
             command.arg("-c").arg(setup);
         }
-        command
-            .arg("-c")
-            .arg(copy_of(
-                &format!("SELECT column_name, column_type FROM (DESCRIBE {statement})"),
-                &types_at,
-            ))
-            .arg("-c")
-            .arg(copy_of(statement, &rows_at));
+        if query {
+            command
+                .arg("-c")
+                .arg(copy_of(
+                    &format!("SELECT column_name, column_type FROM (DESCRIBE {statement})"),
+                    &types_at,
+                ))
+                .arg("-c")
+                .arg(copy_of(statement, &rows_at));
+        } else {
+            command.arg("-c").arg(statement);
+        }
 
         // What DuckDB says about a failure goes to a file rather than to a pipe, because the wait
         // below is a poll and a poll that is not reading a pipe is a poll that deadlocks the moment
@@ -245,6 +266,12 @@ impl Engine for Duckdb {
             let _ = std::fs::remove_file(&types_at);
             let _ = std::fs::remove_file(&rows_at);
             return Ok(Outcome::Error(EngineError::parse(&text)));
+        }
+
+        // It worked and there was never a result set to read, so the table is the empty one. A
+        // caller asking whether the statement ran gets yes, which is what it did.
+        if !query {
+            return Ok(Outcome::Rows(crate::engine::Table::default()));
         }
 
         let types = std::fs::read_to_string(&types_at)
@@ -372,6 +399,54 @@ fn wait_for(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>, Ha
 }
 
 /// The COPY that writes one result set out.
+/// Whether this statement is one `COPY (...) TO` and `DESCRIBE` will take.
+///
+/// The two wrappers accept exactly the same set, which was checked against the pinned binary rather
+/// than assumed: SELECT, WITH, VALUES, TABLE, FROM, SHOW, DESCRIBE, SUMMARIZE, PIVOT, UNPIVOT and a
+/// parenthesised query. Everything else is a parser error inside the wrapper, and a parser error
+/// inside the wrapper is reported as DuckDB failing to parse a statement it parses perfectly well.
+///
+/// This reads the first word and nothing else, deliberately. Asking the binary would be a second
+/// subprocess for every statement, and the answer is decided by the first word in DuckDB's grammar
+/// too, so there is nothing a heavier check would learn. A leading comment or leading whitespace is
+/// stepped over first, because the corpus has both.
+fn describable(statement: &str) -> bool {
+    const QUERIES: [&str; 10] = [
+        "select",
+        "with",
+        "values",
+        "table",
+        "from",
+        "show",
+        "describe",
+        "summarize",
+        "pivot",
+        "unpivot",
+    ];
+    let mut rest = statement.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail).trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail).trim_start();
+            continue;
+        }
+        break;
+    }
+    // A parenthesised query, which is how the corpus writes a bare set operation.
+    if rest.starts_with('(') {
+        return true;
+    }
+    let word: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .flat_map(char::to_lowercase)
+        .collect();
+    QUERIES.contains(&word.as_str())
+}
+
 fn copy_of(statement: &str, to: &Path) -> String {
     let quoted = to.display().to_string().replace('\'', "''");
     format!("COPY ({statement}) TO '{quoted}' (FORMAT csv, HEADER, FORCE_QUOTE *)")
@@ -381,7 +456,7 @@ fn copy_of(statement: &str, to: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Duckdb, PINNED_COMMIT, Pin, classify, copy_of, hash_in, on_path};
+    use super::{Duckdb, PINNED_COMMIT, Pin, classify, copy_of, describable, hash_in, on_path};
     use crate::engine::{Cell, Engine, Outcome};
     use std::path::Path;
 
@@ -515,5 +590,80 @@ mod tests {
             panic!("the setup should have made t");
         };
         assert_eq!(table.rows, vec![vec![Cell::Text("5".into())]]);
+    }
+
+    #[test]
+    fn the_statements_the_two_wrappers_take_are_the_ones_that_go_through_them() {
+        for query in [
+            "SELECT 1",
+            "select 1",
+            "WITH a AS (SELECT 1) SELECT * FROM a",
+            "VALUES (1)",
+            "TABLE t",
+            "FROM range(3)",
+            "SHOW TABLES",
+            "DESCRIBE t",
+            "SUMMARIZE SELECT 1",
+            "PIVOT t ON i",
+            "UNPIVOT t ON i",
+            "(SELECT 1) UNION (SELECT 2)",
+        ] {
+            assert!(describable(query), "{query} is a query");
+        }
+    }
+
+    #[test]
+    fn a_statement_that_is_not_a_query_does_not_go_through_them() {
+        for other in [
+            "CREATE TABLE t(i INTEGER)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (1) RETURNING i",
+            "UPDATE t SET i = 2",
+            "DELETE FROM t",
+            "SET memory_limit = '1GB'",
+            "PRAGMA version",
+            "CALL range(3)",
+            "EXPLAIN SELECT 1",
+            "BEGIN TRANSACTION",
+            "COPY t TO 'x.csv'",
+            "ATTACH 'x.db'",
+            "",
+        ] {
+            assert!(!describable(other), "{other} is not a query");
+        }
+    }
+
+    #[test]
+    fn a_leading_comment_is_stepped_over_rather_than_read_as_the_first_word() {
+        assert!(describable("-- what this is about\nSELECT 1"));
+        assert!(describable("/* what this is about */ SELECT 1"));
+        assert!(describable("\n  \t SELECT 1"));
+        assert!(!describable("-- this selects nothing\nCREATE TABLE t(i INTEGER)"));
+    }
+
+    #[test]
+    fn a_word_that_only_starts_with_a_query_word_is_not_a_query() {
+        assert!(!describable("selectivity(1)"));
+        assert!(!describable("from_base64('x')"));
+        assert!(!describable("table_name"));
+    }
+
+    #[test]
+    fn a_statement_that_is_not_a_query_runs_and_comes_back_as_having_worked() {
+        let Some(mut db) = duckdb() else { return };
+        let Outcome::Rows(table) = db.run("CREATE TABLE made_here(i INTEGER)").unwrap() else {
+            panic!("DuckDB parses its own CREATE TABLE");
+        };
+        assert_eq!(table.width(), 0);
+        assert_eq!(table.height(), 0);
+    }
+
+    #[test]
+    fn a_statement_that_is_not_a_query_and_is_wrong_still_comes_back_as_the_error() {
+        let Some(mut db) = duckdb() else { return };
+        let Outcome::Error(e) = db.run("INSERT INTO nothing_made_this VALUES (1)").unwrap() else {
+            panic!("there is no such table");
+        };
+        assert!(e.kind.contains("Catalog"), "{e}");
     }
 }
