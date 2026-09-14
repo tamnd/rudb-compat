@@ -338,6 +338,21 @@ pub enum Skipped {
         /// How many records were behind it.
         records: usize,
     },
+    /// A directive that replaces the database the engine is talking to, which this run cannot
+    /// follow, so everything after it was not attempted.
+    ///
+    /// This is the one that used to be silent. A `restart` means the file is about to check that
+    /// what it wrote is still there after the database was reopened from its file. Carrying the
+    /// directive and then running past it leaves the database exactly as it was, so every one of
+    /// those checks passes, and it passes for the reason the file was written to rule out.
+    Changes {
+        /// The line, worded as the file wrote it.
+        what: String,
+        /// Whose gap it is.
+        gap: Gap,
+        /// How many records came after it, including the directive itself.
+        records: usize,
+    },
     /// The file does not parse, which is a problem with the harness or with the vendoring.
     Unreadable(ParseError),
     /// The file is not text.
@@ -356,7 +371,7 @@ impl Skipped {
     #[must_use]
     pub const fn gap(&self) -> Gap {
         match self {
-            Self::Requires { gap, .. } => *gap,
+            Self::Requires { gap, .. } | Self::Changes { gap, .. } => *gap,
             Self::Unreadable(_) | Self::NotText => Gap::Harness,
         }
     }
@@ -369,7 +384,7 @@ impl Skipped {
     #[must_use]
     pub const fn records(&self) -> usize {
         match self {
-            Self::Requires { records, .. } => *records,
+            Self::Requires { records, .. } | Self::Changes { records, .. } => *records,
             Self::Unreadable(_) | Self::NotText => 0,
         }
     }
@@ -381,6 +396,10 @@ impl fmt::Display for Skipped {
             Self::Requires { what, records, .. } => {
                 let each = if *records == 1 { "record" } else { "records" };
                 write!(f, "requires {what}, and {records} {each} went with it")
+            }
+            Self::Changes { what, records, .. } => {
+                let each = if *records == 1 { "record" } else { "records" };
+                write!(f, "stops at {what}, and {records} {each} came after it")
             }
             Self::Unreadable(e) => write!(f, "does not parse, {e}"),
             Self::NotText => f.write_str("is not valid UTF-8"),
@@ -442,14 +461,27 @@ impl Skips {
         ]
     }
 
-    /// Count one file's records against the gap that kept the file from running.
-    fn charge(&mut self, why: &Skipped) {
-        let records = why.records();
-        match why.gap() {
-            Gap::Engine => self.engine += records,
-            Gap::Machine => self.machine += records,
-            Gap::Harness => self.unreadable += records,
+    /// Count records against the row for whoever owns the gap.
+    fn owe(&mut self, gap: Gap, records: usize) {
+        match gap {
             Gap::Excused => self.conditional += records,
+            Gap::Engine => self.engine += records,
+            Gap::Harness => self.unsupported += records,
+            Gap::Machine => self.machine += records,
+        }
+    }
+
+    /// Count one file's records against the gap that stopped it.
+    ///
+    /// A file that could not be read goes on its own row rather than through [`Skips::owe`],
+    /// because the two harness reasons are different work. A directive this runner does not carry
+    /// out is a feature to write, and a file it cannot parse at all is a bug to fix.
+    fn charge(&mut self, why: &Skipped) {
+        match why {
+            Skipped::Unreadable(_) | Skipped::NotText => self.unreadable += why.records(),
+            Skipped::Requires { .. } | Skipped::Changes { .. } => {
+                self.owe(why.gap(), why.records());
+            }
         }
     }
 
@@ -618,7 +650,7 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
                 let why = Skipped::Requires {
                     what: requirement(*env, params),
                     gap,
-                    records: runnable(file),
+                    records: runnable(&file.records),
                 };
                 summary.skipped.charge(&why);
                 summary.skipped_files.push((file.name.clone(), why));
@@ -631,8 +663,11 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
     // that is known not to work without deleting it.
     let mut skipping = false;
     let mut labels: HashMap<String, Vec<String>> = HashMap::new();
+    // Every path the file has opened so far, which is what decides whether the next `load` or
+    // `restart` is asking for an empty database or for one with history in it.
+    let mut loaded: Vec<String> = Vec::new();
 
-    for record in &file.records {
+    for (at, record) in file.records.iter().enumerate() {
         if let Directive::Mode(mode) = &record.directive {
             match mode.as_str() {
                 "skip" => skipping = true,
@@ -655,8 +690,21 @@ pub fn run_file(engine: &mut dyn Engine, file: &TestFile) -> Result<Summary, Har
             summary.skipped.conditional += 1;
             continue;
         }
-        if let Directive::Unsupported(_) = &record.directive {
-            summary.skipped.unsupported += 1;
+        if let Directive::Unsupported(line) = &record.directive {
+            match effect(line, &mut loaded) {
+                Effect::Fresh => engine.reset()?,
+                Effect::Skip(gap) => summary.skipped.owe(gap, 1),
+                Effect::Ends(gap) => {
+                    let why = Skipped::Changes {
+                        what: line.clone(),
+                        gap,
+                        records: runnable(&file.records[at..]),
+                    };
+                    summary.skipped.charge(&why);
+                    summary.skipped_files.push((file.name.clone(), why));
+                    return Ok(summary);
+                }
+            }
             continue;
         }
         match check(engine, file, record, &mut labels)? {
@@ -756,13 +804,95 @@ fn have(env: bool, params: &[String]) -> Option<Gap> {
     }
 }
 
+/// What a directive this runner does not carry out does to the rest of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Effect {
+    /// The database is an empty one from here on, which is a reset and nothing else.
+    Fresh,
+    /// The record does not run and the file carries on, because the directive speaks only to
+    /// itself.
+    Skip(Gap),
+    /// Nothing after this point means anything, because the database the rest of the file is
+    /// written against is one this run cannot produce.
+    Ends(Gap),
+}
+
+/// The directories the corpus makes for itself, fresh, once per run.
+///
+/// A file that opens a database under one of these and writes to it is starting from nothing, and
+/// starting from nothing is what an in memory engine does anyway. A file that opens anything else
+/// is opening something that already has content in it, which is a different question and not one
+/// rudb can answer today.
+const SCRATCH: &[&str] = &["{TEST_DIR}", "{TEMP_DIR}", "__TEST_DIR__"];
+
+/// What one of the directives this runner does not carry out does here, and where it cannot be
+/// done, whose gap that is.
+///
+/// The reason this exists is a false pass, and it was a large one. Six hundred files in the corpus
+/// write to a database, say `restart`, and then check that what they wrote is still there. The
+/// restart is the whole test. Skipping the `restart` record on its own and running the rest of the
+/// file against a database that was never closed makes every one of those checks pass, and it
+/// makes them pass for precisely the reason the file was written to rule out. A harness that does
+/// that reports a persistence guarantee rudb does not have.
+///
+/// So the rule is that a directive which replaces the database ends the file, and the records after
+/// it go on the skip count against whoever owns the gap. rudb keeps its tables in memory, so
+/// reopening a database from a file is the engine's gap and not this runner's, and it is the one
+/// that would close if rudb grew storage.
+///
+/// The exception is worth having rather than folding in. `load {TEST_DIR}/whatever.db` at the top of
+/// a file, on a path nothing has written to yet and not opened read only, is asking for an empty
+/// database, and an empty database is what a reset gives. Those files then go on to create their
+/// own tables and query them, which is an ordinary test that rudb really does pass, and ending them
+/// at the `load` would throw away thousands of honest records to no purpose.
+fn effect(line: &str, loaded: &mut Vec<String>) -> Effect {
+    let mut words = line.split_whitespace();
+    let first = words.next().unwrap_or("");
+    let rest: Vec<&str> = words.collect();
+    match first {
+        "load" => {
+            // A `load` with no path is DuckDB's spelling for an in memory database, and it leaves
+            // the path empty, so a later `restart` is a wipe rather than a reopen.
+            let Some(path) = rest.first().copied() else { return Effect::Fresh };
+            let empty = SCRATCH.iter().any(|dir| path.starts_with(dir))
+                && !rest.contains(&"readonly")
+                && !loaded.iter().any(|seen| seen == path);
+            loaded.push(path.to_owned());
+            if empty { Effect::Fresh } else { Effect::Ends(Gap::Engine) }
+        }
+
+        // Upstream reopens the database from the path it was loaded from. With no path that is an
+        // empty database again, which is a reset. With one it is the persistence question.
+        "restart" => {
+            if loaded.is_empty() {
+                Effect::Fresh
+            } else {
+                Effect::Ends(Gap::Engine)
+            }
+        }
+
+        // A second connection to a database that is already open. This runner talks to both engines
+        // as processes through one shell each, so there is no second connection to be had, and
+        // everything after it is about what one connection sees of another.
+        "reconnect" => Effect::Ends(Gap::Harness),
+
+        // Unpacking a gzip to make a database file to load. The decompressor is the problem, not the
+        // directive: this crate has one dependency on purpose and a second one for this is not a
+        // trade worth making while `load` cannot use the result anyway.
+        "unzip" => Effect::Ends(Gap::Harness),
+
+        // `sleep` and `set`, which speak to themselves and leave the database alone.
+        _ => Effect::Skip(Gap::Harness),
+    }
+}
+
 /// How many records a file would have put in front of the engine.
 ///
 /// Everything down to a `halt` that is not a directive. A `skipif` and a `load` are counted, because
 /// they are records the run would have reached and had an answer about, and leaving them out would
 /// make a file skipped whole look smaller than the same file skipped record by record.
-fn runnable(file: &TestFile) -> usize {
-    file.records
+fn runnable(records: &[Record]) -> usize {
+    records
         .iter()
         .take_while(|record| !matches!(record.directive, Directive::Halt))
         .filter(|record| {
@@ -1366,6 +1496,84 @@ mod tests {
         assert_eq!(summary.skipped_files.len(), 1);
         assert_eq!(summary.skipped_files[0].1.records(), 0);
         assert_eq!(summary.skipped.total(), 0);
+    }
+
+    #[test]
+    fn a_restart_ends_the_file_rather_than_letting_the_checks_after_it_pass_for_free() {
+        // The file writes something, reopens the database and checks it survived. rudb keeps its
+        // tables in memory, so it cannot reopen anything, and running past the restart leaves the
+        // data exactly where it was. Every check after it then passes for the one reason the file
+        // was written to rule out, which is the worst kind of number a report like this can carry.
+        let text = "load {TEST_DIR}/x.db\n\nstatement ok\nCREATE TABLE t(i INTEGER)\n\nrestart\n\nquery I\nSELECT count(*) FROM t\n----\n0\n";
+        let summary = run(vec![Outcome::Rows(Table::default())], text);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.skipped.engine, 2);
+        let (_, why) = &summary.skipped_files[0];
+        assert_eq!(why.to_string(), "stops at restart, and 2 records came after it");
+        assert_eq!(why.gap(), Gap::Engine);
+    }
+
+    #[test]
+    fn a_load_of_a_scratch_path_nothing_has_written_to_is_an_empty_database_and_runs() {
+        // Most of the corpus writes `load {TEST_DIR}/whatever.db` at the top and then builds its own
+        // tables, which is an ordinary test an in memory engine passes. Ending those files at the
+        // load would throw away thousands of honest records for nothing.
+        let text = "load {TEST_DIR}/x.db\n\nstatement ok\nCREATE TABLE t(i INTEGER)\n";
+        let summary = run(vec![Outcome::Rows(Table::default())], text);
+        assert_eq!(summary.passed, 1);
+        assert!(summary.skipped_files.is_empty());
+    }
+
+    #[test]
+    fn a_restart_with_nothing_loaded_is_a_wipe_and_not_a_question_about_storage() {
+        // With no path there is nothing to reopen, so upstream gets an empty database back and so
+        // do we. That is a reset, which this runner can do, so the file carries on.
+        let text = "restart\n\nstatement ok\nCREATE TABLE t(i INTEGER)\n";
+        let summary = run(vec![Outcome::Rows(Table::default())], text);
+        assert_eq!(summary.passed, 1);
+        assert!(summary.skipped_files.is_empty());
+    }
+
+    #[test]
+    fn opening_a_database_that_already_has_something_in_it_ends_the_file() {
+        // Three ways of saying the same thing. A path outside the scratch directories is a file
+        // shipped with the corpus, `readonly` says the content is already there, and a second load
+        // of a path this file wrote to earlier is the persistence question spelled differently.
+        for line in [
+            "load data/storage/views_092.db readonly",
+            "load {TEST_DIR}/x.db readonly",
+            "load {TEST_DIR}/x.db\n\nstatement ok\nCREATE TABLE t(i INTEGER)\n\nload {TEST_DIR}/x.db",
+        ] {
+            let text = format!("{line}\n\nquery I\nSELECT 1\n----\n1\n");
+            let summary = run(vec![Outcome::Rows(Table::default())], &text);
+            assert_eq!(summary.skipped_files.len(), 1, "{line}");
+            assert_eq!(summary.skipped_files[0].1.gap(), Gap::Engine, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_directive_that_leaves_the_database_alone_skips_itself_and_nothing_else() {
+        // `set` and `sleep` are work for this runner rather than for rudb, but neither of them
+        // changes what the engine holds, so the records after them are still worth running.
+        let text = "set ignore_error_messages HTTP\n\nstatement ok\nSELECT 1\n";
+        let summary = run(vec![Outcome::Rows(Table::default())], text);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.skipped.unsupported, 1);
+        assert!(summary.skipped_files.is_empty());
+    }
+
+    #[test]
+    fn the_records_a_stopped_file_had_run_already_are_kept_rather_than_thrown_away() {
+        // The file stops where the database changes, not from the top, so the work in front of the
+        // directive stays in the denominator with its result on it.
+        let text = "statement ok\nSELECT 1\n\nquery I\nSELECT 2\n----\nnope\n\nreconnect\n\nstatement ok\nSELECT 3\n";
+        let summary =
+            run(vec![Outcome::Rows(Table::default()), Outcome::Rows(table(1, &["2"]))], text);
+        assert_eq!(summary.passed, 1);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.skipped.unsupported, 2);
+        assert_eq!(summary.skipped_files[0].1.gap(), Gap::Harness);
     }
 
     #[test]
