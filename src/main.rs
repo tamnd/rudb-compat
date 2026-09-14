@@ -16,7 +16,7 @@ use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
-use rudb_compat::reduce::{Alive, BUDGET, shrink};
+use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
@@ -280,6 +280,9 @@ fn one(sql: &str, messages: MessageMatch, through_shells: bool, measure: Measure
 /// the same difference. The two commands are asked different questions. `query` is asked whether
 /// these engines agree and answers no by failing. `reduce` is pointed at a disagreement somebody
 /// already has and asked to make it small, and it did that or it did not.
+///
+/// A `--file` with more than one statement in it goes to [`triage`] instead, which is the same
+/// reduction over each of them with the results grouped.
 fn reduce(
     sql: Option<&str>,
     file: Option<&str>,
@@ -295,8 +298,12 @@ fn reduce(
         }
         None => None,
     };
-    let Some(sql) = from_file.as_deref().or(sql) else {
-        eprintln!("rudb-compat: reduce needs a statement, or a file of one behind --file");
+    let many = from_file.as_deref().map(statements).unwrap_or_default();
+    if many.len() > 1 {
+        return triage(&many, messages, through_shells, budget);
+    }
+    let Some(sql) = many.first().map(String::as_str).or(sql) else {
+        eprintln!("rudb-compat: reduce needs a statement, or a file of them behind --file");
         return ExitCode::FAILURE;
     };
     let (mut left, mut right) = match engines(through_shells) {
@@ -338,6 +345,62 @@ fn reduce(
             ExitCode::FAILURE
         }
     }
+}
+
+/// Reduce every statement in a file that the two engines disagree about, and group the results.
+///
+/// This is what the reducer is for at scale. A corpus produces thousands of failing statements and
+/// they are not thousands of bugs, they are a few dozen bugs each found by every query that happens
+/// to touch one, so each failure is shrunk and then the shrunken ones are counted by hash. What
+/// comes out is a list somebody can work through.
+///
+/// A statement the two engines agree about is counted and skipped, because reducing something that
+/// does not fail has nothing to keep alive.
+///
+/// Progress goes to standard error under `RUDB_COMPAT_WATCH`, the same as everywhere else here,
+/// because a thousand reductions at up to a budget of engine runs each is a long time to print
+/// nothing.
+fn triage(all: &[String], messages: MessageMatch, through_shells: bool, budget: usize) -> ExitCode {
+    let watching = std::env::var_os("RUDB_COMPAT_WATCH").is_some();
+    let (mut left, mut right) = match engines(through_shells) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut distinct = Distinct::new();
+    for (at, sql) in all.iter().enumerate() {
+        match reduce_one(&mut *left, &mut *right, sql, messages, budget) {
+            Ok(Some((reduced, signatures))) => distinct.add(sql, &reduced.sql, &signatures),
+            Ok(None) => distinct.agreed(),
+            Err(e) => {
+                eprintln!("rudb-compat: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if watching {
+            eprintln!("{} of {}, {} distinct", at + 1, all.len(), distinct.cases().len());
+        }
+    }
+    print!("{distinct}");
+    ExitCode::SUCCESS
+}
+
+/// Reduce one statement, or say that there was nothing to reduce.
+///
+/// `None` is the two engines agreeing, which is not an error and not a case.
+fn reduce_one(
+    left: &mut dyn Engine,
+    right: &mut dyn Engine,
+    sql: &str,
+    messages: MessageMatch,
+    budget: usize,
+) -> Result<Option<(Reduced, Vec<String>)>, HarnessError> {
+    let Some(mut alive) = Alive::at(left, right, sql, messages)? else { return Ok(None) };
+    let signatures = alive.keeping();
+    let reduced = shrink(sql, budget, &mut |candidate| alive.keeps(candidate))?;
+    Ok(Some((reduced, signatures)))
 }
 
 /// The left engine and the right one, in the order everything here puts them in.
@@ -885,7 +948,11 @@ fn help() {
     println!(
         "  reduce <sql>  shrink a failing query to a minimal reproduction, keeping it failing"
     );
-    println!("                the way it failed rather than only keeping it failing");
+    println!("                the way it failed rather than only keeping it failing. Given a file");
+    println!(
+        "                with more than one statement in it, it reduces every one of them and"
+    );
+    println!("                prints the distinct cases they came down to, the most found first.");
     println!("  report [path] run the corpus and write the published status page from that run");
     println!("  -V, --version print the version and exit");
     println!();
@@ -903,8 +970,9 @@ fn help() {
     println!("                     failed, disagreed, or took under ten milliseconds on both");
     println!("                     engines are not timed, and the reasons are in");
     println!("                     spec/sql/duckdb/09-the-harness.md section 9.7.");
-    println!("  --file <path>      where reduce reads the statement from, for the generated ones");
-    println!("                     that are too long to paste onto a command line");
+    println!("  --file <path>      where reduce reads its statements from, for the generated ones");
+    println!("                     that are too long to paste onto a command line and for whole");
+    println!("                     runs of them at once");
     println!("  --budget <n>       how many candidates one reduce may put to the engines, 2000 by");
     println!("                     default. Every candidate is two engine runs and one of them is");
     println!("                     a subprocess, so this is a clock rather than a memory limit.");

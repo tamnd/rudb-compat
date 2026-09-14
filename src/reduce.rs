@@ -150,6 +150,113 @@ pub fn shrink(
     Ok(Reduced { after: best.len(), sql: best, before, tried, steps, gave_up })
 }
 
+/// One distinct reduced case, and a count of what reduced to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Case {
+    /// The md5 of the reduced statement, which is what two runs compare and what a bug report
+    /// carries so that the same case found twice is recognisable as the same case.
+    pub hash: String,
+    /// The reduced statement.
+    pub sql: String,
+    /// How the two engines disagree about it.
+    pub signatures: Vec<String>,
+    /// How many statements reduced to this one.
+    pub hits: usize,
+    /// The first statement that reduced to it.
+    pub first: String,
+}
+
+/// The distinct cases out of a run, and how many statements went into them.
+///
+/// This is the part that makes a large differential run readable. Fifty thousand failing statements
+/// over a corpus are not fifty thousand bugs, they are a few hundred bugs each found by every query
+/// in the corpus that happens to touch it, and a report that lists them one per line is a report
+/// nobody reads twice.
+///
+/// The key is the reduced statement itself, exactly, with no normalising on top. That works because
+/// the reduction has already done the normalising that matters: literals are down to `''` and `0`,
+/// every clause that did not contribute is gone, and every column the failure did not need has been
+/// dropped. Two queries that fail for the same reason arrive at the same text. Anything past that,
+/// folding `SELECT f(a)` and `SELECT f(b)` together, is a judgement about what makes two bugs one
+/// bug, and this is not making it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Distinct {
+    cases: Vec<Case>,
+    differed: usize,
+    agreed: usize,
+}
+
+impl Distinct {
+    /// Nothing seen yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Count a statement the two engines agreed about.
+    pub const fn agreed(&mut self) {
+        self.agreed += 1;
+    }
+
+    /// Count a statement they did not, under the case it reduced to.
+    pub fn add(&mut self, original: &str, sql: &str, signatures: &[String]) {
+        self.differed += 1;
+        let hash = crate::hash::md5_hex(sql.as_bytes());
+        if let Some(case) = self.cases.iter_mut().find(|case| case.hash == hash) {
+            case.hits += 1;
+            return;
+        }
+        self.cases.push(Case {
+            hash,
+            sql: sql.to_owned(),
+            signatures: signatures.to_vec(),
+            hits: 1,
+            first: original.to_owned(),
+        });
+    }
+
+    /// The cases, the most found first, and the ones found equally often in the order they arrived.
+    #[must_use]
+    pub fn cases(&self) -> Vec<&Case> {
+        let mut out: Vec<&Case> = self.cases.iter().collect();
+        out.sort_by_key(|case| std::cmp::Reverse(case.hits));
+        out
+    }
+
+    /// How many statements went in.
+    #[must_use]
+    pub const fn seen(&self) -> usize {
+        self.agreed + self.differed
+    }
+}
+
+impl fmt::Display for Distinct {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "{} statements, {} agreed, {} differed, {} distinct cases",
+            self.seen(),
+            self.agreed,
+            self.differed,
+            self.cases.len()
+        )?;
+        for case in self.cases() {
+            writeln!(f)?;
+            writeln!(f, "{:>6}  {}", case.hits, case.hash)?;
+            writeln!(f, "        {}", case.sql)?;
+            for signature in &case.signatures {
+                writeln!(f, "        {signature}")?;
+            }
+            // The statement it was found in, when the reduction changed it. A case with nothing it
+            // came from is a case nobody can put back in the query that produced it.
+            if case.first != case.sql {
+                writeln!(f, "        found in: {}", case.first)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The two engines, and the failure the reducer is keeping alive.
 pub struct Alive<'a> {
     left: &'a mut dyn Engine,
@@ -172,6 +279,29 @@ impl fmt::Debug for Alive<'_> {
 impl<'a> Alive<'a> {
     /// Read how the statement fails now, which is how every step has to leave it failing.
     ///
+    /// Nothing comes back when the two engines agree about it. That is not an error. Pointed at one
+    /// statement it means somebody reduced the wrong query, and over a whole file it is most of the
+    /// file, so the caller decides which of those it is.
+    ///
+    /// # Errors
+    ///
+    /// When either engine could not be run, which is a broken harness rather than an answer.
+    pub fn at(
+        left: &'a mut dyn Engine,
+        right: &'a mut dyn Engine,
+        sql: &str,
+        messages: MessageMatch,
+    ) -> Result<Option<Self>, HarnessError> {
+        let mut one = Self { left, right, messages, wanted: BTreeSet::new() };
+        one.wanted = one.signatures(sql)?;
+        if one.wanted.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(one))
+    }
+
+    /// The same, for a caller that was pointed at one statement and meant it.
+    ///
     /// # Errors
     ///
     /// When either engine could not be run, or when the two of them agree about the statement, in
@@ -183,15 +313,12 @@ impl<'a> Alive<'a> {
         sql: &str,
         messages: MessageMatch,
     ) -> Result<Self, HarnessError> {
-        let mut one = Self { left, right, messages, wanted: BTreeSet::new() };
-        one.wanted = one.signatures(sql)?;
-        if one.wanted.is_empty() {
-            return Err(HarnessError::new(
+        Self::at(left, right, sql, messages)?.ok_or_else(|| {
+            HarnessError::new(
                 "the two engines agree about this statement, so there is nothing to reduce"
                     .to_owned(),
-            ));
-        }
-        Ok(one)
+            )
+        })
     }
 
     /// Whether this statement still fails the way the one it came from failed.
@@ -629,7 +756,7 @@ fn tidy(sql: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BUDGET, Kind, cuts, scan, shrink, tidy};
+    use super::{BUDGET, Distinct, Kind, cuts, scan, shrink, tidy};
     use crate::engine::HarnessError;
 
     fn kinds(sql: &str) -> Vec<(Kind, &str)> {
@@ -844,5 +971,101 @@ mod tests {
             Err(HarnessError::new("the engine is gone".to_owned()))
         });
         assert!(out.is_err(), "an engine that cannot answer is not an engine that said no");
+    }
+
+    #[test]
+    fn two_statements_that_reduce_to_the_same_text_are_one_case_found_twice() {
+        let mut distinct = Distinct::new();
+        distinct.add(
+            "SELECT age(TIME '1:00') FROM t",
+            "SELECT age(TIME '')",
+            &["wrong type".to_owned()],
+        );
+        distinct.add(
+            "SELECT age(TIME '2:00'), b FROM u",
+            "SELECT age(TIME '')",
+            &["wrong type".to_owned()],
+        );
+        let cases = distinct.cases();
+        assert_eq!(cases.len(), 1, "{distinct}");
+        assert_eq!(cases[0].hits, 2, "{distinct}");
+        assert_eq!(distinct.seen(), 2, "{distinct}");
+    }
+
+    #[test]
+    fn the_first_statement_a_case_was_found_in_is_the_one_kept() {
+        let mut distinct = Distinct::new();
+        distinct.add("SELECT age(TIME '1:00') FROM t", "SELECT age(TIME '')", &[]);
+        distinct.add("SELECT age(TIME '2:00') FROM u", "SELECT age(TIME '')", &[]);
+        assert_eq!(distinct.cases()[0].first, "SELECT age(TIME '1:00') FROM t");
+    }
+
+    #[test]
+    fn two_different_reduced_statements_stay_two_cases() {
+        let mut distinct = Distinct::new();
+        distinct.add("SELECT age(TIME '')", "SELECT age(TIME '')", &[]);
+        distinct.add("SELECT date_part('', TIME '')", "SELECT date_part('', TIME '')", &[]);
+        assert_eq!(distinct.cases().len(), 2, "{distinct}");
+    }
+
+    #[test]
+    fn the_cases_come_back_with_the_most_found_one_first() {
+        let mut distinct = Distinct::new();
+        distinct.add("a", "SELECT one()", &[]);
+        distinct.add("b", "SELECT two()", &[]);
+        distinct.add("c", "SELECT two()", &[]);
+        distinct.add("d", "SELECT three()", &[]);
+        distinct.add("e", "SELECT three()", &[]);
+        distinct.add("f", "SELECT three()", &[]);
+        let order: Vec<&str> = distinct.cases().iter().map(|case| case.sql.as_str()).collect();
+        assert_eq!(order, ["SELECT three()", "SELECT two()", "SELECT one()"], "{distinct}");
+    }
+
+    #[test]
+    fn a_statement_the_engines_agreed_about_is_counted_and_is_not_a_case() {
+        let mut distinct = Distinct::new();
+        distinct.agreed();
+        distinct.agreed();
+        distinct.add("SELECT age(TIME '')", "SELECT age(TIME '')", &[]);
+        assert_eq!(distinct.seen(), 3, "{distinct}");
+        assert_eq!(distinct.cases().len(), 1, "{distinct}");
+        assert!(
+            distinct
+                .to_string()
+                .starts_with("3 statements, 2 agreed, 1 differed, 1 distinct cases"),
+            "{distinct}"
+        );
+    }
+
+    #[test]
+    fn the_hash_is_the_md5_of_the_reduced_statement_and_not_of_the_one_it_came_from() {
+        let mut distinct = Distinct::new();
+        distinct.add("SELECT age(TIME '1:00') FROM t", "SELECT age(TIME '')", &[]);
+        let case = distinct.cases()[0];
+        assert_eq!(case.hash, crate::hash::md5_hex(b"SELECT age(TIME '')"));
+    }
+
+    #[test]
+    fn a_case_prints_what_it_was_found_in_only_when_the_reduction_changed_something() {
+        let mut distinct = Distinct::new();
+        distinct.add("SELECT f() FROM t", "SELECT f()", &["wrong answer".to_owned()]);
+        let printed = distinct.to_string();
+        assert!(printed.contains("found in: SELECT f() FROM t"), "{printed}");
+        assert!(printed.contains("wrong answer"), "{printed}");
+
+        let mut same = Distinct::new();
+        same.add("SELECT f()", "SELECT f()", &[]);
+        assert!(!same.to_string().contains("found in"), "{same}");
+    }
+
+    #[test]
+    fn nothing_seen_prints_nothing_seen_rather_than_an_empty_page() {
+        let distinct = Distinct::new();
+        assert_eq!(distinct.seen(), 0);
+        assert!(
+            distinct
+                .to_string()
+                .starts_with("0 statements, 0 agreed, 0 differed, 0 distinct cases")
+        );
     }
 }
