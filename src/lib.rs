@@ -52,6 +52,7 @@ pub mod shell;
 pub mod slt;
 pub mod sqlsmith;
 pub mod suite;
+pub mod tlp;
 pub mod vendor;
 
 /// The four compatibility levels from `spec/12-duckdb-compat.md` section 12.8.

@@ -330,7 +330,7 @@ fn shape(difference: &Difference) -> String {
 /// rule, since that is the feature and the rest is the query. A table name is replaced by the word
 /// table, which works because every table the generator writes is qualified with `main` and there
 /// is nothing else in a message shaped that way.
-fn generalised(message: &str) -> String {
+pub(crate) fn generalised(message: &str) -> String {
     if let Some(at) = message.find(", the grammar rule is ") {
         return message[at + ", ".len()..].to_owned();
     }
