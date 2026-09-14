@@ -100,6 +100,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("functions") => functions(rest.get(1).copied(), pinned),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => {
@@ -451,6 +452,65 @@ fn report(
     }
 }
 
+/// Read the function table off the pinned DuckDB and print it.
+///
+/// With no name it prints the inventory, which is the denominator the function coverage number is
+/// over and the list of types nothing can generate a call for yet. With a name it prints that name's
+/// overloads and every call the generator would put to each of them, which is how a case gets read
+/// before a run puts thousands of them to two engines.
+fn functions(name: Option<&str>, require: bool) -> ExitCode {
+    let mut duckdb = match Duckdb::discover() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let pin = duckdb.pin();
+    if pin != Pin::Pinned {
+        eprintln!("rudb-compat: this is not the pinned DuckDB, so this catalog is another one's");
+        if require {
+            return ExitCode::FAILURE;
+        }
+    }
+    let catalog = match rudb_compat::functions::catalog(&mut duckdb) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match name {
+        None => print!("{}", rudb_compat::functions::inventory(&catalog)),
+        Some(name) => {
+            let wanted: Vec<_> = catalog.iter().filter(|o| o.name == name).collect();
+            if wanted.is_empty() {
+                eprintln!("rudb-compat: this DuckDB has no function called {name}");
+                return ExitCode::FAILURE;
+            }
+            for overload in wanted {
+                println!(
+                    "{}({}) -> {}, {}",
+                    overload.name,
+                    overload.parameters.join(", "),
+                    overload.returns,
+                    overload.kind.name()
+                );
+                let calls = rudb_compat::functions::calls(overload);
+                if calls.is_empty() {
+                    println!("    no calls, because nothing here has a boundary set for one of");
+                    println!("    its parameter types or the generator does not call this kind");
+                }
+                for call in calls {
+                    println!("    {}", call.sql);
+                }
+                println!();
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// Which directory a corpus run reads.
 ///
 /// No path means the upstream corpus, fetched if it is not already there. That is the run CI does
@@ -631,6 +691,8 @@ fn help() {
     println!("  query <sql>   run one statement on both engines and print the differences");
     println!("  run <file>    run every statement in a file of SQL and print the differences");
     println!("  slt [path]    run sqllogictest and print the pass rate, upstream if no path");
+    println!("  functions [n] print the function catalog off the pinned DuckDB, or the calls the");
+    println!("                generator would put to the overloads of one name");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!("  reduce        shrink a failing query to a minimal reproduction");
@@ -640,7 +702,8 @@ fn help() {
     println!("  --strict-messages  require error text to match and not only the error kind");
     println!("  --slow             include the .test_slow files, which slt leaves out by default");
     println!("  --refresh          fetch the corpus again even if it is already there");
-    println!("  --pinned           make `duckdb` fail when the binary is not the pinned commit");
+    println!("  --pinned           make `duckdb` and `functions` fail when the binary is not the");
+    println!("                     pinned commit");
     println!("  --shell            drive both engines as command line binaries rather than one");
     println!("                     binary and one linked library, which is what tests the drop in");
     println!("                     claim. Needs a built rudb on PATH or in RUDB_COMPAT_RUDB.");
