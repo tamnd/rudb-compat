@@ -19,7 +19,7 @@ use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
-use rudb_compat::suite::{Report, run, run_parse, statements};
+use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -30,6 +30,18 @@ fn main() -> ExitCode {
     let refresh = args.iter().any(|a| a == "--refresh");
     let pinned = args.iter().any(|a| a == "--pinned");
     let through_shells = args.iter().any(|a| a == "--shell");
+    // Only the shell driver measures, because it is the only place both engines are processes
+    // reached the same way. Asking for numbers without asking for shells would produce a run with
+    // nothing in the resource block and no explanation, so it says so instead.
+    let measure = if args.iter().any(|a| a == "--measure") {
+        if !through_shells {
+            eprintln!("rudb-compat: --measure needs --shell, because only the shells are measured");
+            return ExitCode::FAILURE;
+        }
+        Measure::On
+    } else {
+        Measure::Off
+    };
     let default = Limits::default();
     let limits = Limits {
         time: valued(&args, "--limit").map_or(default.time, Duration::from_secs),
@@ -50,21 +62,21 @@ fn main() -> ExitCode {
         }
         Some("duckdb") => report_on_duckdb(pinned),
         Some("parse") => match rest.get(1) {
-            Some(path) => suite(path, messages, Mode::Parse, through_shells),
+            Some(path) => suite(path, messages, Mode::Parse, through_shells, measure),
             None => {
                 eprintln!("rudb-compat: parse needs a file of SQL");
                 ExitCode::FAILURE
             }
         },
         Some("query") => match rest.get(1) {
-            Some(sql) => one(sql, messages, through_shells),
+            Some(sql) => one(sql, messages, through_shells, measure),
             None => {
                 eprintln!("rudb-compat: query needs a statement");
                 ExitCode::FAILURE
             }
         },
         Some("run") => match rest.get(1) {
-            Some(path) => suite(path, messages, Mode::Run, through_shells),
+            Some(path) => suite(path, messages, Mode::Run, through_shells, measure),
             None => {
                 eprintln!("rudb-compat: run needs a file of SQL");
                 ExitCode::FAILURE
@@ -225,9 +237,9 @@ enum Mode {
 }
 
 /// Compare one statement and print the differences.
-fn one(sql: &str, messages: MessageMatch, through_shells: bool) -> ExitCode {
+fn one(sql: &str, messages: MessageMatch, through_shells: bool, measure: Measure) -> ExitCode {
     let statements = vec![sql.to_owned()];
-    match go(&statements, messages, Mode::Run, through_shells) {
+    match go(&statements, messages, Mode::Run, through_shells, measure) {
         Ok((report, pin)) => {
             print(&report, pin);
             verdict(&report)
@@ -240,7 +252,13 @@ fn one(sql: &str, messages: MessageMatch, through_shells: bool) -> ExitCode {
 }
 
 /// Compare every statement in a file.
-fn suite(path: &str, messages: MessageMatch, mode: Mode, through_shells: bool) -> ExitCode {
+fn suite(
+    path: &str,
+    messages: MessageMatch,
+    mode: Mode,
+    through_shells: bool,
+    measure: Measure,
+) -> ExitCode {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -253,7 +271,7 @@ fn suite(path: &str, messages: MessageMatch, mode: Mode, through_shells: bool) -
         eprintln!("rudb-compat: {path} has no statements in it");
         return ExitCode::FAILURE;
     }
-    match go(&statements, messages, mode, through_shells) {
+    match go(&statements, messages, mode, through_shells, measure) {
         Ok((report, pin)) => {
             print(&report, pin);
             verdict(&report)
@@ -275,6 +293,7 @@ fn go(
     messages: MessageMatch,
     mode: Mode,
     through_shells: bool,
+    measure: Measure,
 ) -> Result<(Report, Pin), HarnessError> {
     if through_shells {
         let mut duckdb = Shell::duckdb()?;
@@ -282,7 +301,7 @@ fn go(
         let mut rudb = Shell::rudb()?;
         let report = match mode {
             Mode::Parse => run_parse(&mut duckdb, &mut rudb, statements, messages)?,
-            Mode::Run => run(&mut duckdb, &mut rudb, statements, messages)?,
+            Mode::Run => run(&mut duckdb, &mut rudb, statements, messages, measure)?,
         };
         return Ok((report, pin));
     }
@@ -291,7 +310,7 @@ fn go(
     let mut rudb = Rudb::new();
     let report = match mode {
         Mode::Parse => run_parse(&mut duckdb, &mut rudb, statements, messages)?,
-        Mode::Run => run(&mut duckdb, &mut rudb, statements, messages)?,
+        Mode::Run => run(&mut duckdb, &mut rudb, statements, messages, Measure::Off)?,
     };
     Ok((report, pin))
 }
@@ -323,6 +342,34 @@ fn print(report: &Report, pin: Pin) {
         report.cases.len(),
         report.share() * 100.0
     );
+    resources(report);
+}
+
+/// Print what the run cost, when it measured anything.
+///
+/// Three ratios and not one, and a median with the quartiles beside it and never a minimum, per
+/// `spec/sql/duckdb/11-the-number.md` section 11.2. The worst records are printed under them
+/// because the median is the statistic that hides the one shape that is two hundred times slower,
+/// and that shape is a bug rather than a distribution.
+fn resources(report: &Report) {
+    let Some(ratios) = report.ratios() else { return };
+    println!();
+    println!("rudb over duckdb, median with the quartiles, over {} records", ratios.time.count);
+    let line = |what: &str, spread: &rudb_compat::resource::Spread| {
+        println!("  {what:6} {:.2}  [{:.2} {:.2}]", spread.median, spread.low, spread.high);
+    };
+    line("time", &ratios.time);
+    line("cpu", &ratios.cpu);
+    line("memory", &ratios.memory);
+    println!("  the goal is {:.1} on all three", rudb_compat::resource::Ratios::GOAL);
+    let worst = report.worst(5);
+    if !worst.is_empty() {
+        println!();
+        println!("slowest records, worst first");
+        for (sql, ratio) in worst {
+            println!("  {ratio:8.2}  {}", sql.replace('\n', " "));
+        }
+    }
 }
 
 /// A run where anything disagreed exits nonzero, so CI does not have to read the text.
@@ -537,6 +584,12 @@ fn help() {
     println!("  --shell            drive both engines as command line binaries rather than one");
     println!("                     binary and one linked library, which is what tests the drop in");
     println!("                     claim. Needs a built rudb on PATH or in RUDB_COMPAT_RUDB.");
+    println!("  --measure          also record what each record cost on both engines, which is");
+    println!("                     wall clock, processor time and peak resident set. Needs");
+    println!("                     --shell, and needs GNU time on the machine. Records that");
+    println!("                     failed, disagreed, or took under ten milliseconds on both");
+    println!("                     engines are not timed, and the reasons are in");
+    println!("                     spec/sql/duckdb/09-the-harness.md section 9.7.");
     println!("  --limit <seconds>  how long one statement may run, 10 by default");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
     println!();
