@@ -131,6 +131,20 @@ RUDB_COMPAT_RUDB=/path/to/rudb cargo run -- run corpus/clickbench.sql --shell
 
 Both shells are driven in `.mode quote`, which is the one output mode that keeps a NULL, an empty string and the four letter string `NULL` apart, and which needs nothing from the engine under test. The types come from a second invocation that wraps the statement in a `DESCRIBE`. A statement `DESCRIBE` cannot wrap, `PRAGMA` for instance, still returns its rows, with the type column saying why there is no type rather than guessing one.
 
+## What a record cost
+
+The goal is not compatibility on its own. It is compatibility at ten times the speed and a tenth of the memory, which is three numbers rather than one, and `spec/sql/duckdb/01-what-compatible-means.md` section 1.7 in the engine repository puts the second and third of them in this harness rather than only in the benchmark suite. A benchmark suite measures the shapes somebody chose. The corpus measures the shapes nobody chose, and a feature that is fast on the benchmark and quadratic on the long tail only ever shows up in the second.
+
+```
+RUDB_COMPAT_RUDB=/path/to/rudb cargo run -- run corpus/clickbench.sql --shell --measure
+```
+
+That prints the three ratios of rudb over DuckDB, which are wall clock, processor time and peak resident set, each as a median with the quartiles beside it and never as a minimum, and then the five slowest records worst first. The worst list is the part to read, because an engine that is fast on the median and two hundred times slower on one shape has a bug rather than a distribution.
+
+It needs `--shell`, because the shells are the only place both engines are processes reached the same way, and it needs GNU time on the machine, which rules out a macOS laptop and is fine because the runs happen on the Linux boxes anyway. A machine that cannot measure prints no ratios rather than ratios from a different measurement.
+
+Four kinds of record are deliberately not timed and the reasons are in the code beside the rule. A record that failed on either side, because timing an error path measures the error path. A record the two engines disagreed about, because that is a ratio between two different amounts of work. A record under ten milliseconds on both engines, because below that it is mostly the cost of starting a shell. And every record on a shared machine, which is why server3 does not produce these at all.
+
 ## License
 
 Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE).

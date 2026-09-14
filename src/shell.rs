@@ -41,8 +41,15 @@ use crate::engine::{
     Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table, assemble,
 };
 use crate::quote;
+use crate::resource::{Meter, Usage};
 
 /// One shell, and the session state to put in front of every statement.
+///
+/// This is also where the harness measures what a statement cost, and it is the only place it can.
+/// Both engines are processes here and they are reached through one driver, so wrapping the
+/// process in a meter measures the two sides the same way, which is the whole requirement.
+/// `crate::rudb` links the engine as a library and cannot answer the same question honestly, so it
+/// does not answer it at all.
 #[derive(Debug, Clone)]
 pub struct Shell {
     name: String,
@@ -50,6 +57,8 @@ pub struct Shell {
     version: String,
     database: String,
     setup: Vec<String>,
+    meter: Meter,
+    last: Option<Usage>,
 }
 
 impl Shell {
@@ -104,6 +113,8 @@ impl Shell {
             version: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
             database: ":memory:".to_owned(),
             setup: Vec::new(),
+            meter: Meter::find(),
+            last: None,
         })
     }
 
@@ -133,28 +144,43 @@ impl Shell {
     /// a developer with a `.duckdbrc` setting an output mode would get results this cannot read and
     /// a report that says the engines disagree.
     fn invoke(&self, statement: &str) -> Result<Written, HarnessError> {
-        let mut command = Command::new(&self.binary);
+        let mut metered = self.meter.command(&self.binary);
+        let command = metered.command();
         command.arg("-batch").arg("-init").arg(devnull()).arg("-cmd").arg(".mode quote");
         for setup in &self.setup {
             command.arg("-c").arg(setup);
         }
         command.arg(&self.database).arg(statement);
-        let out = command
+        let (out, cost) = metered
             .output()
             .map_err(|e| HarnessError::new(format!("cannot run {}: {e}", self.binary.display())))?;
         Ok(Written {
             failed: !out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            cost,
         })
+    }
+
+    /// Turn the meter off, for a caller that wants the answers and not the cost of measuring.
+    ///
+    /// Measuring costs a fork per statement on top of the fork that was already happening, which
+    /// is nothing next to starting a shell and is not nothing when it happens four thousand times
+    /// for a run that is going to throw the numbers away.
+    #[must_use]
+    pub fn unmetered(mut self) -> Self {
+        self.meter = Meter::off();
+        self
     }
 }
 
-/// What one run of a shell wrote.
+/// What one run of a shell wrote, and what it cost.
 struct Written {
     failed: bool,
     stdout: String,
     stderr: String,
+    /// Nothing when this machine cannot measure, per `crate::resource`.
+    cost: Option<Usage>,
 }
 
 impl Engine for Shell {
@@ -169,6 +195,10 @@ impl Engine for Shell {
     fn run(&mut self, sql: &str) -> Result<Outcome, HarnessError> {
         let statement = sql.trim().trim_end_matches(';');
         let rows = self.invoke(statement)?;
+        // The statement's cost is the run that answered it. The DESCRIBE below is the harness
+        // asking a second question of its own, and charging that to the engine would be measuring
+        // this file rather than the engine it drives.
+        self.last = rows.cost;
         if rows.failed {
             return Ok(Outcome::Error(EngineError::parse(&rows.stderr)));
         }
@@ -186,6 +216,10 @@ impl Engine for Shell {
         assemble(&quote::read(&types.stdout)?, &rows)
             .map(Outcome::Rows)
             .map_err(|e| HarnessError::new(format!("{}: {e}", self.name)))
+    }
+
+    fn usage(&self) -> Option<Usage> {
+        self.last
     }
 
     fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError> {
@@ -285,6 +319,13 @@ impl Engine for Session {
         self.history.clear();
         Ok(())
     }
+
+    // `usage` is deliberately left at the default, which is nothing. A session replays every
+    // statement that left something behind in front of the next one, so what a measurement here
+    // would time is the statement plus the whole file so far, and that number goes up as the file
+    // goes on for reasons that have nothing to do with either engine. A wrong number with a
+    // confident name is worse than no number, which is the rule the rest of this crate is built
+    // on. The corpus timings come from `Shell`, where one process runs one statement.
 }
 
 /// The query that asks a shell what a statement's columns are.

@@ -273,6 +273,24 @@ pub trait Engine {
     fn reset(&mut self) -> Result<(), HarnessError> {
         Ok(())
     }
+
+    /// What the last statement cost, when this engine is in a position to know.
+    ///
+    /// The goal is a tenth of DuckDB's time and a tenth of its memory, so the harness records the
+    /// cost of every record beside the answer to it, per `spec/sql/duckdb/09-the-harness.md`
+    /// section 9.7. The default is nothing, and nothing is the right answer for more engines than
+    /// it looks like. `crate::rudb` links the engine as a library, so there is no child process to
+    /// ask about and no honest way to separate one statement's peak from the process it shares
+    /// with the harness. `crate::shell` runs both engines as processes through one driver that
+    /// differs only in the path of the binary, which is the only place in this crate where the two
+    /// sides are measured the same way, so it is the only place that answers this.
+    ///
+    /// An engine that cannot measure says so rather than estimating. A record with no number on
+    /// one side is a record that is not in the denominator, which is the same rule as a record
+    /// that failed or a record that was too fast.
+    fn usage(&self) -> Option<crate::resource::Usage> {
+        None
+    }
 }
 
 /// Whether an engine thinks a piece of text is SQL.

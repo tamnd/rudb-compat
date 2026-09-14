@@ -46,7 +46,7 @@ use rudb_compat::duckdb::Duckdb;
 use rudb_compat::engine::Engine;
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
-use rudb_compat::suite::{Report, run, statements};
+use rudb_compat::suite::{Measure, Report, run, statements};
 
 /// The projection every engine on the board gets, as a view over the file where it lies.
 ///
@@ -111,7 +111,8 @@ fn against(corpus: &str) -> Option<(Report, PathBuf)> {
     let text = std::fs::read_to_string(corpus).unwrap();
     let queries = statements(&text);
     assert_eq!(queries.len(), 43, "ClickBench is forty three queries and {corpus} lost one");
-    let report = run(left.as_mut(), right.as_mut(), &queries, MessageMatch::Kind).unwrap();
+    let report =
+        run(left.as_mut(), right.as_mut(), &queries, MessageMatch::Kind, Measure::Off).unwrap();
     Some((report, at))
 }
 

@@ -8,7 +8,7 @@
 use rudb_compat::compare::{Difference, MessageMatch, Side};
 use rudb_compat::duckdb::Duckdb;
 use rudb_compat::rudb::Rudb;
-use rudb_compat::suite::{run_parse, statements};
+use rudb_compat::suite::{Measure, run_parse, statements};
 
 /// Get a DuckDB, or say why the test is not running.
 fn duckdb() -> Option<Duckdb> {
@@ -95,8 +95,14 @@ fn the_dialect_file_runs_at_fourteen_of_fifteen_through_the_library_driver() {
     let mut rudb = Rudb::new();
     let text = std::fs::read_to_string("corpus/dialect.sql").unwrap();
     let statements = statements(&text);
-    let report = rudb_compat::suite::run(&mut duckdb, &mut rudb, &statements, MessageMatch::Kind)
-        .expect("both engines should answer");
+    let report = rudb_compat::suite::run(
+        &mut duckdb,
+        &mut rudb,
+        &statements,
+        MessageMatch::Kind,
+        Measure::Off,
+    )
+    .expect("both engines should answer");
 
     // Parsing this file agrees fifteen of fifteen and running it agrees fourteen here, which
     // are two different measurements of the same statements and both are worth having. Pinned by
@@ -120,8 +126,9 @@ fn a_query_and_a_statement_that_is_not_sql_both_reach_the_full_comparison() {
     let Some(mut duckdb) = duckdb() else { return };
     let mut rudb = Rudb::new();
     let cases = vec!["SELECT 1 AS a".to_owned(), "SELECT FROM WHERE".to_owned()];
-    let report = rudb_compat::suite::run(&mut duckdb, &mut rudb, &cases, MessageMatch::Kind)
-        .expect("both engines should answer");
+    let report =
+        rudb_compat::suite::run(&mut duckdb, &mut rudb, &cases, MessageMatch::Kind, Measure::Off)
+            .expect("both engines should answer");
 
     // Both agree now. The first case used to be a difference because rudb had no executor, and it
     // is the one line in this file that had to change the day one arrived. Two engines returning
