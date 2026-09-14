@@ -166,7 +166,8 @@ impl Report {
 /// three queries twice and it takes hours, and a query that gets the process killed by the kernel
 /// takes the report with it, so afterwards there is no way to say which query it died on. One line
 /// per statement as it finishes answers that. Off by default, because a gate should say one thing.
-fn watching() -> bool {
+#[must_use]
+pub fn watching() -> bool {
     std::env::var_os("RUDB_COMPAT_PROGRESS").is_some_and(|on| on != "0")
 }
 

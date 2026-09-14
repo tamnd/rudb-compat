@@ -35,13 +35,14 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 use crate::duckdb::on_path;
 use crate::engine::{
     Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table, assemble,
 };
 use crate::quote;
-use crate::resource::{Meter, Usage};
+use crate::resource::{Meter, Metered, Usage};
 
 /// One shell, and the session state to put in front of every statement.
 ///
@@ -59,6 +60,8 @@ pub struct Shell {
     setup: Vec<String>,
     meter: Meter,
     last: Option<Usage>,
+    limit: Option<Duration>,
+    killer: Option<PathBuf>,
 }
 
 impl Shell {
@@ -115,6 +118,8 @@ impl Shell {
             setup: Vec::new(),
             meter: Meter::find(),
             last: None,
+            limit: None,
+            killer: killer(),
         })
     }
 
@@ -132,6 +137,28 @@ impl Shell {
         self
     }
 
+    /// Stop a statement that has not answered within this long and call it a refusal.
+    ///
+    /// A corpus run needs this and a differential run does not. The corpus has statements in it
+    /// that one engine answers in a second and the other does not answer at all, and without a
+    /// limit the first of those ends the run: every benchmark after it goes unmeasured while one
+    /// process sits on a join it is never going to finish. A limit turns that from a dead run into
+    /// one refused benchmark with the reason written next to it, which is a result.
+    ///
+    /// It needs a `timeout` on the machine and quietly does nothing without one, because a caller
+    /// that cannot have the limit still wants the numbers.
+    #[must_use]
+    pub fn within(mut self, limit: Duration) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// True when this shell can stop a statement that will not finish.
+    #[must_use]
+    pub const fn can_stop(&self) -> bool {
+        self.killer.is_some()
+    }
+
     /// The binary being driven, for the report.
     #[must_use]
     pub fn binary(&self) -> &std::path::Path {
@@ -144,7 +171,7 @@ impl Shell {
     /// a developer with a `.duckdbrc` setting an output mode would get results this cannot read and
     /// a report that says the engines disagree.
     fn invoke(&self, statement: &str) -> Result<Written, HarnessError> {
-        let mut metered = self.meter.command(&self.binary);
+        let mut metered = self.started();
         let command = metered.command();
         command.arg("-batch").arg("-init").arg(devnull()).arg("-cmd").arg(".mode quote");
         for setup in &self.setup {
@@ -156,10 +183,73 @@ impl Shell {
             .map_err(|e| HarnessError::new(format!("cannot run {}: {e}", self.binary.display())))?;
         Ok(Written {
             failed: !out.status.success(),
+            code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
             cost,
         })
+    }
+
+    /// The command to start, which is the binary on its own or the binary under the killer.
+    ///
+    /// The killer goes inside the meter rather than outside it, so the order is time, then timeout,
+    /// then the shell. That way the numbers still come back for a statement that was stopped, since
+    /// `getrusage` on a child counts everything underneath it, and the process the limit applies to
+    /// is the shell rather than the meter. The other order loses both: killing the meter leaves the
+    /// shell running with nothing waiting on it.
+    fn started(&self) -> Metered {
+        let (Some(killer), Some(limit)) = (self.killer.as_ref(), self.limit) else {
+            return self.meter.command(&self.binary);
+        };
+        let mut metered = self.meter.command(killer);
+        metered
+            .command()
+            .arg("-k")
+            .arg("1")
+            .arg(format!("{}", limit.as_secs().max(1)))
+            .arg(&self.binary);
+        metered
+    }
+
+    /// What a failed run means, which is usually what it said and sometimes that it said nothing.
+    ///
+    /// A stopped statement writes no error text, so reading the empty stderr would file it under
+    /// the same kind as every other unrecognizable failure and lose the one thing worth knowing
+    /// about it.
+    fn declined(&self, out: &Written) -> EngineError {
+        match self.limit {
+            Some(limit) if out.code == Some(STOPPED) => EngineError {
+                kind: "Timeout".to_owned(),
+                message: format!("no answer within {} seconds", limit.as_secs()),
+            },
+            _ => EngineError::parse(&out.stderr),
+        }
+    }
+
+    /// Run one statement for what it costs rather than for what it answers.
+    ///
+    /// Nothing written is read back beyond whether the process failed, and that is the point. The
+    /// shell writes every result to one stream, so a setup statement that returns a row, and
+    /// `SELECT setseed(0.1)` is one, lands in front of the statement's own rows and the two arrive
+    /// as one run of text that no reader can split. `Engine::run` fails on exactly that, and a
+    /// caller timing a benchmark does not want the rows in the first place. What the rows say is
+    /// the differential loop's question and it is asked somewhere else.
+    ///
+    /// It is also one process instead of two, because there is no `DESCRIBE` to send when nobody
+    /// wants the types, which halves what a measurement costs the machine running it.
+    ///
+    /// The `Ok(None)` case is a machine that cannot measure, per `crate::resource`.
+    ///
+    /// # Errors
+    ///
+    /// When the binary cannot be started. A statement the engine refuses comes back as the inner
+    /// `Err` and is a fact about the engine rather than about the harness.
+    pub fn timed(&self, sql: &str) -> Result<Result<Option<Usage>, EngineError>, HarnessError> {
+        let out = self.invoke(sql.trim().trim_end_matches(';'))?;
+        if out.failed {
+            return Ok(Err(self.declined(&out)));
+        }
+        Ok(Ok(out.cost))
     }
 
     /// Turn the meter off, for a caller that wants the answers and not the cost of measuring.
@@ -174,9 +264,27 @@ impl Shell {
     }
 }
 
+/// What `timeout` exits with when it stopped the thing it was watching.
+const STOPPED: i32 = 124;
+
+/// The `timeout` binary, when the machine has one.
+///
+/// GNU coreutils calls it `timeout` and Homebrew's coreutils calls it `gtimeout`, and the BSD
+/// userland on macOS ships neither, so a mac without Homebrew gets no limit. That is the same
+/// answer the meter gives on the same machine and for the same reason: the corpus runs on the
+/// Linux boxes, and a mac is where the tests run rather than where the numbers come from.
+fn killer() -> Option<PathBuf> {
+    ["/usr/bin/timeout", "/bin/timeout", "/opt/homebrew/bin/gtimeout", "/usr/local/bin/gtimeout"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.exists())
+}
+
 /// What one run of a shell wrote, and what it cost.
 struct Written {
     failed: bool,
+    /// The exit status, which is `None` when a signal ended it.
+    code: Option<i32>,
     stdout: String,
     stderr: String,
     /// Nothing when this machine cannot measure, per `crate::resource`.
@@ -528,6 +636,37 @@ mod tests {
                 panic!("{}: the setup should have made t", shell.name());
             };
             assert_eq!(table.rows, vec![vec![Cell::Text("5".into())]], "{}", shell.name());
+        }
+    }
+
+    #[test]
+    fn timing_a_statement_reads_nothing_back_so_a_setup_that_prints_rows_cannot_break_it() {
+        // The shell writes the setup's rows and the statement's rows to one stream with nothing in
+        // between saying where the first ended, so a reader sees one table with two shapes in it
+        // and gives up. A run for the cost does not want either set of rows, and this is the whole
+        // reason it does not ask for them. `SELECT 42` stands in for `SELECT setseed(0.1)`, which
+        // is what the benchmark corpus actually opens with.
+        for shell in shells() {
+            let shell = shell.with_setup(vec!["SELECT 42".to_owned()]);
+            let timed = shell.timed("SELECT 1").unwrap();
+            assert!(timed.is_ok(), "{}: {timed:?}", Engine::name(&shell));
+        }
+    }
+
+    #[test]
+    fn a_statement_that_is_not_going_to_finish_is_stopped_and_reads_as_a_timeout() {
+        for shell in shells() {
+            let shell = shell.within(std::time::Duration::from_secs(1));
+            if !shell.can_stop() {
+                eprintln!("skipping, no timeout on this machine");
+                continue;
+            }
+            let forever = "SELECT sum(a.range * b.range) \
+                           FROM range(100000000) a, range(100000000) b";
+            let Err(e) = shell.timed(forever).unwrap() else {
+                panic!("{}: nothing answers that in a second", Engine::name(&shell));
+            };
+            assert_eq!(e.kind, "Timeout", "{}", Engine::name(&shell));
         }
     }
 }

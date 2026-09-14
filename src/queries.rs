@@ -25,8 +25,8 @@
 //!
 //! A `.benchmark` file is directives at the left margin, each either taking the rest of its line or
 //! introducing a block that runs to the next blank line. The ones that matter here are `name`,
-//! `group`, and `run`, which is either the query itself as a block or the path of a `.sql` file
-//! holding it.
+//! `group`, `require`, and then `run` and `load`, each of which is either the SQL itself as a block
+//! or the path of a `.sql` file holding it.
 //!
 //! Rather more than half of them are not files but instances of one: `template <path>` followed by
 //! `KEY=VALUE` lines, against a `.benchmark.in` that has `${KEY}` in it and may `include` another
@@ -54,6 +54,11 @@ pub struct Query {
     pub file: String,
     /// The query.
     pub sql: String,
+    /// What has to be in the database before the query means anything, one statement at a time.
+    /// Empty for a query that builds its own rows out of `range`.
+    pub load: Vec<String>,
+    /// What the benchmark says it needs before it will run, which is extensions and settings.
+    pub requires: Vec<String>,
 }
 
 /// Read every benchmark under a vendored DuckDB clone.
@@ -118,7 +123,7 @@ fn walk(dir: &Path, into: &mut Vec<PathBuf>) -> Result<(), HarnessError> {
 fn one(clone: &Path, file: &Path) -> Option<Query> {
     let text = std::fs::read_to_string(file).ok()?;
     let text = expanded(clone, &text)?;
-    let sql = run_of(clone, &text)?;
+    let sql = part(clone, &text, "run")?;
     let sql = sql.trim().trim_end_matches(';').trim();
     if sql.is_empty() {
         return None;
@@ -130,7 +135,34 @@ fn one(clone: &Path, file: &Path) -> Option<Query> {
         group: directive(&text, "group").unwrap_or_else(|| suite(&relative)),
         file: relative,
         sql: sql.to_owned(),
+        load: statements(&part(clone, &text, "load").unwrap_or_default()),
+        requires: every(&text, "require"),
     })
+}
+
+/// A block of SQL as the statements it holds.
+///
+/// `rudb::split` first, because it is a real splitter and knows a semicolon inside a string is not
+/// the end of anything. A load it cannot parse falls back to splitting on the line ends, which is
+/// how the rest of this file reads the format anyway.
+fn statements(text: &str) -> Vec<String> {
+    let split = crate::suite::statements(text);
+    if !split.is_empty() {
+        return split;
+    }
+    text.split(";\n")
+        .map(|one| one.trim().trim_end_matches(';').trim().to_owned())
+        .filter(|one| !one.is_empty())
+        .collect()
+}
+
+/// Every line of a directive that can appear more than once.
+fn every(text: &str, name: &str) -> Vec<String> {
+    let wanted = format!("{name} ");
+    text.lines()
+        .filter_map(|line| line.strip_prefix(&wanted))
+        .map(|rest| rest.trim().to_owned())
+        .collect()
 }
 
 /// The suite a file belongs to when it does not say, which is the directory under `benchmark`.
@@ -193,12 +225,12 @@ fn fill(text: &str, values: &BTreeMap<String, String>) -> String {
     out
 }
 
-/// The query a file runs, whether it wrote it out or named the file holding it.
-fn run_of(clone: &Path, text: &str) -> Option<String> {
-    if let Some(path) = directive(text, "run") {
+/// The SQL a directive carries, whether the file wrote it out or named the file holding it.
+fn part(clone: &Path, text: &str, name: &str) -> Option<String> {
+    if let Some(path) = directive(text, name) {
         return std::fs::read_to_string(clone.join(path.trim())).ok();
     }
-    block(text, "run")
+    block(text, name)
 }
 
 /// The rest of the line after a directive, when the directive has one.
@@ -339,6 +371,8 @@ mod tests {
             group: group.to_owned(),
             file: "benchmark/x/q.benchmark".to_owned(),
             sql: sql.to_owned(),
+            load: Vec::new(),
+            requires: Vec::new(),
         }
     }
 

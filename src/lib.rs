@@ -33,6 +33,7 @@ pub mod ask;
 pub mod bisect;
 pub mod compare;
 pub mod conform;
+pub mod cost;
 pub mod coverage;
 pub mod csv;
 pub mod duckdb;

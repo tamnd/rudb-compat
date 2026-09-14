@@ -13,13 +13,15 @@ use std::time::Duration;
 use rudb_compat::Level;
 use rudb_compat::compare::{MessageMatch, Ordering, Rules};
 use rudb_compat::conform::{Reason, Skipped, Summary};
+use rudb_compat::cost::{Costs, Measured};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::oracles::{Split, Verdict};
-use rudb_compat::queries::{Histogram, histogram};
+use rudb_compat::queries::{Histogram, Query, histogram};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
+use rudb_compat::resource::{RUNS, Ratios, Spread};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::{Session, Shell};
 use rudb_compat::sqlsmith::QUERIES;
@@ -123,6 +125,13 @@ fn main() -> ExitCode {
             pinned,
             valued(&args, "--limit").map_or(NAMES, |n| usize::try_from(n).unwrap_or(NAMES)),
         ),
+        Some("cost") => cost(
+            refresh,
+            valued(&args, "--count").and_then(|n| usize::try_from(n).ok()),
+            valued(&args, "--runs").map_or(RUNS, |n| usize::try_from(n).unwrap_or(RUNS)),
+            text(&args, "--group"),
+            valued(&args, "--seconds").unwrap_or(SECONDS),
+        ),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => reduce(
@@ -198,8 +207,18 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 7] =
-        ["--limit", "--memory", "--out", "--budget", "--file", "--count", "--seed"];
+    const VALUED: [&str; 10] = [
+        "--limit",
+        "--memory",
+        "--out",
+        "--budget",
+        "--file",
+        "--count",
+        "--seed",
+        "--runs",
+        "--group",
+        "--seconds",
+    ];
     const PLAIN: [&str; 6] =
         ["--strict-messages", "--slow", "--refresh", "--pinned", "--shell", "--measure"];
     let mut out = Vec::new();
@@ -611,13 +630,13 @@ fn resources(report: &Report) {
     let Some(ratios) = report.ratios() else { return };
     println!();
     println!("rudb over duckdb, median with the quartiles, over {} records", ratios.time.count);
-    let line = |what: &str, spread: &rudb_compat::resource::Spread| {
+    let line = |what: &str, spread: &Spread| {
         println!("  {what:6} {:.2}  [{:.2} {:.2}]", spread.median, spread.low, spread.high);
     };
     line("time", &ratios.time);
     line("cpu", &ratios.cpu);
     line("memory", &ratios.memory);
-    println!("  the goal is {:.1} on all three", rudb_compat::resource::Ratios::GOAL);
+    println!("  the goal is {:.1} on all three", Ratios::GOAL);
     let worst = report.worst(5);
     if !worst.is_empty() {
         println!();
@@ -939,6 +958,203 @@ fn print_queries(found: &Histogram, overloads: usize, limit: usize) {
     println!("function spelled as a keyword score nothing and read here as unused.");
 }
 
+/// How many of the worst benchmarks the cost page prints.
+const WORST: usize = 20;
+
+/// How long one process of one engine gets before the benchmark is called refused.
+///
+/// A minute is long for a benchmark cut down to a million rows and short next to a run of the
+/// whole corpus. The number matters because the corpus contains joins one engine answers in a
+/// second and the other does not answer at all, and without a limit the first of those takes the
+/// rest of the run with it.
+const SECONDS: u64 = 60;
+
+/// Measure the real query corpus on both engines and print the three ratios.
+///
+/// This is the only place in the project where the claim of a tenth of DuckDB's time and a tenth of
+/// its memory can be checked against queries nobody wrote for us. Both engines are driven as shells,
+/// because that is the only way both of them are processes reached the same way and the only way
+/// either of them can be measured from outside.
+///
+/// A benchmark is the load and the query together, and the reason is in `crate::cost`: rudb has no
+/// storage format yet, so there is no way to build a table once and time a query against it. The
+/// load is measured on its own as well and its share is printed beside every row, because a number
+/// that is nine tenths `CREATE TABLE` and does not say so sends people to the wrong file.
+fn cost(
+    refresh: bool,
+    count: Option<usize>,
+    runs: usize,
+    group: Option<&str>,
+    seconds: u64,
+) -> ExitCode {
+    let limit = Duration::from_secs(seconds);
+    let (ours, theirs) = match (Shell::rudb(), Shell::duckdb()) {
+        (Ok(ours), Ok(theirs)) => (ours.within(limit), theirs.within(limit)),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if !ours.can_stop() {
+        eprintln!(
+            "rudb-compat: no timeout on this machine, so a benchmark that hangs hangs the run"
+        );
+    }
+    let corpus = rudb_compat::vendor::checkout(Path::new(root()), refresh)
+        .and_then(|dir| rudb_compat::queries::read(&dir));
+    let corpus = match corpus {
+        Ok(corpus) => corpus,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let wanted: Vec<&Query> = corpus
+        .iter()
+        .filter(|query| group.is_none_or(|group| query.group == group))
+        .take(count.unwrap_or(usize::MAX))
+        .collect();
+    let mut costs = Costs::default();
+    let watching = rudb_compat::suite::watching();
+    for (at, query) in wanted.iter().enumerate() {
+        if watching {
+            eprintln!("{} of {}  {}", at + 1, wanted.len(), query.name);
+        }
+        if let Some(why) = rudb_compat::cost::skipped(query) {
+            costs.skipped.push((query.name.clone(), why));
+            continue;
+        }
+        match rudb_compat::cost::measure(&ours, &theirs, query, runs) {
+            Ok(Ok(measured)) => costs.measured.push(measured),
+            Ok(Err(said)) => costs.refused.push((query.name.clone(), said)),
+            Err(e) => {
+                eprintln!("rudb-compat: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    print_costs(&costs, wanted.len(), runs, seconds);
+    ExitCode::SUCCESS
+}
+
+/// Print a cost run at the three granularities the milestone asks for.
+fn print_costs(costs: &Costs, asked: usize, runs: usize, seconds: u64) {
+    let mut reasons: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for (_, why) in &costs.skipped {
+        *reasons.entry(why.reason()).or_default() += 1;
+    }
+    println!("benchmarks {asked}");
+    println!("measured   {}", costs.measured.len());
+    println!(
+        "refused    {}, which is one engine declining it or taking too long",
+        costs.refused.len()
+    );
+    for (why, how_many) in grouped(&costs.refused) {
+        println!("    {how_many:>5}  {why}");
+    }
+    println!("skipped    {}", costs.skipped.len());
+    for (why, how_many) in &reasons {
+        println!("    {how_many:>5}  {why}");
+    }
+    println!();
+    println!(
+        "Each number below is rudb over the pinned binary, so one is even and the goal is 0.1."
+    );
+    println!("The median of {runs} runs with the quartiles beside it, never the minimum.");
+    println!();
+    match costs.overall() {
+        None => {
+            println!("no benchmark was measured on both engines, so there is no ratio to print")
+        }
+        Some(ratios) => {
+            println!("whole corpus");
+            print_ratios(&ratios);
+        }
+    }
+    let groups = costs.per_group();
+    if !groups.is_empty() {
+        println!();
+        println!("per suite, worst first, and a suite with one benchmark in it is left out");
+        println!("{:<24}{:>10}{:>10}{:>10}{:>7}", "suite", "time", "cpu", "memory", "n");
+        for (group, ratios) in &groups {
+            println!(
+                "{group:<24}{:>10.2}{:>10.2}{:>10.2}{:>7}",
+                ratios.time.median, ratios.cpu.median, ratios.memory.median, ratios.time.count
+            );
+        }
+    }
+    let worst = costs.worst(WORST);
+    if !worst.is_empty() {
+        println!();
+        println!("the worst {}, which is the column to read", worst.len());
+        println!("{:<44}{:>9}{:>9}{:>12}", "benchmark", "time", "memory", "load share");
+        for one in worst {
+            println!(
+                "{:<44}{:>9.2}{:>9.2}{:>11.0}%",
+                short(&one.name, 43),
+                one.time(),
+                memory(one),
+                one.load_share() * 100.0
+            );
+        }
+    }
+    println!();
+    println!("A benchmark here is the load and the query in one process, because rudb has no");
+    println!("storage format yet and there is no way to build a table once and then time a query");
+    println!("against it. The load share says how much of each number is the ingestion. The row");
+    println!("counts are cut down to a million, so these are ratios at a million rows. A process");
+    println!("that has not answered in {seconds} seconds is stopped and the benchmark is refused.");
+    println!();
+    println!("A benchmark stopped on our side is one rudb was losing badly, so it leaves the");
+    println!("ratios above rather than making them worse. Read the timeout count as part of the");
+    println!("result and not as a footnote: those are the shapes to fix first.");
+}
+
+/// What the refusals were, the most common first.
+fn grouped(refused: &[(String, String)]) -> Vec<(String, usize)> {
+    let mut by: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for (_, said) in refused {
+        *by.entry(said.as_str()).or_default() += 1;
+    }
+    let mut rows: Vec<(String, usize)> =
+        by.into_iter().map(|(said, how_many)| (said.to_owned(), how_many)).collect();
+    rows.sort_by_key(|(said, how_many)| (std::cmp::Reverse(*how_many), said.clone()));
+    rows
+}
+
+/// The three medians with their quartiles under a heading.
+fn print_ratios(ratios: &Ratios) {
+    let line = |what: &str, spread: &Spread| {
+        println!(
+            "  {what:<8}{:>8.2}   quartiles {:.2} to {:.2} over {} benchmarks",
+            spread.median, spread.low, spread.high, spread.count
+        );
+    };
+    line("time", &ratios.time);
+    line("cpu", &ratios.cpu);
+    line("memory", &ratios.memory);
+    if ratios.at_goal() {
+        println!("  all three are at the goal of a tenth");
+    }
+}
+
+/// Peak resident set, rudb over the pin.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a resident set a double cannot count does not exist"
+)]
+fn memory(one: &Measured) -> f64 {
+    if one.theirs.peak == 0 { 0.0 } else { one.ours.peak as f64 / one.theirs.peak as f64 }
+}
+
+/// A name cut to something a column can hold.
+fn short(name: &str, width: usize) -> String {
+    if name.chars().count() <= width {
+        return name.to_owned();
+    }
+    name.chars().take(width - 3).chain("...".chars()).collect()
+}
+
 /// Run the generated calls on both engines and print the function coverage number.
 ///
 /// A name narrows it to that name's overloads, which is how somebody works on one function without
@@ -1240,6 +1456,11 @@ fn help() {
     println!("                each name in the catalog is called and how many of them are called");
     println!("                nowhere. Nothing is run, because what this corpus is for is the");
     println!("                weights rather than a pass rate. Takes --limit.");
+    println!("  cost          measure that same corpus on both engines and print the three");
+    println!("                ratios, time, processor time and peak memory, at three");
+    println!("                granularities: the whole corpus, per suite, and the worst twenty.");
+    println!("                The median of five runs with the quartiles beside it. Takes");
+    println!("                --count, --runs, --group and --seconds.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!(
@@ -1274,6 +1495,10 @@ fn help() {
     println!("                     default. Every candidate is two engine runs and one of them is");
     println!("                     a subprocess, so this is a clock rather than a memory limit.");
     println!("  --limit <seconds>  how long one statement may run, 10 by default");
+    println!("  --seconds <n>      how long one engine gets on one benchmark in a cost run, 60 by");
+    println!("                     default. A process that goes over it is stopped and the");
+    println!("                     benchmark is refused rather than measured, which is what keeps");
+    println!("                     one query nobody can answer from ending the whole run.");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
     println!("  --out <dir>        where report writes its page, target/report by default. Each");
     println!("                     run is a new file and one row appended to series.tsv beside");

@@ -275,6 +275,39 @@ Nothing here is run against an engine. The loads in that suite build tables of a
 
 Two counts are deliberately short. A query that appears in five benchmark files at five scale factors is one query, because five measurements of one query are not five queries and counting them that way would weight the histogram towards the two suites that are parameterised that way. And a name counts only when the bracket comes straight after it, so an operator scores nothing and `EXTRACT` and `CAST` score nothing, which means both read here as unused. Both of those want a parser rather than a scan over text, and a number nobody can check by reading a file is worse than a number that is honest about what it left out.
 
+## What the corpus costs on both engines
+
+The same eight hundred and forty five queries run on both engines with the clock and the meter around them, which is the three ratios the goal is actually about. `queries` counts what the corpus calls and runs nothing. `cost` runs it.
+
+```
+RUDB_COMPAT_RUDB=/path/to/rudb rudb-compat cost --runs 5 --seconds 30
+```
+
+```
+benchmarks 845
+measured   32
+refused    339, which is one engine declining it or taking too long
+      107  rudb-shell said Not implemented Error
+      100  the load: rudb-shell said Not implemented Error
+       65  the load: rudb-shell said Catalog Error
+       41  rudb-shell said Catalog Error
+        9  rudb-shell said Timeout
+skipped    474
+
+whole corpus
+  time        1.30   quartiles 0.43 to 3.01 over 32 benchmarks
+  cpu         0.94   quartiles 0.35 to 1.81 over 32 benchmarks
+  memory      0.28   quartiles 0.27 to 0.38 over 32 benchmarks
+```
+
+Memory is the one that is going the right way, at a bit over a quarter of what the pinned binary uses, and the goal is a tenth. Time is a shade worse than even and the quartiles are wide, which is the honest summary of an engine with some operators finished and some not. Per suite it is joins at nineteen times and everything else between a third and twice, and the worst single benchmark is a hash join at twenty five times, which is what an engine with no hash join yet looks like from the outside.
+
+A benchmark here is the load and the query in one process rather than the query on its own, and that is not a shortcut. rudb has no storage format yet, tamnd/rudb#103, so there is no way to build a table once and time a query against it afterwards. Both engines are handed the load as setup statements and the query after it, the process is what gets measured, and the load is measured again on its own so the share of each number that is ingestion can be printed beside it. Most of these are eighty percent load, which is worth knowing before anybody reads a ratio as a statement about the query.
+
+The row counts are cut down. The suite builds tables of a hundred million rows because it is a benchmark suite for a finished database, and every `range` and `generate_series` argument above a million is brought down to a million before either engine sees it. Nothing else is rewritten, so a modulus or a seed or a hash constant is still whatever its author wrote. That makes these ratios at a million rows and nothing else, which is a smaller claim than the one `tamnd/rudb-bench` exists to make.
+
+Two thirds of the corpus produces no ratio and the reasons are counted rather than dropped. Four hundred and seventy four are skipped before either engine sees them, almost all of them behind a `require` for httpfs or parquet or json or one of the two data generators. Three hundred and thirty nine are refused, which is one engine declining the load or the query, and every one of those is rudb: a hundred and seven not implemented, a hundred more in the load, and a hundred and six between a catalog, binder or parser error. Nine are rudb taking longer than thirty seconds on something the pinned binary answers in under one, and those are the interesting ones, because a benchmark stopped on our side leaves the ratios above rather than making them worse. The timeout count is part of the result and not a footnote.
+
 ## License
 
 Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE).
