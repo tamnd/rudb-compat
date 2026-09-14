@@ -269,6 +269,32 @@ The count of predicates that divided the table is the number to read second. A p
 
 rudb passes every predicate this has generated so far and refuses none of them, and the pinned binary passes the same predicates, which says the generator is writing SQL that means what it looks like. That leaves the failure path untested by any real run, so it is tested against an engine written for the purpose that answers every partition with the rows where the predicate is true, which is exactly what an engine that treats unknown as false does.
 
+## The optimizer against itself
+
+The same predicates, asked a different way. `SELECT * FROM t WHERE (p)` is the query an optimizer works on: it pushes the predicate down, it rewrites the expression, it decides a block of rows cannot match and skips it. Move the predicate out of the `WHERE` and into the select list, `SELECT (p) IS TRUE FROM t`, and none of that is available, because there is no filter to push and nothing to skip and the engine has to evaluate the expression once per row. Count the true ones and it is the same number by a route the optimizer cannot take. The paper is Rigger, Rui and Su, "Detecting Optimization Bugs in Database Engines via Non-Optimizing Reference Engine Construction", ESEC/FSE 2020, and it calls the second query a non optimizing reference engine, which is a reference implementation the engine is already obliged to have rather than one somebody had to write.
+
+```
+cargo run --release -- norec --count 20000 --seed 1
+```
+
+```
+the optimizer against itself on rudb from git
+seed 1, which is what replays this run exactly
+
+20000 predicates, 0 the engine would not run, 20000 left
+20000 of those count the same filtered as they do evaluated a row at a time, 14072 of which matched some rows and not all of them
+```
+
+It is worth having beside the partitioning oracle above because the two fail on different bugs. A filter that drops the rows where the predicate is unknown is a partitioning failure and passes here, since both of these queries are filters and both drop the same rows. A pushdown that loses rows is a failure here and passes there, since the three parts are all wrong in the same direction and still add up.
+
+On a disagreement the same predicate goes to a second rudb with every optimizer pass turned off. If the two counts agree there, a rewrite did it and `bisect` names which one. If they disagree there too, the optimizer is not where to look and the answer is already wrong in the binder or the executor, which is the one sentence that saves a day of reading plans. That pairing is the reason this oracle and the pass bisector below it are the same piece of work.
+
+`IS TRUE` rather than the bare predicate, because what is wanted is one value per row that is never NULL. A column that is true, false or NULL would make the harness decide what an unknown is worth, and `IS TRUE` is the engine's own answer to that question and the one `WHERE` already uses.
+
+rudb passes every predicate this has generated and refuses none of them, and `--pinned` puts the same predicates to the pinned binary, which passes 300 of them and refuses none either. That is the check an oracle with one engine in it cannot do without, since a generator writing SQL no optimizer would touch produces exactly the same green run.
+
+Passing everything leaves the failure path with no run to exercise it, so it is tested against an engine whose filter loses a row its select list finds, which is what a pushdown bug looks like from outside. The same fake engine with the bug present in both halves is used to check that the verdict comes back saying the optimizer is not to blame.
+
 ## Which pass changed the answer
 
 A wrong answer is a sentence and a plan, and the plan is the part nobody wants to read. rudb takes DuckDB's `SET disabled_optimizers` spelling, so the question "which rewrite did this" can be asked by running the statement again rather than by reading anything.
