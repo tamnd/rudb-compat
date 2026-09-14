@@ -17,6 +17,7 @@ use rudb_compat::cost::{Costs, Measured};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
+use rudb_compat::norec::CASES as PREDICATES;
 use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::queries::{Histogram, Query, histogram};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
@@ -123,6 +124,12 @@ fn main() -> ExitCode {
         ),
         Some("tlp") => tlp(
             valued(&args, "--count").map_or(CASES, |n| usize::try_from(n).unwrap_or(CASES)),
+            valued(&args, "--seed"),
+            pinned,
+        ),
+        Some("norec") => norec(
+            valued(&args, "--count")
+                .map_or(PREDICATES, |n| usize::try_from(n).unwrap_or(PREDICATES)),
             valued(&args, "--seed"),
             pinned,
         ),
@@ -821,6 +828,45 @@ fn tlp(count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
     }
 }
 
+/// Ask the same question twice, once where the optimizer can work and once where it cannot.
+///
+/// The predicates are the ones `tlp` uses, because a predicate that is worth partitioning is a
+/// predicate that is worth optimizing, and one generator with two oracles reading from it is less to
+/// maintain than two.
+///
+/// Against rudb this opens a second engine with every optimizer pass turned off and puts any
+/// disagreement to that one as well, so the report says whether a rewrite caused it or whether the
+/// answer was already wrong underneath. `--pinned` runs it against the pinned binary instead, which
+/// has no second engine, so that run reports the disagreement and not where it came from.
+///
+/// It exits nonzero when the two counts ever differ, for the same reason `tlp` does: there is no
+/// other engine in the room to blame.
+fn norec(count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
+    let seed = seed.unwrap_or_else(|| u64::from(fresh_seed()));
+    let found = if pinned {
+        match Shell::duckdb() {
+            Ok(shell) => rudb_compat::norec::run(&mut Session::new(shell), None, count, seed),
+            Err(e) => {
+                eprintln!("rudb-compat: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        let mut plain = Rudb::unoptimized();
+        rudb_compat::norec::run(&mut Rudb::new(), Some(&mut plain), count, seed)
+    };
+    match found {
+        Ok(found) => {
+            print!("{found}");
+            if found.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// A seed for a run nobody gave one for.
 ///
 /// The clock, because this is a starting point for a search and not a key, and the only property it
@@ -1506,6 +1552,13 @@ fn help() {
     println!("                instead, which is how a finding is checked against the generator");
     println!("                and is slow enough to be for a handful of predicates rather than");
     println!("                for a sweep. Exits nonzero on anything that did not add up.");
+    println!("  norec         generate predicates and ask each one twice, once as a filter the");
+    println!("                optimizer works on and once in the select list where there is");
+    println!("                nothing to push down or skip, and require the two counts to match.");
+    println!("                Needs no DuckDB. On a disagreement it puts the same predicate to a");
+    println!("                second rudb with every optimizer pass off, so the report says");
+    println!("                whether a rewrite caused it. Takes --count and --seed, and --pinned");
+    println!("                to run against DuckDB instead. Exits nonzero on any disagreement.");
     println!("  queries       read upstream's benchmark suite, which is a thousand queries");
     println!("                somebody wrote because they wanted an answer, and print how often");
     println!("                each name in the catalog is called and how many of them are called");
