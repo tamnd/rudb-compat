@@ -14,11 +14,13 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4096 files, 13868 passed, 50925 failed, which is 21.4 percent of what was attempted
-14314 skipped, of which 13392 the file turned off, 0 in a skipped section and 922 behind a directive the runner does not implement
+4096 files, 16414 passed, 59671 failed, which is 21.6 percent of what was attempted
+14916 skipped, of which 13818 the file turned off, 0 in a skipped section and 1098 behind a directive the runner does not implement
 ```
 
 That is DuckDB's own `sqllogictest` corpus at `v2.0-cyanoptera`, every `.test` file under `test/sql`, run against rudb on every commit and published on the run summary. The M2 exit criterion is above 60 percent, so the distance between those two numbers is the work list for the milestone. The skips are printed on the line underneath rather than folded into the percentage, because a record the file itself turned off with `skipif` and a record behind a directive this runner does not implement mean completely different things and neither of them is a pass.
+
+A `require` line is read the way DuckDB's own runner reads it, in `test/sqlite/sqllogic_test_runner.cpp`, and that is worth saying out loud because most of what the corpus requires is not a feature. `require skip_reload` tells DuckDB's runner not to reopen the database in the middle of the file, `require noforcestorage` tells it not to run the file in the mode that writes everything to disk first, and `require no_alternative_verify` turns off a debug mode. Upstream answers yes to every one of those on an ordinary build and runs the file. Reading them as a missing feature, which this runner did until recently, hid 579 files. The rate went from 23.0 percent to 21.6 percent when they came back, and that is the direction a number moves when it stops being computed over a corpus somebody quietly narrowed.
 
 Each file gets a process of its own, with ten seconds on a statement and two gigabytes on the process. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that are there to be stopped. Both limits are handed to the engine, so the normal way one of those ends is rudb raising an error the report can count against the record that asked for it. This process keeps a clock of its own at twelve times the statement limit and a cap on how large the child may get, as a backstop for an engine that does not stop when it is asked to. Twelve, because a file with ten slow statements in it is a file that exists and killing it would throw away the outcome the limits were handed down to produce. A file that reaches one of those is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for. No file reaches one today, which is why there is no such line above.
 
