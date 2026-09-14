@@ -21,6 +21,7 @@ use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::{Session, Shell};
+use rudb_compat::sqlsmith::QUERIES;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -111,6 +112,11 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("sqlsmith") => sqlsmith(
+            valued(&args, "--count").map_or(QUERIES, |n| usize::try_from(n).unwrap_or(QUERIES)),
+            valued(&args, "--seed").and_then(|n| u32::try_from(n).ok()),
+            messages,
+        ),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => reduce(
@@ -186,7 +192,8 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 5] = ["--limit", "--memory", "--out", "--budget", "--file"];
+    const VALUED: [&str; 7] =
+        ["--limit", "--memory", "--out", "--budget", "--file", "--count", "--seed"];
     const PLAIN: [&str; 6] =
         ["--strict-messages", "--slow", "--refresh", "--pinned", "--shell", "--measure"];
     let mut out = Vec::new();
@@ -692,6 +699,68 @@ fn oracles(path: Option<&str>, slow: bool, refresh: bool) -> ExitCode {
     if bugs.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
+/// Generate queries with upstream's own generator and put every one of them to both engines.
+///
+/// The generator is a DuckDB with the sqlsmith extension loaded, which on a machine that has the
+/// pin is usually not the pin, because extension binaries are published for releases and the pin is
+/// a development commit. That is not a compromise. What comes out of a generator is SQL text and
+/// text has no version, and every statement it writes is still put to the pinned binary and to rudb
+/// here, which is the run that decides anything.
+///
+/// Both engines are driven through sessions, because the tables have to be there when the query
+/// runs and a driver that forgets between statements would put every generated query to an empty
+/// catalog and find one difference over and over.
+///
+/// The seed is printed whether it was given or not, because a generated run whose findings cannot
+/// be replayed is a generated run whose findings do not get fixed.
+fn sqlsmith(how_many: usize, seed: Option<u32>, messages: MessageMatch) -> ExitCode {
+    let generator = match rudb_compat::sqlsmith::Generator::find() {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let seed = seed.unwrap_or_else(fresh_seed);
+    let generated = match generator.generate(how_many, seed) {
+        Ok(found) => found,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let setup = rudb_compat::sqlsmith::catalog();
+    let mut statements = setup.clone();
+    statements.extend(generated);
+    let (mut duckdb, mut rudb) = match sessions() {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let report = match run(&mut *duckdb, &mut *rudb, &statements, messages, Measure::Off) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", rudb_compat::sqlsmith::Found::of(&report, seed, generator.version(), setup.len()));
+    ExitCode::SUCCESS
+}
+
+/// A seed for a run nobody gave one for.
+///
+/// The clock, because this is a starting point for a search and not a key, and the only property it
+/// needs is that two runs a second apart look somewhere different. It is printed either way, which
+/// is what turns it back into a run somebody can repeat.
+fn fresh_seed() -> u32 {
+    let since =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    u32::try_from(since.as_nanos() % u128::from(u32::MAX)).unwrap_or_default()
+}
+
 /// Run the corpus and write the published page from it.
 ///
 /// The same run `slt` does, because the page has to be a measurement of something that happened and
@@ -1089,6 +1158,10 @@ fn help() {
     println!("                more with all of them off. That last run is the one to read: an");
     println!("                answer that is still wrong with every rewrite off is wrong in the");
     println!("                binder or the executor and the optimizer is not where to look.");
+    println!("  sqlsmith      generate queries with upstream's own generator and put every one of");
+    println!("                them to both engines, grouped by what rudb said about them. Takes");
+    println!("                --count and --seed, and prints the seed either way, because a");
+    println!("                generated run that cannot be replayed is one nobody can fix.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!(
