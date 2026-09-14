@@ -20,7 +20,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::conform::Reason;
-use crate::duckdb::{Duckdb, PINNED, PINNED_COMMIT};
+use crate::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use crate::engine::{Engine, HarnessError};
 use crate::isolate::Isolated;
 use crate::vendor;
@@ -86,6 +86,12 @@ pub struct Provenance {
     pub duckdb_version: String,
     /// The md5 of that binary, so that two runs claiming the same version can be told apart.
     pub duckdb_hash: String,
+    /// Whether that binary is the commit this project tracks.
+    ///
+    /// Nothing on the page comes out of DuckDB yet, and this row is here from the start anyway,
+    /// because the resource ratios that are coming are a comparison against whatever binary was on
+    /// the machine and a ratio against another build is a ratio about another database.
+    pub duckdb_pinned: String,
     /// The tag the corpus is fetched at.
     pub corpus_ref: String,
     /// The commit the corpus is at.
@@ -113,13 +119,24 @@ impl Provenance {
         let unix = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let upstream = corpus.starts_with(root.join(vendor::DEST));
         let duckdb = Duckdb::discover();
-        let (binary, version, hash) = match &duckdb {
-            Ok(db) => {
-                (db.binary().display().to_string(), db.version().to_owned(), md5_of(db.binary()))
-            }
+        let (binary, version, hash, pinned) = match &duckdb {
+            Ok(db) => (
+                db.binary().display().to_string(),
+                db.version().to_owned(),
+                md5_of(db.binary()),
+                match db.pin() {
+                    Pin::Pinned => {
+                        "yes, this is the commit the grammar is vendored from".to_owned()
+                    }
+                    Pin::OtherCommit => {
+                        format!("no, this is {PINNED} built at some other commit")
+                    }
+                    Pin::Fallback => "no, this is some other DuckDB".to_owned(),
+                },
+            ),
             Err(_) => {
                 let missing = "no duckdb on this machine".to_owned();
-                (missing.clone(), missing.clone(), missing)
+                (missing.clone(), missing.clone(), missing.clone(), missing)
             }
         };
         Self {
@@ -134,6 +151,7 @@ impl Provenance {
             duckdb_binary: binary,
             duckdb_version: version,
             duckdb_hash: hash,
+            duckdb_pinned: pinned,
             corpus_ref: vendor::REF.to_owned(),
             corpus_commit: if upstream {
                 vendor::commit(root).map_or_else(|_| "unknown".to_owned(), |c| short(&c).to_owned())
@@ -235,8 +253,16 @@ impl fmt::Display for Page<'_> {
             writeln!(f, "    {count:>7}  {:<10}{}", gap.name(), gap.blurb())?;
         }
         writeln!(f)?;
-        writeln!(f, "    {:>7}  files not run", run.skipped_files.len())?;
-        writeln!(f, "    {:>7}  files cut off, counted in neither column", run.stopped.len())?;
+        let files = run.skipped_files.len();
+        let cut = run.stopped.len();
+        writeln!(
+            f,
+            "    {files:>7}  not run   files the runner never opened, whose records are on the rows above"
+        )?;
+        writeln!(
+            f,
+            "    {cut:>7}  cut off   files killed part way through, whose records are in neither column"
+        )?;
         writeln!(f)?;
 
         writeln!(f, "## Failures by reason")?;
@@ -287,6 +313,7 @@ impl fmt::Display for Page<'_> {
         writeln!(f, "    duckdb binary  {}", p.duckdb_binary)?;
         writeln!(f, "    duckdb version {}", p.duckdb_version)?;
         writeln!(f, "    duckdb md5     {}", p.duckdb_hash)?;
+        writeln!(f, "    duckdb pinned  {}", p.duckdb_pinned)?;
         if p.upstream {
             writeln!(f, "    corpus         {} at {}", p.corpus_ref, p.corpus_commit)?;
         } else {
@@ -530,6 +557,7 @@ mod tests {
             duckdb_binary: "/usr/local/bin/duckdb".to_owned(),
             duckdb_version: "v2.0.0-dev1234".to_owned(),
             duckdb_hash: "0123456789abcdef0123456789abcdef".to_owned(),
+            duckdb_pinned: "yes, this is the commit the grammar is vendored from".to_owned(),
             corpus_ref: "v2.0-cyanoptera".to_owned(),
             corpus_commit: "9f8e7d6c5b".to_owned(),
             corpus_path: "target/corpus/test/sql".to_owned(),
@@ -607,6 +635,7 @@ mod tests {
             &p.compat_commit,
             &p.duckdb_pin,
             &p.duckdb_hash,
+            &p.duckdb_pinned,
             &p.corpus_commit,
             &p.seed,
         ] {
