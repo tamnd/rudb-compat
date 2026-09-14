@@ -9,9 +9,12 @@
 //! It skips rather than fails when there is no DuckDB on the machine, the same way
 //! `tests/differential.rs` does and for the same reason.
 
+use rudb_compat::compare::MessageMatch;
+use rudb_compat::coverage::{Untested, Verdict, coverage, score};
 use rudb_compat::duckdb::Duckdb;
 use rudb_compat::engine::{Engine, Outcome};
-use rudb_compat::functions::{TYPES, boundaries, calls, catalog, inventory};
+use rudb_compat::functions::{Kind, TYPES, boundaries, calls, catalog, inventory};
+use rudb_compat::rudb::Rudb;
 
 /// Get a DuckDB, or say why the test is not running.
 fn duckdb() -> Option<Duckdb> {
@@ -81,4 +84,95 @@ fn every_call_the_generator_makes_is_a_statement_duckdb_parses() {
         }
     }
     assert!(bad.is_empty(), "{} calls were not SQL\n{}", bad.len(), bad.join("\n"));
+}
+
+#[test]
+fn a_function_both_engines_have_scores_as_passed_and_one_only_duckdb_has_does_not() {
+    let Some(mut duckdb) = duckdb() else { return };
+    let catalog = catalog(&mut duckdb).expect("this binary has duckdb_functions()");
+    let wanted: Vec<_> = catalog
+        .into_iter()
+        .filter(|o| ["upper", "lower", "generate_series"].contains(&o.name.as_str()))
+        .collect();
+    assert!(!wanted.is_empty(), "the catalog has none of the names this test is about");
+    let mut rudb = Rudb::new();
+    let scored = score(&mut duckdb, &mut rudb, &wanted, MessageMatch::Kind).expect("both engines");
+    let verdict = |name: &str| {
+        scored
+            .iter()
+            .filter(|s| s.overload.name == name)
+            .map(|s| s.verdict.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        verdict("upper").iter().all(|v| *v == Verdict::Passed),
+        "upper disagreed somewhere\n{:?}",
+        scored.iter().flat_map(|s| &s.failures).collect::<Vec<_>>()
+    );
+    assert!(verdict("lower").iter().all(|v| *v == Verdict::Passed), "lower disagreed somewhere");
+    // The table overloads of `generate_series` are a kind the generator does not build calls for,
+    // so they are never tested rather than counted as a pass nobody earned. Its scalar overloads are
+    // tested like anything else, which is why this asks by kind and not by name.
+    let tabular: Vec<_> =
+        scored.iter().filter(|s| s.overload.kind == Kind::Table).map(|s| &s.verdict).collect();
+    assert!(!tabular.is_empty(), "the catalog has no table overload among these names");
+    assert!(
+        tabular.iter().all(|v| **v == Verdict::Untested(Untested::KindNotCalled)),
+        "{tabular:?}"
+    );
+}
+
+#[test]
+fn a_function_whose_answer_changes_between_calls_is_never_put_to_either_engine() {
+    let Some(mut duckdb) = duckdb() else { return };
+    let catalog = catalog(&mut duckdb).expect("this binary has duckdb_functions()");
+    let wanted: Vec<_> = catalog
+        .into_iter()
+        .filter(|o| ["random", "now", "version", "age"].contains(&o.name.as_str()))
+        .collect();
+    let mut rudb = Rudb::new();
+    let scored = score(&mut duckdb, &mut rudb, &wanted, MessageMatch::Kind).expect("both engines");
+    for one in &scored {
+        let volatile = one.overload.name != "age" || one.overload.parameters.len() == 1;
+        if volatile {
+            assert_eq!(
+                one.verdict,
+                Verdict::Untested(Untested::Volatile),
+                "{} was put to both engines and it answers differently every time",
+                one.signature()
+            );
+            assert_eq!(one.attempted, 0);
+        }
+    }
+    // The two argument `age` is the difference between two things the caller named, so it is as
+    // pure as subtraction and the run has to have actually tried it.
+    let two = scored
+        .iter()
+        .find(|s| s.overload.name == "age" && s.overload.parameters.len() == 2)
+        .expect("the catalog has a two argument age");
+    assert!(two.attempted > 0, "the two argument age was never tried");
+}
+
+#[test]
+fn the_number_is_over_the_whole_catalog_and_not_over_what_happened_to_be_tested() {
+    let Some(mut duckdb) = duckdb() else { return };
+    if !duckdb.is_pinned() {
+        eprintln!("skipping, this is not the pinned DuckDB and the counts are per pin");
+        return;
+    }
+    let catalog = catalog(&mut duckdb).expect("the pinned binary has duckdb_functions()");
+    // Only the untested rows, which need no engine, because the point here is the denominator and
+    // not the answers. Running all 3245 is what `rudb-compat coverage` is for.
+    let untested: Vec<_> = catalog.iter().filter(|o| calls(o).is_empty()).cloned().collect();
+    let mut rudb = Rudb::new();
+    let scored =
+        score(&mut duckdb, &mut rudb, &untested, MessageMatch::Kind).expect("both engines");
+    let coverage = coverage(&scored);
+    assert_eq!(coverage.overloads.total, untested.len());
+    assert_eq!(coverage.overloads.passed, 0, "nothing here was tested, so nothing passed");
+    assert_eq!(coverage.overloads.untested, untested.len());
+    assert!(
+        coverage.names.share() < f64::EPSILON,
+        "a run that tested nothing came out above zero, which means it divided by what it tested"
+    );
 }

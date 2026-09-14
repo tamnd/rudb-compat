@@ -8,7 +8,8 @@
 //!
 //! The boundary sets are the only judgement in the whole scheme, which is why they are a table in
 //! one place rather than a rule spread over a generator. Minimum, maximum, zero, one and minus one
-//! for the integers. Empty, embedded null, invalid UTF-8, long and combining for `VARCHAR`. Zero,
+//! for the integers. Empty, embedded null, the twelve byte storage boundary, long and combining for
+//! `VARCHAR`, and the invalid UTF-8 on `BLOB` because DuckDB will not build one in a string. Zero,
 //! negative zero, both infinities, NaN and the subnormal boundary for `DOUBLE`. The width and scale
 //! extremes for `DECIMAL`. The epoch, the infinities and the leap day for `TIMESTAMP`. Every one of
 //! those is a place an engine is wrong while looking right, and none of them is a place a query
@@ -351,6 +352,60 @@ pub struct Boundaries {
     pub values: &'static [&'static str],
 }
 
+/// The functions whose answer depends on something that is not in the call.
+///
+/// `random` gives a different number every time. `now` reads the clock. `version` is the engine
+/// saying its own name. Two engines that both work perfectly disagree on every one of these, so a
+/// differential run has to know which they are before it reports a difference, and a run that did
+/// not would open twenty six wrong answers on its first pass.
+///
+/// This list was read off the pinned catalog and it is a best effort rather than a proof. The run
+/// itself is what finds the ones that are missing from it, because a function that fails on every
+/// single generated call and passes by hand is what volatility looks like from the outside.
+pub const VOLATILE: [&str; 27] = [
+    "current_connection_id",
+    "current_database",
+    "current_date",
+    "current_localtime",
+    "current_localtimestamp",
+    "current_query",
+    "current_query_id",
+    "current_schema",
+    "current_schemas",
+    "current_setting",
+    "current_transaction_id",
+    "currval",
+    "gen_random_uuid",
+    "get_current_time",
+    "get_current_timestamp",
+    "getenv",
+    "nextval",
+    "now",
+    "random",
+    "setseed",
+    "today",
+    "transaction_timestamp",
+    "txid_current",
+    "uuid",
+    "uuidv4",
+    "uuidv7",
+    "version",
+];
+
+/// Whether this overload's answer depends on something that is not in the call.
+///
+/// Asked per overload rather than per name because of `age`, which is two functions wearing one
+/// name. `age(TIMESTAMP, TIMESTAMP)` is the difference between two things the caller named and is
+/// as pure as subtraction. `age(TIMESTAMP)` is the difference between one thing the caller named
+/// and today, so it answers differently tomorrow.
+#[must_use]
+pub fn volatile(overload: &Overload) -> bool {
+    if overload.name == "age" {
+        return overload.parameters.len() == 1;
+    }
+    VOLATILE.contains(&overload.name.as_str())
+}
+
 /// How a function name is written in a call.
 ///
 /// A good part of this catalog is operators. `+`, `@`, `^@`, `!~~` and about forty others are rows
@@ -406,6 +461,15 @@ pub const TYPES: [&str; 33] = [
     "FLOAT[]",
     "BOOLEAN[]",
 ];
+
+/// A string long enough that nothing about it is stored inline anywhere.
+///
+/// Two hundred and fifty six characters, written out rather than built by a function call, and not
+/// the hundred thousand it started as. The length that matters is the one where the representation
+/// changes and that is twelve bytes. Past that it is the same code path with a larger allocation,
+/// and a hundred thousand character literal in every failure report is a failure report nobody
+/// pastes anywhere.
+const LONG: &str = "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'";
 
 /// The boundary set for a type, or nothing when this table has none for it.
 ///
@@ -512,21 +576,39 @@ pub fn boundaries(ty: &str) -> Option<Boundaries> {
             "'a'",
             &[
                 "''",
+                // The only way to get a zero byte into a string. There is no escape for it in a
+                // literal, so this one case costs a dependency on `chr` and a failure here is a
+                // failure of either function.
                 "chr(0)",
                 "'a' || chr(0) || 'b'",
-                // Through a blob, because that is the only way to get bytes into a VARCHAR that are not
-                // UTF-8. A string literal with backslash x in it is those four characters.
-                "'\\xFF\\xFE'::BLOB::VARCHAR",
-                "repeat('a', 100000)",
-                "'e' || chr(769)",
+                // Twelve bytes and thirteen, which is where both engines stop storing a string
+                // beside the pointer and start storing it somewhere else. Written out rather than
+                // built with `repeat`, so that a function missing from one engine cannot fail every
+                // other function's long string case with it.
+                "'aaaaaaaaaaaa'",
+                "'aaaaaaaaaaaaa'",
+                LONG,
+                // The letter and the accent as two code points, which is a different string from
+                // the one code point that prints the same way.
+                "'e\u{301}'",
                 "'\u{1f600}'",
                 "'  a  '",
                 "'A'",
             ],
         ),
+        // The invalid UTF-8 case the specification asks for is here and not on `VARCHAR`, because
+        // DuckDB will not build one. A string literal with backslash x in it is those four
+        // characters, casting a blob to a string escapes the bytes rather than carrying them, and
+        // `decode` raises a conversion error on purpose. A blob is where those bytes can exist.
         "BLOB" => set(
             "'ab'::BLOB",
-            &["''::BLOB", "'\\x00'::BLOB", "'\\xff\\xfe'::BLOB", "repeat('a', 100000)::BLOB"],
+            &[
+                "''::BLOB",
+                "'\\x00'::BLOB",
+                "'\\xff\\xfe'::BLOB",
+                "'\\xc3\\x28'::BLOB",
+                "'aaaaaaaaaaaaa'::BLOB",
+            ],
         ),
         "BOOLEAN" => set("true", &["true", "false"]),
         "DATE" => set(
@@ -804,8 +886,11 @@ mod tests {
         has("DOUBLE", "5e-324");
         has("VARCHAR", "''");
         has("VARCHAR", "chr(0)");
-        has("VARCHAR", "repeat");
-        has("VARCHAR", "chr(769)");
+        has("VARCHAR", "'aaaaaaaaaaaa'");
+        has("VARCHAR", "'aaaaaaaaaaaaa'");
+        has("VARCHAR", "e\u{301}");
+        has("BLOB", "\\xff\\xfe");
+        has("BLOB", "\\xc3\\x28");
         has("DECIMAL", "DECIMAL(38,0)");
         has("DECIMAL", "DECIMAL(38,38)");
         has("TIMESTAMP", "1970-01-01");

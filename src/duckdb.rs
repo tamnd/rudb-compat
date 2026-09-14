@@ -23,7 +23,8 @@
 //! a temporary view or a setting made by the setup statements is visible to both.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::csv;
 use crate::engine::{Acceptance, Cell, Engine, EngineError, HarnessError, Outcome, assemble};
@@ -72,7 +73,16 @@ pub struct Duckdb {
     database: String,
     setup: Vec<String>,
     scratch: PathBuf,
+    limit: Duration,
 }
+
+/// How long one statement gets before the process running it is killed.
+///
+/// The same ten seconds `--limit` defaults to, for the same reason. DuckDB has functions that are
+/// supposed to take forever, `sleep_ms` being the plain one, and a generated call is going to find
+/// them: the first full sweep spent an hour asleep inside
+/// `sleep_ms(9223372036854775807::BIGINT)`, which is about nine billion seconds.
+pub const LIMIT: Duration = Duration::from_secs(10);
 
 impl Duckdb {
     /// Find a DuckDB and ask it what version it is.
@@ -108,7 +118,15 @@ impl Duckdb {
             database: ":memory:".to_owned(),
             setup: Vec::new(),
             scratch: std::env::temp_dir().join(format!("rudb-compat-{}", std::process::id())),
+            limit: LIMIT,
         })
+    }
+
+    /// Give one statement a different amount of time before the process is killed.
+    #[must_use]
+    pub fn within(mut self, limit: Duration) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Point it at a database file instead of an in-memory one.
@@ -182,6 +200,7 @@ impl Engine for Duckdb {
         let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let types_at = self.scratch.join(format!("types-{n}.csv"));
         let rows_at = self.scratch.join(format!("rows-{n}.csv"));
+        let said_at = self.scratch.join(format!("said-{n}.txt"));
 
         let statement = sql.trim().trim_end_matches(';');
         let mut command = Command::new(&self.binary);
@@ -198,11 +217,33 @@ impl Engine for Duckdb {
             .arg("-c")
             .arg(copy_of(statement, &rows_at));
 
-        let out = command
-            .output()
+        // What DuckDB says about a failure goes to a file rather than to a pipe, because the wait
+        // below is a poll and a poll that is not reading a pipe is a poll that deadlocks the moment
+        // the pipe fills. Nothing reads the standard output: every result comes back through the
+        // two CSV files.
+        let said = std::fs::File::create(&said_at)
+            .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", said_at.display())))?;
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::from(said));
+
+        let mut child = command
+            .spawn()
             .map_err(|e| HarnessError::new(format!("cannot run {}: {e}", self.binary.display())))?;
-        if !out.status.success() {
-            let text = String::from_utf8_lossy(&out.stderr);
+        let Some(status) = wait_for(&mut child, self.limit)? else {
+            let _ = child.kill();
+            let _ = child.wait();
+            for at in [&types_at, &rows_at, &said_at] {
+                let _ = std::fs::remove_file(at);
+            }
+            return Ok(Outcome::Error(EngineError {
+                kind: "Timeout Error".to_owned(),
+                message: format!("killed after {} seconds", self.limit.as_secs()),
+            }));
+        };
+        let text = std::fs::read_to_string(&said_at).unwrap_or_default();
+        let _ = std::fs::remove_file(&said_at);
+        if !status.success() {
+            let _ = std::fs::remove_file(&types_at);
+            let _ = std::fs::remove_file(&rows_at);
             return Ok(Outcome::Error(EngineError::parse(&text)));
         }
 
@@ -307,6 +348,27 @@ pub(crate) fn on_path(name: &str) -> PathBuf {
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
         .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Wait for a child, or give up on it and say so by coming back with nothing.
+///
+/// A poll rather than a blocking wait, because the standard library has no wait with a deadline and
+/// the alternatives are a thread per call or a signal handler. The sleep is short enough that it
+/// costs a couple of milliseconds on a call that finishes quickly and long enough that a ten second
+/// wait is a few thousand cheap syscalls rather than a spin.
+fn wait_for(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>, HarnessError> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => {}
+            Err(e) => return Err(HarnessError::new(format!("cannot wait for DuckDB: {e}"))),
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 /// The COPY that writes one result set out.

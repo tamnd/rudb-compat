@@ -101,6 +101,7 @@ fn main() -> ExitCode {
             }
         },
         Some("functions") => functions(rest.get(1).copied(), pinned),
+        Some("coverage") => coverage(rest.get(1).copied(), pinned, messages),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => {
@@ -511,6 +512,66 @@ fn functions(name: Option<&str>, require: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Run the generated calls on both engines and print the function coverage number.
+///
+/// A name narrows it to that name's overloads, which is how somebody works on one function without
+/// waiting for the whole catalog. With no name it is the full sweep, which is about fifteen thousand
+/// calls and takes a while, so `RUDB_COMPAT_WATCH` makes it say where it is.
+fn coverage(name: Option<&str>, require: bool, messages: MessageMatch) -> ExitCode {
+    let mut duckdb = match Duckdb::discover() {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if duckdb.pin() != Pin::Pinned {
+        eprintln!(
+            "rudb-compat: this is not the pinned DuckDB, so this number is about another one"
+        );
+        if require {
+            return ExitCode::FAILURE;
+        }
+    }
+    let catalog = match rudb_compat::functions::catalog(&mut duckdb) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let catalog: Vec<_> = match name {
+        Some(name) => catalog.into_iter().filter(|o| o.name == name).collect(),
+        None => catalog,
+    };
+    if catalog.is_empty() {
+        eprintln!("rudb-compat: this DuckDB has no function by that name");
+        return ExitCode::FAILURE;
+    }
+    let mut rudb = Rudb::new();
+    let scored = match rudb_compat::coverage::score(&mut duckdb, &mut rudb, &catalog, messages) {
+        Ok(scored) => scored,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // Every failing call in full and above the counts, the same way the differential report does it,
+    // because a report whose useful part is below the fold is a report people stop reading.
+    for one in &scored {
+        if one.failures.is_empty() {
+            continue;
+        }
+        println!("{}", one.signature());
+        for failure in &one.failures {
+            print!("{failure}");
+        }
+        println!();
+    }
+    print!("{}", rudb_compat::coverage::coverage(&scored));
+    ExitCode::SUCCESS
+}
+
 /// Which directory a corpus run reads.
 ///
 /// No path means the upstream corpus, fetched if it is not already there. That is the run CI does
@@ -693,6 +754,8 @@ fn help() {
     println!("  slt [path]    run sqllogictest and print the pass rate, upstream if no path");
     println!("  functions [n] print the function catalog off the pinned DuckDB, or the calls the");
     println!("                generator would put to the overloads of one name");
+    println!("  coverage [n]  run those calls on both engines and print the function coverage");
+    println!("                number, over one name if given and over the whole catalog if not");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!("  reduce        shrink a failing query to a minimal reproduction");
@@ -702,8 +765,8 @@ fn help() {
     println!("  --strict-messages  require error text to match and not only the error kind");
     println!("  --slow             include the .test_slow files, which slt leaves out by default");
     println!("  --refresh          fetch the corpus again even if it is already there");
-    println!("  --pinned           make `duckdb` and `functions` fail when the binary is not the");
-    println!("                     pinned commit");
+    println!("  --pinned           make `duckdb`, `functions` and `coverage` fail when the binary");
+    println!("                     is not the pinned commit");
     println!("  --shell            drive both engines as command line binaries rather than one");
     println!("                     binary and one linked library, which is what tests the drop in");
     println!("                     claim. Needs a built rudb on PATH or in RUDB_COMPAT_RUDB.");
@@ -725,6 +788,11 @@ fn help() {
     println!("stops the statement itself and leaves a failure the report can count. This process");
     println!("keeps a clock of its own at twelve times the statement limit and a cap on the size");
     println!("the child, and a file that reaches either of those is killed and named instead.");
+    println!();
+    println!("DuckDB gets ten seconds on every statement everywhere, whatever --limit says, and");
+    println!("the process is killed when it runs out. It is a subprocess rather than a library");
+    println!("here, so nothing else was going to stop it, and sleep_ms is a real function that a");
+    println!("generated call will eventually reach.");
     println!();
     println!("The slt command needs no DuckDB on the machine, because a sqllogictest file already");
     println!("carries what every statement is supposed to produce. Everything else here compares");
