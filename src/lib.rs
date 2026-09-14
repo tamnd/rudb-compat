@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ask;
+pub mod bisect;
 pub mod compare;
 pub mod conform;
 pub mod coverage;
