@@ -117,6 +117,19 @@ pub enum Difference {
         /// How many the right engine returned.
         right: usize,
     },
+    /// One side did not come back with anything, because it came apart.
+    ///
+    /// [`compare`] never produces this one, because a comparison needs two outcomes and this is
+    /// what is left when there is only one. It is here rather than in the caller so that a crash
+    /// reads as a difference everywhere a difference is read, and so that it can never match
+    /// anything: no engine reports an error of this kind, so two engines cannot both crash into
+    /// agreement.
+    Panicked {
+        /// Which side came apart.
+        side: Side,
+        /// What it said on the way down.
+        message: String,
+    },
     /// A value differs.
     Value {
         /// Which row, counting from zero, after sorting when the rules said to sort.
@@ -149,6 +162,7 @@ impl fmt::Display for Difference {
                 write!(f, "column {at} has type {left} against {right}")
             }
             Self::Height { left, right } => write!(f, "{left} rows against {right}"),
+            Self::Panicked { side, message } => write!(f, "{side} panicked, with {message}"),
             Self::Value { row, column, left, right } => {
                 write!(f, "row {row} column {column} is {left} against {right}")
             }

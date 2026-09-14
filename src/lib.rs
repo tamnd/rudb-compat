@@ -31,6 +31,7 @@
 
 pub mod compare;
 pub mod conform;
+pub mod coverage;
 pub mod csv;
 pub mod duckdb;
 pub mod engine;

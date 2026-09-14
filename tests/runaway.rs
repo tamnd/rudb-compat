@@ -8,11 +8,16 @@
 //! This is the two ways that goes wrong, written small enough to run in a second. The engine is
 //! given a one second clock and a one megabyte budget, and both files come back as records with an
 //! outcome rather than as processes that had to be killed.
+//!
+//! The other engine is here too, at the bottom. DuckDB is a subprocess rather than a library, so
+//! nothing in this harness was stopping it, and a generated call to `sleep_ms` is all it takes.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rudb_compat::conform::Reason;
+use rudb_compat::duckdb::Duckdb;
+use rudb_compat::engine::{Engine, Outcome};
 use rudb_compat::isolate::{Limits, run_corpus};
 
 #[test]
@@ -50,6 +55,28 @@ fn a_query_the_engine_stops_is_a_failed_record_and_not_a_killed_process() {
     let details: Vec<&str> = run.failures.iter().map(|f| f.detail.as_str()).collect();
     assert!(details.iter().any(|d| d.contains("Interrupt Error")), "{details:?}");
     assert!(details.iter().any(|d| d.contains("Out of Memory Error")), "{details:?}");
+}
+
+#[test]
+fn a_duckdb_that_is_never_going_to_finish_is_killed_and_comes_back_as_a_record() {
+    let Ok(duckdb) = Duckdb::discover() else {
+        eprintln!("skipping, no DuckDB");
+        return;
+    };
+    if !duckdb.is_pinned() {
+        eprintln!("skipping, sleep_ms being in the catalog is a property of the pin");
+        return;
+    }
+    // The other engine in this harness is a subprocess and nothing was stopping it. The function
+    // sweep generated this exact call, DuckDB went to sleep for about nine billion seconds, and the
+    // run sat behind it for an hour before anybody looked.
+    let mut duckdb = duckdb.within(Duration::from_secs(1));
+    let started = Instant::now();
+    let outcome = duckdb.run("SELECT sleep_ms(9223372036854775807::BIGINT)").expect("it answers");
+    let elapsed = started.elapsed();
+    let Outcome::Error(e) = outcome else { panic!("that call was never going to return rows") };
+    assert_eq!(e.kind, "Timeout Error", "{e}");
+    assert!(elapsed < Duration::from_secs(30), "it waited {elapsed:?}, so nothing killed it");
 }
 
 fn scratch() -> PathBuf {
