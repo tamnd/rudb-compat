@@ -171,6 +171,36 @@ impl Both {
         self.count(Verdict::Agreed) + self.count(Verdict::Harness)
     }
 
+    /// How the pinned binary failed on the records neither engine passed, most found first.
+    ///
+    /// A stale file is a note rather than a bug here, but the size of the note is worth reading.
+    /// The pin is the reference implementation, so a directory where it fails most of the records
+    /// is usually not a directory of stale files. It is a directory this runner is running wrongly
+    /// in a way that makes rudb fail too, and that hides in the stale count where the harness bug
+    /// line cannot reach it, because the harness bug line only sees the records rudb passed.
+    ///
+    /// Breaking the stale records down by what the binary said is the cheapest way to tell the two
+    /// apart. A spread across several reasons is a set of files that have aged, which is what it
+    /// says on the tin. One reason under almost every record is this runner, and then the reason
+    /// names the thing to go and fix.
+    #[must_use]
+    pub fn why_stale(&self) -> Vec<(Reason, usize)> {
+        let mut counts: Vec<(Reason, usize)> = Reason::ALL
+            .into_iter()
+            .map(|reason| {
+                let found = self
+                    .splits
+                    .iter()
+                    .filter(|split| split.verdict == Verdict::Stale && split.duckdb == Some(reason))
+                    .count();
+                (reason, found)
+            })
+            .filter(|(_, found)| *found > 0)
+            .collect();
+        counts.sort_by_key(|(_, found)| std::cmp::Reverse(*found));
+        counts
+    }
+
     /// Take in what the two runs of one file said.
     pub fn take(&mut self, file: &TestFile, rudb: &Told, duckdb: &Told) {
         self.files += 1;
@@ -225,6 +255,17 @@ impl fmt::Display for Both {
         writeln!(f)?;
         for verdict in Verdict::ALL {
             writeln!(f, "{:>8}  {:<12}{}", self.count(verdict), verdict.name(), verdict.blurb())?;
+        }
+        let stale = self.why_stale();
+        if !stale.is_empty() {
+            writeln!(f)?;
+            writeln!(
+                f,
+                "what the pinned binary said on the records neither engine passed, because the pin is the reference implementation and a pile of these in one reason is this runner rather than a pile of old files"
+            )?;
+            for (reason, found) in stale {
+                writeln!(f, "{found:>8}  {:<16}{}", reason.name(), reason.blurb())?;
+            }
         }
         if self.unpaired > 0 {
             writeln!(f)?;
@@ -379,6 +420,29 @@ mod tests {
         );
         assert_eq!(both.count(Verdict::Stale), 1, "{both}");
         assert_eq!(both.count(Verdict::Gap), 0, "{both}");
+    }
+
+    #[test]
+    fn the_stale_records_are_broken_down_by_what_the_pinned_binary_said_most_found_first() {
+        let file = parse("t.test", "query I\nSELECT 1\n----\n1\n").expect("parses");
+        let mut both = Both::new();
+        for _ in 0..3 {
+            both.take(
+                &file,
+                &told(&[(0, Said::Failed(Reason::Unbound))]),
+                &told(&[(0, Said::Failed(Reason::Syntax))]),
+            );
+        }
+        both.take(
+            &file,
+            &told(&[(0, Said::Failed(Reason::Unbound))]),
+            &told(&[(0, Said::Failed(Reason::WrongAnswer))]),
+        );
+        // A gap is not a stale record and must not turn up in the breakdown, even though the binary
+        // passed it and so has no reason to be counted under at all.
+        both.take(&file, &told(&[(0, Said::Failed(Reason::Unbound))]), &told(&[(0, Said::Passed)]));
+        assert_eq!(both.why_stale(), vec![(Reason::Syntax, 3), (Reason::WrongAnswer, 1)], "{both}");
+        assert!(both.to_string().contains("the pinned binary said"), "{both}");
     }
 
     #[test]
