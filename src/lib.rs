@@ -37,6 +37,7 @@ pub mod engine;
 pub mod hash;
 pub mod isolate;
 pub mod quote;
+pub mod report;
 pub mod resource;
 pub mod rudb;
 pub mod shell;

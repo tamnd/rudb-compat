@@ -1,14 +1,14 @@
 //! The harness command line.
 //!
 //! The subcommands are named in `spec/14-rudb-compat.md` and the CI job in the rudb repository
-//! calls them by name, so the names are a decision rather than an afterthought. Three of them work
-//! now. `reduce` and `report` do not, and they say so rather than printing something empty.
+//! calls them by name, so the names are a decision rather than an afterthought. All of them work
+//! now except `reduce`, which says so rather than printing something empty.
 
 #![forbid(unsafe_code)]
 
 use std::process::ExitCode;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rudb_compat::Level;
@@ -17,6 +17,7 @@ use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
+use rudb_compat::report::{Page, Provenance};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
@@ -100,7 +101,8 @@ fn main() -> ExitCode {
             }
         },
         Some("vendor") => fetch(refresh),
-        Some("reduce" | "report") => {
+        Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
+        Some("reduce") => {
             eprintln!("rudb-compat: not built yet, see spec/14-rudb-compat.md in tamnd/rudb");
             ExitCode::FAILURE
         }
@@ -135,6 +137,21 @@ fn valued(args: &[String], flag: &str) -> Option<u64> {
     None
 }
 
+/// The flags that take a word rather than a number, in either spelling.
+fn text<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    for (at, arg) in args.iter().enumerate() {
+        if let Some(rest) = arg.strip_prefix(flag) {
+            if let Some(value) = rest.strip_prefix('=') {
+                return Some(value);
+            }
+            if rest.is_empty() {
+                return args.get(at + 1).map(String::as_str);
+            }
+        }
+    }
+    None
+}
+
 /// The two numbers the runner passes a child after the file and the name.
 ///
 /// A timeout in seconds and a memory budget in bytes, both worked out by the parent out of its own
@@ -155,7 +172,7 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 2] = ["--limit", "--memory"];
+    const VALUED: [&str; 3] = ["--limit", "--memory", "--out"];
     const PLAIN: [&str; 4] = ["--strict-messages", "--slow", "--refresh", "--pinned"];
     let mut out = Vec::new();
     let mut skip = false;
@@ -379,18 +396,70 @@ fn verdict(report: &Report) -> ExitCode {
 
 /// Run the sqllogictest corpus, either a path that was given or the upstream one.
 fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCode {
+    let run = corpus_dir(path, refresh).and_then(|dir| corpus(&dir, slow, limits));
+    match run {
+        Ok(total) => {
+            print_corpus(&Rudb::new(), &total);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Run the corpus and write the published page from it.
+///
+/// The same run `slt` does, because the page has to be a measurement of something that happened and
+/// not a summary of a file somebody kept. It prints the page as well as writing it, so that a CI log
+/// has the numbers in it without anybody fetching an artifact.
+fn report(
+    path: Option<&str>,
+    slow: bool,
+    refresh: bool,
+    limits: Limits,
+    out: Option<&str>,
+) -> ExitCode {
+    let dir = match corpus_dir(path, refresh) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let total = match corpus(&dir, slow, limits) {
+        Ok(total) => total,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let provenance = Provenance::gather(Path::new(root()), &dir, Rudb::new().version());
+    println!("{}", Page::of(&total, &provenance));
+    let into = out.map_or_else(|| Path::new(root()).join(rudb_compat::report::DEST), PathBuf::from);
+    match rudb_compat::report::write(&into, &total, &provenance) {
+        Ok(page) => {
+            println!("written to {}", page.display());
+            println!("appended to {}", into.join(rudb_compat::report::SERIES).display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Which directory a corpus run reads.
+///
+/// No path means the upstream corpus, fetched if it is not already there. That is the run CI does
+/// and it is the number the project publishes, so it is the one that takes no argument. Pointing it
+/// at a directory is for narrowing down a failure by hand.
+fn corpus_dir(path: Option<&str>, refresh: bool) -> Result<PathBuf, HarnessError> {
     match path {
-        Some(path) => corpus(Path::new(path), slow, limits),
-        // No path means the upstream corpus, fetched if it is not already there. That is the run
-        // CI does and it is the number the project publishes, so it is the one that takes no
-        // argument. Pointing it at a directory is for narrowing down a failure by hand.
-        None => match rudb_compat::vendor::corpus(Path::new(root()), refresh) {
-            Ok(dir) => corpus(&dir, slow, limits),
-            Err(e) => {
-                eprintln!("rudb-compat: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Some(path) => Ok(PathBuf::from(path)),
+        None => rudb_compat::vendor::corpus(Path::new(root()), refresh),
     }
 }
 
@@ -475,29 +544,16 @@ const fn root() -> &'static str {
     env!("CARGO_MANIFEST_DIR")
 }
 
-/// Run a sqllogictest file or a directory of them against rudb and print the pass rate.
+/// Run a sqllogictest file or a directory of them against rudb.
 ///
-/// This exits zero whatever the pass rate is, which is the opposite of what `run` does and is
-/// deliberate. The corpus is thousands of statements against a database that is being built, so a
-/// nonzero exit would mean the job is red every day until the day it is finished and nobody would
-/// read it. What CI watches is the number going down, and the number is what this prints.
-fn corpus(path: &Path, slow: bool, limits: Limits) -> ExitCode {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            eprintln!("rudb-compat: cannot find this binary to re-run it: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let total = match rudb_compat::isolate::run_corpus(&exe, path, slow, limits) {
-        Ok(total) => total,
-        Err(e) => {
-            eprintln!("rudb-compat: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    print_corpus(&Rudb::new(), &total);
-    ExitCode::SUCCESS
+/// Whoever called this exits zero whatever the pass rate is, which is the opposite of what `run`
+/// does and is deliberate. The corpus is thousands of statements against a database that is being
+/// built, so a nonzero exit would mean the job is red every day until the day it is finished and
+/// nobody would read it. What CI watches is the number going down.
+fn corpus(path: &Path, slow: bool, limits: Limits) -> Result<Isolated, HarnessError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| HarnessError::new(format!("cannot find this binary to re-run it: {e}")))?;
+    rudb_compat::isolate::run_corpus(&exe, path, slow, limits)
 }
 
 /// Print a corpus run.
@@ -578,7 +634,7 @@ fn help() {
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!("  reduce        shrink a failing query to a minimal reproduction");
-    println!("  report        write the published status page from the last run");
+    println!("  report [path] run the corpus and write the published status page from that run");
     println!("  -V, --version print the version and exit");
     println!();
     println!("  --strict-messages  require error text to match and not only the error kind");
@@ -596,6 +652,10 @@ fn help() {
     println!("                     spec/sql/duckdb/09-the-harness.md section 9.7.");
     println!("  --limit <seconds>  how long one statement may run, 10 by default");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
+    println!("  --out <dir>        where report writes its page, target/report by default. Each");
+    println!("                     run is a new file and one row appended to series.tsv beside");
+    println!("                     it, because a page that is overwritten cannot go down in");
+    println!("                     front of anybody.");
     println!();
     println!("Each file in an slt run gets a process of its own, because the corpus contains");
     println!("queries that are meant to be enormous. Both limits are handed to the engine, which");
