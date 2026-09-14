@@ -243,6 +243,32 @@ A query both engines refused is counted apart from the rest. The generator is a 
 
 The seed is printed whether it was given or not, because a generated run whose findings cannot be replayed is a generated run whose findings do not get fixed.
 
+## An oracle with one engine in it
+
+Every other check here needs a DuckDB on the machine to say what the answer should have been. This one does not, because what it tests is a property of SQL rather than an agreement between two engines. Take a predicate `p`. Every row a query can see is in exactly one of three buckets: the rows where `p` is true, the rows where it is false, and the rows where it is neither of those because something in it was NULL. So the rows of `WHERE p`, `WHERE NOT (p)` and `WHERE (p) IS NULL` put together are the rows of the query with no predicate on it at all, and that has to hold for every predicate an engine will accept. The paper is Rigger and Su, "Finding Bugs in Database Systems via Query Partitioning", OOPSLA 2020, where it is called ternary logic partitioning.
+
+```
+cargo run --release -- tlp --count 20000 --seed 1
+```
+
+```
+ternary logic partitioning against rudb from git
+seed 1, which is what replays this run exactly
+
+20000 predicates, 0 the engine would not run, 20000 left
+20000 of those split into three parts that add back up to the whole, 16378 of which divided the table rather than putting every row in one part
+```
+
+Three things make it worth having beside the differential loop. It runs on a machine with no DuckDB on it, which makes it a check every commit can afford. It localises, because the three parts are the same query four times over and the only thing that moved is the predicate, so a failure names the predicate rather than the query. And it tests three valued logic directly, which is the part of SQL a young engine gets wrong quietly, since a predicate that returns false where it should return unknown gives the right answer for almost every query anybody writes by hand and the wrong answer for the rest.
+
+The three parts are run as three queries and put back together in the harness rather than written as one `UNION ALL` the way the paper does it. It is the same property and it fails in fewer places, since a bug in `UNION ALL` would break every case in a run and say nothing about any predicate. The one statement form is printed beside every failure anyway, because that is what a person pastes into a shell.
+
+The table is a constant in the source rather than something generated from the seed, so a run is replayed by the seed alone and the rows can be chosen for the job instead of sampled. What the job needs is rows that straddle every boundary a generated predicate might draw, and one row per column whose value in that column is NULL while the rest of the row is ordinary, because that is the row a predicate on one column is unknown about and everything else in the same expression is not.
+
+The count of predicates that divided the table is the number to read second. A predicate that puts every row in one part passed without testing anything, so a generator that drifts into writing those would produce a run that is green and empty, and the two numbers side by side is what makes that visible.
+
+rudb passes every predicate this has generated so far and refuses none of them, and the pinned binary passes the same predicates, which says the generator is writing SQL that means what it looks like. That leaves the failure path untested by any real run, so it is tested against an engine written for the purpose that answers every partition with the rows where the predicate is true, which is exactly what an engine that treats unknown as false does.
+
 ## Which pass changed the answer
 
 A wrong answer is a sentence and a plan, and the plan is the part nobody wants to read. rudb takes DuckDB's `SET disabled_optimizers` spelling, so the question "which rewrite did this" can be asked by running the statement again rather than by reading anything.

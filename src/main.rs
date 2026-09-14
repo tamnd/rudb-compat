@@ -26,6 +26,7 @@ use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::{Session, Shell};
 use rudb_compat::sqlsmith::QUERIES;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
+use rudb_compat::tlp::CASES;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -119,6 +120,11 @@ fn main() -> ExitCode {
             valued(&args, "--count").map_or(QUERIES, |n| usize::try_from(n).unwrap_or(QUERIES)),
             valued(&args, "--seed").and_then(|n| u32::try_from(n).ok()),
             messages,
+        ),
+        Some("tlp") => tlp(
+            valued(&args, "--count").map_or(CASES, |n| usize::try_from(n).unwrap_or(CASES)),
+            valued(&args, "--seed"),
+            pinned,
         ),
         Some("queries") => queries(
             refresh,
@@ -773,6 +779,46 @@ fn sqlsmith(how_many: usize, seed: Option<u32>, messages: MessageMatch) -> ExitC
     };
     print!("{}", rudb_compat::sqlsmith::Found::of(&report, seed, generator.version(), setup.len()));
     ExitCode::SUCCESS
+}
+
+/// Split generated predicates three ways and require the parts to add up.
+///
+/// This is the one check here that needs no DuckDB on the machine, because the property it tests is
+/// a property of SQL rather than an agreement between two engines. It drives rudb as the linked
+/// library for the same reason `bisect` does: the fixture is created once and every predicate after
+/// it asks about the same table, so the driver has to be one that remembers. `--pinned` runs the
+/// whole thing against the pinned binary instead, which is how somebody checks that a predicate
+/// this reports about is really rudb being wrong and not this generator writing SQL that does not
+/// mean what it looks like. That run is a process per query with the fixture replayed in front of
+/// each one, so it does a few hundred predicates in the time rudb does twenty thousand, and it is
+/// for checking a finding rather than for a sweep.
+///
+/// It exits nonzero when anything did not add up, unlike `sqlsmith`, because there is no second
+/// engine here to be the reason for a difference. Every finding is a bug in the engine or a bug in
+/// this file, and both of those are somebody's job before the next merge.
+fn tlp(count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
+    let mut engine: Box<dyn Engine> = if pinned {
+        match Shell::duckdb() {
+            Ok(shell) => Box::new(Session::new(shell)),
+            Err(e) => {
+                eprintln!("rudb-compat: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        Box::new(Rudb::new())
+    };
+    let seed = seed.unwrap_or_else(|| u64::from(fresh_seed()));
+    match rudb_compat::tlp::run(&mut *engine, count, seed) {
+        Ok(found) => {
+            print!("{found}");
+            if found.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// A seed for a run nobody gave one for.
@@ -1451,6 +1497,15 @@ fn help() {
     println!("                them to both engines, grouped by what rudb said about them. Takes");
     println!("                --count and --seed, and prints the seed either way, because a");
     println!("                generated run that cannot be replayed is one nobody can fix.");
+    println!("  tlp           generate predicates and split a query on each of them three ways,");
+    println!("                the rows where it is true, where it is false and where it is");
+    println!("                neither, and require the three to add back up to the query with no");
+    println!("                predicate on it. Needs no DuckDB, since the property is a property");
+    println!("                of SQL rather than an agreement between two engines. Takes --count");
+    println!("                and --seed, and --pinned to run the whole thing against DuckDB");
+    println!("                instead, which is how a finding is checked against the generator");
+    println!("                and is slow enough to be for a handful of predicates rather than");
+    println!("                for a sweep. Exits nonzero on anything that did not add up.");
     println!("  queries       read upstream's benchmark suite, which is a thousand queries");
     println!("                somebody wrote because they wanted an answer, and print how often");
     println!("                each name in the catalog is called and how many of them are called");
