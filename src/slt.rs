@@ -26,6 +26,7 @@
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 
 /// One record from a `.test` file, after loops are expanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,8 +104,24 @@ pub enum Directive {
     /// settled there and this is what is left when the condition is about the engine rather than
     /// about the loop.
     Continue,
-    /// Something the format has and this runner does not do: `sleep`, `restart`, `load`, `unzip`
-    /// and the rest.
+    /// `set <what> <value>`, which is the file saying something about the run rather than about
+    /// the engine.
+    Set(Setting),
+    /// `sleep <n> <unit>`, which waits.
+    ///
+    /// In the corpus for two reasons, waiting for a clock to move on and waiting for a cache to
+    /// let go of a file, and both of those are the point of the record rather than padding.
+    Sleep(Duration),
+    /// `test-env <name> <default>`, which names an environment variable the file reads and what to
+    /// use when it is not set.
+    TestEnv {
+        /// The variable name, which is also the name written `{name}` in the SQL below it.
+        name: String,
+        /// What the file says to use when the environment does not have it.
+        default: String,
+    },
+    /// Something the format has and this runner does not do: `restart`, `load`, `unzip`, and
+    /// `reconnect`.
     ///
     /// Carried rather than dropped, because a file that reconnects in the middle is a file whose
     /// later records are about persistence, and running them against a database that never
@@ -162,6 +179,38 @@ pub enum StatementResult {
     /// parser refuses a `maybe` without one, so reading the directive and leaving the `----` behind
     /// is how twenty nine files in the corpus came back as unreadable.
     Maybe(Option<String>),
+}
+
+/// What a `set` line sets.
+///
+/// Four of these, and they are not the SQL `SET`. A `set` directive is read by the runner and a
+/// `SET` under a `statement ok` is read by the engine, and the corpus has plenty of both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Setting {
+    /// `set ignore_error_messages a, b, c`, which is the file naming errors that mean the rest of
+    /// it is not worth running.
+    ///
+    /// The corpus writes this above statements that reach out to a network or a filesystem, so the
+    /// errors named are `HTTP Error` and `Unable to connect` rather than anything about SQL. When
+    /// one fires upstream stops reading the file, and it is not a failure, which is why these
+    /// records land on the excused row rather than anywhere else.
+    Ignore(Vec<String>),
+    /// `set always_fail_error_messages a, b`, which names errors no `statement error` may be
+    /// satisfied by.
+    ///
+    /// Defaults to `INTERNAL` with no line in the file at all. An internal error is the engine
+    /// saying it has broken an invariant of its own, and a file that expected an error getting one
+    /// of those is not a file that passed.
+    AlwaysFail(Vec<String>),
+    /// `set seed <number>`, which the runner turns into `SELECT setseed(n)`.
+    Seed(String),
+    /// `set variable <name> <value>`, which is a name the SQL below can write as `{name}`.
+    Variable {
+        /// The name, without the braces.
+        name: String,
+        /// What it stands for.
+        value: String,
+    },
 }
 
 /// What a `query` record expects.
@@ -441,9 +490,20 @@ fn one(lines: &[&str], at: &mut usize) -> Result<Option<Record>, ParseError> {
                 });
             }
         },
-        "sleep" | "restart" | "reconnect" | "load" | "unzip" | "set" | "test-env" => {
-            Directive::Unsupported(trimmed.to_owned())
-        }
+        "set" => Directive::Set(setting(&rest, number)?),
+        "sleep" => Directive::Sleep(nap(&rest, number)?),
+        "test-env" => match (rest.first().copied(), rest.get(1).copied()) {
+            (Some(name), Some(default)) => {
+                Directive::TestEnv { name: name.to_owned(), default: default.to_owned() }
+            }
+            _ => {
+                return Err(ParseError {
+                    line: number,
+                    message: "a test-env is a name and what to use when it is not set".to_owned(),
+                });
+            }
+        },
+        "restart" | "reconnect" | "load" | "unzip" => Directive::Unsupported(trimmed.to_owned()),
         other => {
             return Err(ParseError {
                 line: number,
@@ -453,6 +513,65 @@ fn one(lines: &[&str], at: &mut usize) -> Result<Option<Record>, ParseError> {
     };
 
     Ok(Some(Record { line: number, condition, directive }))
+}
+
+/// `set <what> ...`, which is the four settings on [`Setting`] and nothing else.
+///
+/// An unrecognised one is an error rather than a shrug, the same way an unknown directive is, and
+/// for the same reason: the corpus is vendored at a known release, so a `set` nobody has seen means
+/// the format moved and somebody should look.
+fn setting(rest: &[&str], number: usize) -> Result<Setting, ParseError> {
+    let fail = |message: &str| ParseError { line: number, message: message.to_owned() };
+    match rest.first().copied() {
+        Some("ignore_error_messages") => Ok(Setting::Ignore(messages(&rest[1..]))),
+        Some("always_fail_error_messages") => Ok(Setting::AlwaysFail(messages(&rest[1..]))),
+        Some("seed") => match rest.get(1) {
+            Some(seed) => Ok(Setting::Seed((*seed).to_owned())),
+            None => Err(fail("a set seed takes the seed")),
+        },
+        Some("variable") => match (rest.get(1), rest.get(2)) {
+            (Some(name), Some(value)) => {
+                Ok(Setting::Variable { name: (*name).to_owned(), value: (*value).to_owned() })
+            }
+            _ => Err(fail("a set variable takes a name and a value")),
+        },
+        Some(other) => Err(ParseError {
+            line: number,
+            message: format!("{other} is not a set this parser knows"),
+        }),
+        None => Err(fail("a set with nothing after it")),
+    }
+}
+
+/// The comma separated list of error messages a `set` carries.
+///
+/// Commas separate and spaces do not, because the messages have spaces in them. `set
+/// ignore_error_messages HTTP Error, Unable to connect` names two, not four.
+fn messages(rest: &[&str]) -> Vec<String> {
+    rest.join(" ")
+        .split(',')
+        .map(|part| part.trim().to_owned())
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// `sleep <n> <unit>`, in the four units upstream accepts.
+fn nap(rest: &[&str], number: usize) -> Result<Duration, ParseError> {
+    let fail = |message: String| ParseError { line: number, message };
+    let how_long: u64 = rest
+        .first()
+        .and_then(|word| word.parse().ok())
+        .ok_or_else(|| fail("a sleep takes a whole number and a unit".to_owned()))?;
+    let unit = rest.get(1).copied().unwrap_or("");
+    // Upstream takes the singular and the plural of each, so `1 second` and `10 seconds` are both
+    // written in the corpus and both mean what they say.
+    match unit.trim_end_matches('s') {
+        "nanosecond" => Ok(Duration::from_nanos(how_long)),
+        "microsecond" => Ok(Duration::from_micros(how_long)),
+        "millisecond" => Ok(Duration::from_millis(how_long)),
+        "second" => Ok(Duration::from_secs(how_long)),
+        other => Err(fail(format!("{other} is not a unit a sleep is written in"))),
+    }
 }
 
 /// `statement ok`, `statement error` or `statement maybe`, then the SQL.
@@ -735,7 +854,9 @@ fn resolve(condition: &Condition, name: &str, value: &str) -> Condition {
 
 #[cfg(test)]
 mod tests {
-    use super::{Condition, Directive, QueryResult, Sort, StatementResult, parse};
+    use super::{
+        Condition, Directive, Duration, QueryResult, Setting, Sort, StatementResult, parse,
+    };
 
     #[test]
     fn a_statement_and_a_query_read_back_as_what_they_say() {
@@ -816,6 +937,36 @@ SELECT a FROM t
             panic!("a statement");
         };
         assert_eq!(sql, "SELECT 1");
+    }
+
+    #[test]
+    fn a_set_of_error_messages_is_separated_by_commas_and_not_by_spaces() {
+        let file =
+            parse("x.test", "set ignore_error_messages HTTP Error, Unable to connect\n").unwrap();
+        let Directive::Set(Setting::Ignore(messages)) = &file.records[0].directive else {
+            panic!("an ignore list");
+        };
+        assert_eq!(messages, &["HTTP Error".to_owned(), "Unable to connect".to_owned()]);
+    }
+
+    #[test]
+    fn a_set_this_parser_has_never_seen_is_an_error_and_not_a_line_that_is_dropped() {
+        let error = parse("x.test", "set frobnicate 3\n").unwrap_err();
+        assert!(error.message.contains("frobnicate"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_sleep_is_read_in_the_unit_it_was_written_in() {
+        let text = "sleep 1 millisecond\n\nsleep 10 seconds\n";
+        let file = parse("x.test", text).unwrap();
+        let naps: Vec<&Directive> = file.records.iter().map(|r| &r.directive).collect();
+        assert_eq!(
+            naps,
+            vec![
+                &Directive::Sleep(Duration::from_millis(1)),
+                &Directive::Sleep(Duration::from_secs(10))
+            ]
+        );
     }
 
     #[test]
