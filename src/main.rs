@@ -1,8 +1,7 @@
 //! The harness command line.
 //!
 //! The subcommands are named in `spec/14-rudb-compat.md` and the CI job in the rudb repository
-//! calls them by name, so the names are a decision rather than an afterthought. All of them work
-//! now except `reduce`, which says so rather than printing something empty.
+//! calls them by name, so the names are a decision rather than an afterthought. All of them work.
 
 #![forbid(unsafe_code)]
 
@@ -17,6 +16,7 @@ use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
+use rudb_compat::reduce::{Alive, BUDGET, shrink};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
@@ -104,10 +104,13 @@ fn main() -> ExitCode {
         Some("coverage") => coverage(rest.get(1).copied(), pinned, messages, text(&args, "--out")),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
-        Some("reduce") => {
-            eprintln!("rudb-compat: not built yet, see spec/14-rudb-compat.md in tamnd/rudb");
-            ExitCode::FAILURE
-        }
+        Some("reduce") => reduce(
+            rest.get(1).copied(),
+            text(&args, "--file"),
+            messages,
+            through_shells,
+            valued(&args, "--budget").map_or(BUDGET, |n| usize::try_from(n).unwrap_or(BUDGET)),
+        ),
         Some("--help" | "-h") | None => {
             help();
             ExitCode::SUCCESS
@@ -174,8 +177,9 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 3] = ["--limit", "--memory", "--out"];
-    const PLAIN: [&str; 4] = ["--strict-messages", "--slow", "--refresh", "--pinned"];
+    const VALUED: [&str; 5] = ["--limit", "--memory", "--out", "--budget", "--file"];
+    const PLAIN: [&str; 6] =
+        ["--strict-messages", "--slow", "--refresh", "--pinned", "--shell", "--measure"];
     let mut out = Vec::new();
     let mut skip = false;
     for arg in args {
@@ -268,6 +272,88 @@ fn one(sql: &str, messages: MessageMatch, through_shells: bool, measure: Measure
             ExitCode::FAILURE
         }
     }
+}
+
+/// Shrink one failing statement down to the smallest one that still fails the same way.
+///
+/// It exits successfully when it reduced something, which is the opposite of what `query` does with
+/// the same difference. The two commands are asked different questions. `query` is asked whether
+/// these engines agree and answers no by failing. `reduce` is pointed at a disagreement somebody
+/// already has and asked to make it small, and it did that or it did not.
+fn reduce(
+    sql: Option<&str>,
+    file: Option<&str>,
+    messages: MessageMatch,
+    through_shells: bool,
+    budget: usize,
+) -> ExitCode {
+    let from_file = match file.map(std::fs::read_to_string) {
+        Some(Ok(text)) => Some(text),
+        Some(Err(e)) => {
+            eprintln!("rudb-compat: cannot read {}: {e}", file.unwrap_or_default());
+            return ExitCode::FAILURE;
+        }
+        None => None,
+    };
+    let Some(sql) = from_file.as_deref().or(sql) else {
+        eprintln!("rudb-compat: reduce needs a statement, or a file of one behind --file");
+        return ExitCode::FAILURE;
+    };
+    let (mut left, mut right) = match engines(through_shells) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut alive = match Alive::of(&mut *left, &mut *right, sql, messages) {
+        Ok(alive) => alive,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("keeping this alive, and a step that loses all of it is not kept");
+    for one in alive.keeping() {
+        println!("    {one}");
+    }
+    println!();
+    let reduced = match shrink(sql, budget, &mut |candidate| alive.keeps(candidate)) {
+        Ok(reduced) => reduced,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("{reduced}");
+    match alive.differences(&reduced.sql) {
+        Ok(differences) => {
+            for difference in &differences {
+                println!("    {difference}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The left engine and the right one, in the order everything here puts them in.
+type Pair = (Box<dyn Engine>, Box<dyn Engine>);
+
+/// Both engines, as the pair of things a comparison needs rather than as their own types.
+///
+/// `go` builds the same two without boxing because it hands them straight to a function that takes
+/// them by concrete type. Anything that keeps hold of both for longer than one call wants them
+/// behind the trait, because the only difference between the two ways of building them is which
+/// process the SQL ends up in.
+fn engines(through_shells: bool) -> Result<Pair, HarnessError> {
+    if through_shells {
+        return Ok((Box::new(Shell::duckdb()?), Box::new(Shell::rudb()?)));
+    }
+    Ok((Box::new(Duckdb::discover()?), Box::new(Rudb::new())))
 }
 
 /// Compare every statement in a file.
@@ -796,7 +882,10 @@ fn help() {
     println!("                report reads it back onto the published page.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
-    println!("  reduce        shrink a failing query to a minimal reproduction");
+    println!(
+        "  reduce <sql>  shrink a failing query to a minimal reproduction, keeping it failing"
+    );
+    println!("                the way it failed rather than only keeping it failing");
     println!("  report [path] run the corpus and write the published status page from that run");
     println!("  -V, --version print the version and exit");
     println!();
@@ -814,6 +903,11 @@ fn help() {
     println!("                     failed, disagreed, or took under ten milliseconds on both");
     println!("                     engines are not timed, and the reasons are in");
     println!("                     spec/sql/duckdb/09-the-harness.md section 9.7.");
+    println!("  --file <path>      where reduce reads the statement from, for the generated ones");
+    println!("                     that are too long to paste onto a command line");
+    println!("  --budget <n>       how many candidates one reduce may put to the engines, 2000 by");
+    println!("                     default. Every candidate is two engine runs and one of them is");
+    println!("                     a subprocess, so this is a clock rather than a memory limit.");
     println!("  --limit <seconds>  how long one statement may run, 10 by default");
     println!("  --memory <mb>      how large one file may get before it is cut off, 2048 default");
     println!("  --out <dir>        where report writes its page, target/report by default. Each");

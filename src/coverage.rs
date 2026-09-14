@@ -21,13 +21,12 @@
 //! other, because "we tested it and it was wrong" and "we never tested it" are different facts and a
 //! report that adds them together is a report that hides the second one.
 
-use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::compare::{Difference, MessageMatch, Ordering, Rules, Side, compare};
-use crate::engine::{Engine, HarnessError, Outcome};
+use crate::ask::differences;
+use crate::compare::{Difference, MessageMatch, Ordering, Rules};
+use crate::engine::{Engine, HarnessError};
 use crate::functions::{Overload, calls, volatile};
 
 /// What a run says about one overload row.
@@ -125,11 +124,10 @@ impl Scored {
 /// does it, because a full sweep is fifteen thousand calls and a run that prints nothing for twenty
 /// minutes looks like a run that has hung.
 ///
-/// An engine that comes apart on one call does not end the sweep. rudb is linked into this process
-/// rather than run beside it, so a panic in rudb is a panic here, and the first sweep that found one
-/// lost forty minutes of work to a single bad call. A panic is caught, recorded against the overload
-/// that caused it, and the engine that panicked is reset before the next call, because after an
-/// unwind nobody has promised anything about what is left.
+/// An engine that comes apart on one call does not end the sweep. That is [`crate::ask`] rather
+/// than anything here: a panic is caught, recorded against the overload that caused it, and the
+/// engine that panicked is reset before the next call. The first sweep that found one lost forty
+/// minutes of work to a single bad call, which is why it is a rule of the harness and not a flag.
 ///
 /// # Errors
 ///
@@ -157,12 +155,7 @@ pub fn score(
         let calls = calls(overload);
         let mut failures = Vec::new();
         for call in &calls {
-            let a = ask(left, &call.sql, Side::Left)?;
-            let b = ask(right, &call.sql, Side::Right)?;
-            let differences = match (a, b) {
-                (Answer::Ran(a), Answer::Ran(b)) => compare(&a, &b, rules),
-                (a, b) => a.crash().into_iter().chain(b.crash()).collect(),
-            };
+            let differences = differences(left, right, &call.sql, rules)?;
             if !differences.is_empty() {
                 failures.push(Failure {
                     sql: call.sql.clone(),
@@ -189,51 +182,6 @@ pub fn score(
         });
     }
     Ok(out)
-}
-
-/// What came back from an engine, which is an outcome or the engine coming apart.
-enum Answer {
-    /// The engine answered, with rows or with an error of its own.
-    Ran(Outcome),
-    /// The engine panicked, and this is what it said on the way down.
-    Panicked(Side, String),
-}
-
-impl Answer {
-    /// The difference this answer is, if it is one on its own.
-    fn crash(self) -> Option<Difference> {
-        match self {
-            Self::Ran(_) => None,
-            Self::Panicked(side, message) => Some(Difference::Panicked { side, message }),
-        }
-    }
-}
-
-/// Run one statement on one engine and catch it coming apart.
-///
-/// The reset after a panic is not optional. An unwind leaves whatever the engine was in the middle
-/// of half done, and going on to ask the same object another fifteen thousand questions would turn
-/// one crash into a run nobody can read. Resetting costs nothing here because these calls build no
-/// tables and read none.
-fn ask(engine: &mut dyn Engine, sql: &str, side: Side) -> Result<Answer, HarnessError> {
-    match catch_unwind(AssertUnwindSafe(|| engine.run(sql))) {
-        Ok(outcome) => outcome.map(Answer::Ran),
-        Err(payload) => {
-            engine.reset()?;
-            Ok(Answer::Panicked(side, said(&*payload)))
-        }
-    }
-}
-
-/// What a panic said, out of the box it comes in.
-fn said(payload: &(dyn Any + Send)) -> String {
-    if let Some(text) = payload.downcast_ref::<&str>() {
-        return (*text).to_owned();
-    }
-    if let Some(text) = payload.downcast_ref::<String>() {
-        return text.clone();
-    }
-    "a panic that carried no message".to_owned()
 }
 
 /// Why this overload is not going to be run, or nothing when it is.

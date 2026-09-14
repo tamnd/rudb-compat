@@ -143,6 +143,34 @@ pub enum Difference {
     },
 }
 
+impl Difference {
+    /// What kind of difference this is, in a form two of them can be compared by.
+    ///
+    /// The reducer keeps a step when the difference survives it, and surviving has to mean the same
+    /// difference rather than any difference at all. A cut that turns a wrong answer into a parse
+    /// error has not reduced anything, it has thrown one bug away and found another, and a reducer
+    /// that accepts it walks off the bug it was pointed at and reports something nobody asked about.
+    ///
+    /// So this keeps what makes one of these the bug it is and drops what makes it this instance of
+    /// it. The side, the error kind and the panic message stay, because those are the bug. The
+    /// values, the row and the column number go, because those are exactly what shrinking moves.
+    #[must_use]
+    pub fn signature(&self) -> String {
+        match self {
+            Self::OneErrored { side, error } => format!("only {side} errored, {}", error.kind),
+            Self::OneRejected { side, error } => format!("only {side} rejected it, {}", error.kind),
+            Self::ErrorKind { left, right } => format!("error kind {left} against {right}"),
+            Self::ErrorMessage { .. } => "error text".to_owned(),
+            Self::Width { .. } => "width".to_owned(),
+            Self::ColumnName { .. } => "column name".to_owned(),
+            Self::ColumnType { .. } => "column type".to_owned(),
+            Self::Height { .. } => "height".to_owned(),
+            Self::Panicked { side, message } => format!("{side} panicked, {message}"),
+            Self::Value { .. } => "value".to_owned(),
+        }
+    }
+}
+
 impl fmt::Display for Difference {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

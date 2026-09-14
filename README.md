@@ -70,6 +70,20 @@ Errors are compared too, by error kind, so a statement both engines reject count
 
 The full path is there behind `run` rather than `parse`: two engines, full result sets, column names and types, and a per-statement ordering rule that comes from rudb's own AST. `rudb-compat query 'SELECT 1'` runs one statement on both and prints what differs.
 
+A statement that differs goes to `rudb-compat reduce`, which shrinks it until nothing else can come out of it and it still fails the same way. Not until it still fails: a cut that turns a wrong answer into a parse error has thrown one bug away and found another, so every step is held to the difference the statement started with rather than to the statement failing at all. The moves are the ones a person makes by hand. Drop a clause, drop everything from a clause to the end, drop an item from a list, drop one side of an `AND`, replace a bracketed group by a constant, empty a string, shrink a number, delete a run of tokens. Each candidate goes through rudb's parser before either engine sees it, which throws most of them away for nothing, and there is a budget on how many reach the engines because every one of those is two runs and one of them is a subprocess.
+
+```
+$ rudb-compat reduce "SELECT a, b, date_part('microsecond', TIME '12:34:56.789') FROM (SELECT 1 AS a, 2 AS b) WHERE a = 1 ORDER BY a"
+keeping this alive, and a step that loses all of it is not kept
+    only the right engine errored, Binder Error
+
+SELECT date_part('microsecond', TIME '12:34:56.789')
+
+110 bytes down to 52, in 5 steps out of 38 candidates
+```
+
+It cuts on tokens and clause boundaries rather than on the parse tree, and the reason is worth saying rather than hiding. rudb parses into an arena AST, but the nodes carry no spans and there is no printer, so from outside the parser there is no way to say which bytes a node came from or to turn a node back into SQL. Tokens and bracket depth get most of the way there, because the cuts that matter are clause boundaries and items of a list at a depth and both of those are visible without a tree. Cutting on nodes needs one of those two things in rudb first, which is tamnd/rudb#519.
+
 The DuckDB side is a real binary built at a named commit, found on `PATH` or named by `RUDB_COMPAT_DUCKDB`. `rudb-compat duckdb` prints which one it found and whether it is the commit rudb vendors its grammar from.
 
 ```
@@ -100,7 +114,7 @@ The suites behind the four levels arrive with M2 in [`spec/17-milestones.md`](ht
 
 **Errors are results.** A query that errors on DuckDB has to error here, with a matching code and, where it is specified, a matching message. Succeeding where DuckDB fails is a failure, the same as failing where DuckDB succeeds.
 
-**Every failure is reduced and bisected automatically.** A forty-line generated query that returns the wrong answer tells you nothing about why. The harness shrinks it and then bisects it against the optimizer passes, so the report names the pass that introduced the difference. That is the single highest-value piece of tooling in here, because most wrong answers come from a rewrite and finding out which one by hand costs an afternoon each.
+**Every failure is reduced and bisected automatically.** A forty-line generated query that returns the wrong answer tells you nothing about why. The harness shrinks it and then bisects it against the optimizer passes, so the report names the pass that introduced the difference. That is the single highest-value piece of tooling in here, because most wrong answers come from a rewrite and finding out which one by hand costs an afternoon each. The shrinking half is `rudb-compat reduce` and it works. The bisector waits on rudb having a setting that turns one optimizer pass off.
 
 ## The four levels
 
