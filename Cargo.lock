@@ -69,7 +69,7 @@ source = "git+https://github.com/tamnd/rudb?branch=main#b651f4820702e2825ffb4506
 
 [[package]]
 name = "rudb-compat"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "rudb",
 ]
