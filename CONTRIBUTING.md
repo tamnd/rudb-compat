@@ -14,6 +14,20 @@ Read [CONTRIBUTING.md in tamnd/rudb](https://github.com/tamnd/rudb/blob/main/CON
 
 **A skip or an exclusion comes with an issue number.** A suite with silent exclusions reports a number that is not the number it claims to report. Excluded cases are counted and the count is published.
 
+## The compatibility rules this repository owns
+
+These come from `spec/sql/duckdb/` in tamnd/rudb, which is the plan this harness is the instrument for. Four of its rules live here rather than there, because this is the code that has to enforce them.
+
+**No failure reaches a human unreduced.** A difference found by any source goes through `reduce` before anybody reads it, and what gets filed is the minimal case and its hash. The cost of a compatibility project is not finding differences, it is the minutes spent per difference, and fifty thousand raw failures are a year of reading while the same failures reduced are a week of it.
+
+**No dialect enters the registry without a corpus, a fuzz target and a published pass rate.** A second query language that is measured by demos is a language whose gaps are found by users. The entry rule is the same one SQL is held to, on the same page, with the same denominator discipline.
+
+**No number on the report page that the harness did not compute, and no single headline percentage.** Every number carries its denominator and its provenance, which is the rudb commit, this commit, the DuckDB commit and binary hash, the corpus commit, the machine and the seed. A percentage without those six is a rumour. A number is allowed to go down, and a change that lowers one says why rather than hiding it.
+
+**Every feature that lands carries its resource ratios.** The harness records wall clock, CPU seconds and peak resident set for both engines on every record, out of the child process it already forks, and publishes the three ratios of rudb over DuckDB as medians with the interquartile range and never as a minimum. The goal is a tenth on all three. The timing exclusions are written down in the code rather than applied by feel, and a ratio taken on a shared machine is not a ratio.
+
+**A DuckDB bug found by this harness gets reproduced and filed in tamnd/duckdb.** Reduce it, confirm it against the pinned binary, and open the issue in our fork. Never upstream.
+
 ## Running it
 
 ```
