@@ -14,12 +14,12 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4096 files, 16412 passed, 59670 failed, which is 21.6 percent of what was attempted
+4096 files, 15807 passed, 56100 failed, which is 22.0 percent of what was attempted
 
-25033 records not attempted, by whose gap it is
-      13818  excused   the file turned the record off itself
-      10051  engine    something rudb does not have, which is the real gap
-       1098  harness   something this runner does not do, which is work here
+28763 records not attempted, by whose gap it is
+      13801  excused   the file turned the record off itself
+      14885  engine    something rudb does not have, which is the real gap
+         11  harness   something this runner does not do, which is work here
          66  machine   something the machine this ran on does not have
 ```
 
@@ -30,6 +30,8 @@ The skips are printed underneath rather than folded into the percentage, and the
 A `require` line is read the way DuckDB's own runner reads it, in `test/sqlite/sqllogic_test_runner.cpp`, and that is worth saying out loud because most of what the corpus requires is not a feature. `require skip_reload` tells DuckDB's runner not to reopen the database in the middle of the file, `require noforcestorage` tells it not to run the file in the mode that writes everything to disk first, and `require no_alternative_verify` turns off a debug mode. Upstream answers yes to every one of those on an ordinary build and runs the file. Reading them as a missing feature, which this runner did until recently, hid 579 files. The rate went from 23.0 percent to 21.6 percent when they came back, and that is the direction a number moves when it stops being computed over a corpus somebody quietly narrowed.
 
 What is left behind a real `require` is mostly one of four things, and all four are now on the engine row with a count: an extension rudb does not have, of which `json`, `icu` and `httpfs` are the largest, a `vector_size` above rudb's 1024, a `block_size`, which rudb has none of because it keeps its tables in memory, and the `tpch` and `tpcds` generators.
+
+A file stops where the database changes out from under it. Six hundred files in the corpus write something, say `restart`, and then check that what they wrote is still there, which is the whole point of the file. rudb keeps its tables in memory and cannot reopen a database, so running past the `restart` leaves the data exactly where it was and every check after it passes for precisely the reason the file was written to rule out. This runner now ends the file at the directive and puts the records after it on the engine row, named. That moved 4834 records onto that row, took 602 passes and 3573 failures out of the columns they did not belong in, and took the harness row from 1098 down to 11, because almost everything that row held was rudb having no storage rather than work in this repository. The one thing it does not end on is a `load` of a path under the corpus scratch directory that nothing has written to yet, which is an empty database however you open it, and that is most of the six hundred.
 
 Each file gets a process of its own, with ten seconds on a statement and two gigabytes on the process. That is not for speed, although it does make the run use every core. It is because the corpus deliberately contains queries that are meant to be enormous, `range(10000000000000000)` and hundred million row cross joins that are there to be stopped. Both limits are handed to the engine, so the normal way one of those ends is rudb raising an error the report can count against the record that asked for it. This process keeps a clock of its own at twelve times the statement limit and a cap on how large the child may get, as a backstop for an engine that does not stop when it is asked to. Twelve, because a file with ten slow statements in it is a file that exists and killing it would throw away the outcome the limits were handed down to produce. A file that reaches one of those is killed and named in the report, and its records are counted in neither column, because a file that was cut off part way through has records nobody has an answer for. No file reaches one today, which is why there is no such line above.
 
