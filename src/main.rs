@@ -17,7 +17,7 @@ use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::isolate::{Isolated, Limits};
-use rudb_compat::report::{Page, Provenance};
+use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
@@ -101,7 +101,7 @@ fn main() -> ExitCode {
             }
         },
         Some("functions") => functions(rest.get(1).copied(), pinned),
-        Some("coverage") => coverage(rest.get(1).copied(), pinned, messages),
+        Some("coverage") => coverage(rest.get(1).copied(), pinned, messages, text(&args, "--out")),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => {
@@ -438,9 +438,13 @@ fn report(
         }
     };
     let provenance = Provenance::gather(Path::new(root()), &dir, Rudb::new().version());
-    println!("{}", Page::of(&total, &provenance));
     let into = out.map_or_else(|| Path::new(root()).join(rudb_compat::report::DEST), PathBuf::from);
-    match rudb_compat::report::write(&into, &total, &provenance) {
+    // The function coverage number is a forty minute sweep and this is not one, so it is read back
+    // off the most recent sweep recorded here rather than measured again. No sweep on this machine
+    // leaves the page saying so, which is what it said before any of them existed.
+    let sweep = Sweep::latest(&into);
+    println!("{}", Page::of(&total, &provenance).with(sweep.as_ref()));
+    match rudb_compat::report::write(&into, &total, &provenance, sweep.as_ref()) {
         Ok(page) => {
             println!("written to {}", page.display());
             println!("appended to {}", into.join(rudb_compat::report::SERIES).display());
@@ -517,7 +521,17 @@ fn functions(name: Option<&str>, require: bool) -> ExitCode {
 /// A name narrows it to that name's overloads, which is how somebody works on one function without
 /// waiting for the whole catalog. With no name it is the full sweep, which is about fifteen thousand
 /// calls and takes a while, so `RUDB_COMPAT_WATCH` makes it say where it is.
-fn coverage(name: Option<&str>, require: bool, messages: MessageMatch) -> ExitCode {
+///
+/// A full sweep against the pinned binary is written down beside the published pages, where the next
+/// `report` run reads it back. A sweep over one name is not, and neither is one against some other
+/// DuckDB, because both of those are numbers about something narrower than what the page claims and
+/// a row that looks like the published one is worse than no row.
+fn coverage(
+    name: Option<&str>,
+    require: bool,
+    messages: MessageMatch,
+    out: Option<&str>,
+) -> ExitCode {
     let mut duckdb = match Duckdb::discover() {
         Ok(db) => db,
         Err(e) => {
@@ -525,7 +539,8 @@ fn coverage(name: Option<&str>, require: bool, messages: MessageMatch) -> ExitCo
             return ExitCode::FAILURE;
         }
     };
-    if duckdb.pin() != Pin::Pinned {
+    let pinned_binary = duckdb.pin() == Pin::Pinned;
+    if !pinned_binary {
         eprintln!(
             "rudb-compat: this is not the pinned DuckDB, so this number is about another one"
         );
@@ -568,8 +583,29 @@ fn coverage(name: Option<&str>, require: bool, messages: MessageMatch) -> ExitCo
         }
         println!();
     }
-    print!("{}", rudb_compat::coverage::coverage(&scored));
-    ExitCode::SUCCESS
+    let coverage = rudb_compat::coverage::coverage(&scored);
+    print!("{coverage}");
+    println!();
+    let into = out.map_or_else(|| Path::new(root()).join(rudb_compat::report::DEST), PathBuf::from);
+    if let Some(name) = name {
+        println!("not recorded, this was {name} on its own and not the whole catalog");
+        return ExitCode::SUCCESS;
+    }
+    if !pinned_binary {
+        println!("not recorded, this DuckDB is not the pinned one");
+        return ExitCode::SUCCESS;
+    }
+    let provenance = Provenance::of_machine(Path::new(root()), rudb.version());
+    match rudb_compat::report::record(&into, &coverage, &provenance) {
+        Ok(file) => {
+            println!("recorded in {}, where report reads it back", file.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Which directory a corpus run reads.
@@ -755,7 +791,9 @@ fn help() {
     println!("  functions [n] print the function catalog off the pinned DuckDB, or the calls the");
     println!("                generator would put to the overloads of one name");
     println!("  coverage [n]  run those calls on both engines and print the function coverage");
-    println!("                number, over one name if given and over the whole catalog if not");
+    println!("                number, over one name if given and over the whole catalog if not.");
+    println!("                A full sweep against the pinned binary is also written down where");
+    println!("                report reads it back onto the published page.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!("  reduce        shrink a failing query to a minimal reproduction");
@@ -781,7 +819,9 @@ fn help() {
     println!("  --out <dir>        where report writes its page, target/report by default. Each");
     println!("                     run is a new file and one row appended to series.tsv beside");
     println!("                     it, because a page that is overwritten cannot go down in");
-    println!("                     front of anybody.");
+    println!("                     front of anybody. coverage takes the same flag and appends a");
+    println!("                     row to coverage.tsv in the same place, which is the file the");
+    println!("                     page carries the function coverage number off.");
     println!();
     println!("Each file in an slt run gets a process of its own, because the corpus contains");
     println!("queries that are meant to be enormous. Both limits are handed to the engine, which");
