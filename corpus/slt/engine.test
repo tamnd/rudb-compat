@@ -1,0 +1,80 @@
+# name: corpus/slt/engine.test
+# description: the optimizer pass list and the extension list, which is what a tool reads on connect
+# group: [smoke]
+
+# The table means the names SET disabled_optimizers takes, and both engines take the same forty four.
+query I
+SELECT count(*) FROM duckdb_optimizers();
+----
+44
+
+# The eight passes rudb has written are eight of those forty four rather than names of its own, which
+# is what makes a file written against DuckDB turn off the pass it meant.
+query I
+SELECT count(*) FROM duckdb_optimizers() WHERE name IN ('expression_rewriter', 'distinct_aggregate_rewrite', 'filter_pushdown', 'empty_result_pullup', 'unused_columns', 'limit_pushdown', 'top_n', 'late_materialization');
+----
+8
+
+# And a name the table gives is a name the setting takes.
+statement ok
+SET disabled_optimizers = 'join_order,filter_pushdown';
+
+statement ok
+SET disabled_optimizers = '';
+
+query I
+SELECT count(*) FROM duckdb_extensions();
+----
+31
+
+# Parquet is built into both engines and reports the same four columns for it. Twenty one of the
+# thirty one are not installed in either, and that is the whole of the agreement on the booleans:
+# DuckDB has icu, json, shell and autocomplete statically linked and rudb does not, so those four
+# rows are left out of this record rather than asserted.
+query TTTT
+SELECT loaded, installed, install_path, install_mode FROM duckdb_extensions() WHERE extension_name = 'parquet';
+----
+true	true	(BUILT-IN)	STATICALLY_LINKED
+
+query TTT
+SELECT loaded, installed, install_mode FROM duckdb_extensions() WHERE extension_name = 'spatial';
+----
+false	false	NOT_INSTALLED
+
+query I
+SELECT count(*) FROM duckdb_extensions() WHERE extension_name IN ('avro', 'aws', 'azure', 'delta', 'ducklake', 'encodings', 'excel', 'fts', 'iceberg', 'inet', 'lance', 'motherduck', 'mysql_scanner', 'odbc_scanner', 'postgres_scanner', 'quack', 'tpcds', 'ui', 'unity_catalog', 'vortex', 'vss');
+----
+21
+
+# The aliases are a fact about the extension rather than about the engine, so they are the same on
+# both sides, and an extension with none carries an empty list rather than a null.
+query TT
+SELECT extension_name, aliases FROM duckdb_extensions() WHERE extension_name IN ('httpfs', 'parquet', 'sqlite_scanner') ORDER BY extension_name;
+----
+httpfs	[http, https, s3]
+parquet	[]
+sqlite_scanner	[sqlite, sqlite3]
+
+query TT
+SELECT extension_name, description FROM duckdb_extensions() WHERE extension_name IN ('core_functions', 'tpch') ORDER BY extension_name;
+----
+core_functions	Core function library
+tpch	Adds TPC-H data generation and query support
+
+# An extension that is not installed reports empty strings and not nulls, and the fingerprint is null
+# on every row including the ones that are built in.
+query TTT
+SELECT extension_version = '', installed_from = '', install_path = '' FROM duckdb_extensions() WHERE extension_name = 'spatial';
+----
+true	true	true
+
+query T
+SELECT signature_key_fingerprint IS NULL FROM duckdb_extensions() WHERE extension_name = 'parquet';
+----
+true
+
+# Both of these are table functions, so both list themselves in the function table.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('duckdb_extensions', 'duckdb_optimizers');
+----
+2
