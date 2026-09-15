@@ -13,7 +13,7 @@ use std::time::Duration;
 use rudb_compat::Level;
 use rudb_compat::compare::{MessageMatch, Ordering, Rules};
 use rudb_compat::conform::{Reason, Skipped, Summary};
-use rudb_compat::cost::{Costs, Measured};
+use rudb_compat::cost::Costs;
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::grammar::{RULE, STATEMENTS};
@@ -23,7 +23,7 @@ use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::queries::{Histogram, Query, histogram};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::replay::{self, Note};
-use rudb_compat::report::{Page, Provenance, Sweep};
+use rudb_compat::report::{Cost, Page, Provenance, Sweep};
 use rudb_compat::resource::{RUNS, Ratios, Spread};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::{Session, Shell};
@@ -153,6 +153,7 @@ fn main() -> ExitCode {
             valued(&args, "--runs").map_or(RUNS, |n| usize::try_from(n).unwrap_or(RUNS)),
             text(&args, "--group"),
             valued(&args, "--seconds").unwrap_or(SECONDS),
+            text(&args, "--out"),
         ),
         Some("vendor") => fetch(refresh),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
@@ -1000,8 +1001,13 @@ fn report(
     // off the most recent sweep recorded here rather than measured again. No sweep on this machine
     // leaves the page saying so, which is what it said before any of them existed.
     let sweep = Sweep::latest(&into);
-    println!("{}", Page::of(&total, &provenance).with(sweep.as_ref()));
-    match rudb_compat::report::write(&into, &total, &provenance, sweep.as_ref()) {
+    // The three resource ratios come off the benchmark corpus and not this one, because a
+    // sqllogictest record only means anything under a session that replayed every record before it,
+    // so timing one would time the replay. Read back the same way the sweep is, off the most recent
+    // cost run recorded here.
+    let cost = Cost::latest(&into);
+    println!("{}", Page::of(&total, &provenance).with(sweep.as_ref()).with_cost(cost.as_ref()));
+    match rudb_compat::report::write(&into, &total, &provenance, sweep.as_ref(), cost.as_ref()) {
         Ok(page) => {
             println!("written to {}", page.display());
             println!("appended to {}", into.join(rudb_compat::report::SERIES).display());
@@ -1140,9 +1146,6 @@ fn print_queries(found: &Histogram, overloads: usize, limit: usize) {
     println!("function spelled as a keyword score nothing and read here as unused.");
 }
 
-/// How many of the worst benchmarks the cost page prints.
-const WORST: usize = 20;
-
 /// How long one process of one engine gets before the benchmark is called refused.
 ///
 /// A minute is long for a benchmark cut down to a million rows and short next to a run of the
@@ -1162,12 +1165,19 @@ const SECONDS: u64 = 60;
 /// storage format yet, so there is no way to build a table once and time a query against it. The
 /// load is measured on its own as well and its share is printed beside every row, because a number
 /// that is nine tenths `CREATE TABLE` and does not say so sends people to the wrong file.
+///
+/// What it found is written down beside the pages, where `report` reads it back, on the same terms
+/// the function sweep is recorded on. A run narrowed by `--count` or `--group` is not recorded,
+/// because a ratio over eleven benchmarks somebody picked is not the ratio the page is about, and
+/// neither is a run against a DuckDB that is not the pin, because the divisor came from another
+/// database.
 fn cost(
     refresh: bool,
     count: Option<usize>,
     runs: usize,
     group: Option<&str>,
     seconds: u64,
+    out: Option<&str>,
 ) -> ExitCode {
     let limit = Duration::from_secs(seconds);
     let (ours, theirs) = match (Shell::rudb(), Shell::duckdb()) {
@@ -1216,7 +1226,36 @@ fn cost(
         }
     }
     print_costs(&costs, wanted.len(), runs, seconds);
-    ExitCode::SUCCESS
+    println!();
+    record_costs(&costs, out, count.is_some() || group.is_some())
+}
+
+/// Write a cost run down beside the pages, or say why it was not written.
+///
+/// A run that is not recorded still printed everything above, so this never fails the command. The
+/// numbers are on screen either way and the file is what the published page reads, which are two
+/// different jobs.
+fn record_costs(costs: &Costs, out: Option<&str>, narrowed: bool) -> ExitCode {
+    let into = out.map_or_else(|| Path::new(root()).join(rudb_compat::report::DEST), PathBuf::from);
+    if narrowed {
+        println!("not recorded, this was a run somebody narrowed and not the whole corpus");
+        return ExitCode::SUCCESS;
+    }
+    if !Duckdb::discover().is_ok_and(|db| db.is_pinned()) {
+        println!("not recorded, this DuckDB is not the pinned one");
+        return ExitCode::SUCCESS;
+    }
+    let provenance = Provenance::of_machine(Path::new(root()), Rudb::new().version());
+    match rudb_compat::report::measured(&into, costs, &provenance) {
+        Ok(file) => {
+            println!("recorded in {}, where report reads it back", file.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: the numbers are above but they were not recorded: {e}");
+            ExitCode::SUCCESS
+        }
+    }
 }
 
 /// Print a cost run at the three granularities the milestone asks for.
@@ -1265,7 +1304,7 @@ fn print_costs(costs: &Costs, asked: usize, runs: usize, seconds: u64) {
             );
         }
     }
-    let worst = costs.worst(WORST);
+    let worst = costs.worst(rudb_compat::report::WORST);
     if !worst.is_empty() {
         println!();
         println!("the worst {}, which is the column to read", worst.len());
@@ -1275,7 +1314,7 @@ fn print_costs(costs: &Costs, asked: usize, runs: usize, seconds: u64) {
                 "{:<44}{:>9.2}{:>9.2}{:>11.0}%",
                 short(&one.name, 43),
                 one.time(),
-                memory(one),
+                one.memory(),
                 one.load_share() * 100.0
             );
         }
@@ -1318,15 +1357,6 @@ fn print_ratios(ratios: &Ratios) {
     if ratios.at_goal() {
         println!("  all three are at the goal of a tenth");
     }
-}
-
-/// Peak resident set, rudb over the pin.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "a resident set a double cannot count does not exist"
-)]
-fn memory(one: &Measured) -> f64 {
-    if one.theirs.peak == 0 { 0.0 } else { one.ours.peak as f64 / one.theirs.peak as f64 }
 }
 
 /// A name cut to something a column can hold.
@@ -1670,8 +1700,10 @@ fn help() {
     println!("  cost          measure that same corpus on both engines and print the three");
     println!("                ratios, time, processor time and peak memory, at three");
     println!("                granularities: the whole corpus, per suite, and the worst twenty.");
-    println!("                The median of five runs with the quartiles beside it. Takes");
-    println!("                --count, --runs, --group and --seconds.");
+    println!("                The median of five runs with the quartiles beside it. A whole run");
+    println!("                against the pinned binary is recorded beside the pages, where");
+    println!("                report reads it back. Takes --count, --runs, --group, --seconds");
+    println!("                and --out.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  levels        print the four compatibility levels and their current status");
     println!(
@@ -1716,7 +1748,9 @@ fn help() {
     println!("                     it, because a page that is overwritten cannot go down in");
     println!("                     front of anybody. coverage takes the same flag and appends a");
     println!("                     row to coverage.tsv in the same place, which is the file the");
-    println!("                     page carries the function coverage number off.");
+    println!("                     page carries the function coverage number off. cost takes it");
+    println!("                     too and writes its rows to cost.tsv there, which is where the");
+    println!("                     page carries the three resource ratios off.");
     println!();
     println!("Each file in an slt run gets a process of its own, because the corpus contains");
     println!("queries that are meant to be enormous. Both limits are handed to the engine, which");

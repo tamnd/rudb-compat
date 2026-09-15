@@ -391,28 +391,85 @@ RUDB_COMPAT_RUDB=/path/to/rudb rudb-compat cost --runs 5 --seconds 30
 
 ```
 benchmarks 845
-measured   32
-refused    339, which is one engine declining it or taking too long
+measured   34
+refused    337, which is one engine declining it or taking too long
       107  rudb-shell said Not implemented Error
       100  the load: rudb-shell said Not implemented Error
        65  the load: rudb-shell said Catalog Error
        41  rudb-shell said Catalog Error
-        9  rudb-shell said Timeout
+        8  the load: rudb-shell said Parser Error
+        6  rudb-shell said Timeout
+        4  rudb-shell said Binder Error
+        3  the load: rudb-shell said Binder Error
+        1  rudb-shell said Error
+        1  rudb-shell said Parser Error
+        1  the load: duckdb-shell said Timeout
 skipped    474
 
 whole corpus
-  time        1.30   quartiles 0.43 to 3.01 over 32 benchmarks
-  cpu         0.94   quartiles 0.35 to 1.81 over 32 benchmarks
-  memory      0.28   quartiles 0.27 to 0.38 over 32 benchmarks
+  time        0.48   quartiles 0.28 to 0.76 over 34 benchmarks
+  cpu         1.54   quartiles 0.73 to 2.64 over 34 benchmarks
+  memory      0.30   quartiles 0.24 to 0.40 over 34 benchmarks
 ```
 
-Memory is the one that is going the right way, at a bit over a quarter of what the pinned binary uses, and the goal is a tenth. Time is a shade worse than even and the quartiles are wide, which is the honest summary of an engine with some operators finished and some not. Per suite it is joins at nineteen times and everything else between a third and twice, and the worst single benchmark is a hash join at twenty five times, which is what an engine with no hash join yet looks like from the outside.
+Wall clock and memory are going the right way and processor time is not, which is exactly the case three ratios exist to catch. The median benchmark finishes in a bit under half the pinned binary's elapsed time on under a third of its peak memory, and spends half again as much processor time doing it. An engine ahead on the clock and behind on the meter is getting its speed from cores rather than from work, and a report that published elapsed time alone would have said rudb was twice as fast and stopped there.
 
-A benchmark here is the load and the query in one process rather than the query on its own, and that is not a shortcut. rudb has no storage format yet, tamnd/rudb#103, so there is no way to build a table once and time a query against it afterwards. Both engines are handed the load as setup statements and the query after it, the process is what gets measured, and the load is measured again on its own so the share of each number that is ingestion can be printed beside it. Most of these are eighty percent load, which is worth knowing before anybody reads a ratio as a statement about the query.
+Per suite it is the join family at twenty four times and everything else between a third and two thirds. The worst single benchmark is a range join at two hundred and seven times the elapsed time and eight hundred times the processor time, which is a nested loop against an engine that has a range join operator, and the next two are hash joins at twenty four times on ten times the peak memory. None of that makes the median, though. The median is 0.48 and the goal is 0.1, so the work ahead is a factor of five across the whole corpus as well as two orders of magnitude on the joins.
+
+A benchmark here is the load and the query in one process rather than the query on its own, and that is not a shortcut. rudb has no storage format yet, tamnd/rudb#103, so there is no way to build a table once and time a query against it afterwards. Both engines are handed the load as setup statements and the query after it, the process is what gets measured, and the load is measured again on its own so the share of each number that is ingestion can be printed beside it. The median benchmark is eighty eight percent load, which is worth knowing before anybody reads one of these ratios as a statement about a query.
 
 The row counts are cut down. The suite builds tables of a hundred million rows because it is a benchmark suite for a finished database, and every `range` and `generate_series` argument above a million is brought down to a million before either engine sees it. Nothing else is rewritten, so a modulus or a seed or a hash constant is still whatever its author wrote. That makes these ratios at a million rows and nothing else, which is a smaller claim than the one `tamnd/rudb-bench` exists to make.
 
-Two thirds of the corpus produces no ratio and the reasons are counted rather than dropped. Four hundred and seventy four are skipped before either engine sees them, almost all of them behind a `require` for httpfs or parquet or json or one of the two data generators. Three hundred and thirty nine are refused, which is one engine declining the load or the query, and every one of those is rudb: a hundred and seven not implemented, a hundred more in the load, and a hundred and six between a catalog, binder or parser error. Nine are rudb taking longer than thirty seconds on something the pinned binary answers in under one, and those are the interesting ones, because a benchmark stopped on our side leaves the ratios above rather than making them worse. The timeout count is part of the result and not a footnote.
+Two thirds of the corpus produces no ratio and the reasons are counted rather than dropped. Four hundred and seventy four are skipped before either engine sees them, almost all of them behind a `require` for httpfs or parquet or json or one of the two data generators, and thirty seven because they read or write a file that is not in the sparse checkout. Three hundred and thirty seven are refused, which is one engine declining the load or the query, and all but one of those is rudb: a hundred and seven not implemented, a hundred more not implemented in the load, and a hundred and twenty two between a catalog, binder and parser error. Six are rudb taking longer than thirty seconds on something the pinned binary answers in under one, and those are the interesting ones, because a benchmark stopped on our side leaves the ratios above rather than making them worse. The timeout count is part of the result and not a footnote.
+
+The one that is not ours is a load the pinned binary did not finish in thirty seconds either, which is the first time the other side has been the one to run out of time.
+
+## Those ratios on the published page
+
+They do not stay in the terminal. A whole run against the pinned binary appends its rows to `target/report/cost.tsv` beside the pages, and `rudb-compat report` reads the most recent of them back and prints a Resources section on the page, at the three granularities section 11.2 of `spec/sql/duckdb/11-the-number.md` asks for: the whole corpus, then per suite, then the worst twenty.
+
+Carried onto the page rather than computed there, the same way the function coverage number is, and for the same reason. A cost run is four measurements per benchmark and five processes per engine per measurement, over eight hundred and forty five benchmarks, and it took thirty five minutes on server2 with most of the corpus refused. A corpus run is minutes and goes on every commit. So the page says when and where the ratios were measured and whether that was the same engine build on the same machine as the corpus numbers above them, and a reader who finds it was not does not have to compare two commits themselves to notice.
+
+```
+### The whole corpus
+
+    time        0.48   quartiles 0.28 to 0.76 over 34 benchmarks
+    cpu         1.54   quartiles 0.73 to 2.64 over 34 benchmarks
+    memory      0.30   quartiles 0.24 to 0.40 over 34 benchmarks
+
+### Per suite
+
+    suite                        time      cpu   memory      n
+    join                        24.27    15.94     0.16      5
+    timestamp                    0.60     2.62     0.31      2
+    cast                         0.55     1.28     0.31     10
+    aggregate                    0.43     0.81     0.36      3
+    micro                        0.34     0.71     0.34      4
+    case                         0.33     1.20     0.30      3
+    date                         0.33     1.36     0.23      3
+
+### The worst 20
+
+    benchmark                                    time      cpu   memory    load
+    Range Join                                 207.27   813.69     0.16     82%
+    Hash Join Dictionary Emit + Probe           24.53    22.18    10.31     79%
+    Hash Join Constant Probe                    24.27    15.94     8.23    100%
+    Order By (Single Integer)                    8.46     7.17     2.85     27%
+    Big case                                     4.77     8.95     0.17     11%
+
+    measured    2026-09-15 01:52:40 UTC on vmi3112167
+    engine      rudb from git at 4561d0da83
+    rudb-compat a3b256db82, dirty
+    duckdb      v2.0.0-dev84237 (Development Version) cc7e7bac7f
+```
+
+The worst list is cut to five above and the page prints twenty. The processor time column is the one the terminal output does not have room for and the page does, and it earns its place on the first row: a range join at two hundred times the elapsed time and eight hundred times the processor time is a nested loop burning every core it can get, and the elapsed number on its own would have made it look four times better than it is.
+
+One run writes several rows to that file and the rows of a run share their stamp and their machine, which is how they are read back as one measurement. The scope column says whether a row is the corpus, a suite or a benchmark. It is a denormalised table on purpose: the six provenance fields and the three run totals repeat on every row, because the alternative is a row whose meaning depends on another row somewhere above it, and one row of a file like this should say what it is a measurement of on its own.
+
+A run narrowed with `--count` or `--group` is not recorded. A ratio over eleven benchmarks somebody picked is a useful thing to look at and it is not the ratio the page is about. Neither is a run against a DuckDB that is not the pin, because then the divisor came from another database. Both cases print what they found and say they were not written down, which is the same rule `coverage` follows.
+
+Until a machine has run one, the three ratios stay in the list of numbers the page does not say yet, with the command that would produce them beside them. That list is the point of the page as much as the numbers are.
 
 ## Getting a generated run back
 

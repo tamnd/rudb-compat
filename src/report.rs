@@ -4,19 +4,20 @@
 //! and never edited by hand, with eleven numbers on it, each with a denominator and a provenance,
 //! and no single headline percentage anywhere. This module writes that page.
 //!
-//! Three of the eleven have nothing behind them today: statement coverage, the five error levels
-//! and the three resource ratios. They are printed under a heading that says so and names what
-//! would produce each one, rather than being left off the page or printed as a zero. A zero is a
-//! measurement and a missing measurement is not, and the difference between the two is the whole of
-//! section 1.2.
+//! Two of the eleven have nothing behind them today: statement coverage and the five error levels.
+//! They are printed under a heading that says so and names what would produce each one, rather than
+//! being left off the page or printed as a zero. A zero is a measurement and a missing measurement
+//! is not, and the difference between the two is the whole of section 1.2.
 //!
-//! Function coverage is the fourth of those and it is measured now, but not by this command. The
-//! sweep behind it is every generated call to every overload in the catalog put to both engines,
-//! which is forty minutes, and this page comes out of a corpus run that takes a fraction of that.
-//! So `rudb-compat coverage` writes one row down beside the pages and this page reads the most
-//! recent one back and says when and where it was measured. A number carried from another run is
-//! worth having and is not the same thing as a number out of this run, and the page says which it
-//! is looking at.
+//! Two more are measured now but not by this command: function coverage, and the three resource
+//! ratios. The sweep behind the first is every generated call to every overload in the catalog put
+//! to both engines, which is forty minutes. The second comes off the benchmark corpus rather than
+//! the sqllogictest one, because a sqllogictest record only means anything under a session that
+//! replayed every record before it, so timing one would time the replay. This page comes out of a
+//! corpus run that takes a fraction of either. So `rudb-compat coverage` and `rudb-compat cost` each
+//! write down what they found beside the pages, and this page reads the most recent of each back and
+//! says when and where it was measured. A number carried from another run is worth having and is not
+//! the same thing as a number out of this run, and the page says which it is looking at.
 //!
 //! The provenance is gathered best effort. Every field that cannot be found says what it could not
 //! find, because a page that refuses to be written because git is not on the machine is worse than
@@ -28,10 +29,12 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::conform::Reason;
+use crate::cost::{Costs, Measured};
 use crate::coverage::{Coverage, Tally, Untested};
 use crate::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use crate::engine::{Engine, HarnessError};
 use crate::isolate::Isolated;
+use crate::resource::{Ratios, Spread};
 use crate::vendor;
 
 /// Where the pages go when nobody says otherwise, relative to the crate root.
@@ -94,6 +97,62 @@ pub const SWEEP_COLUMNS: [&str; 18] = [
     "kind_not_called",
     "volatile",
 ];
+
+/// The file every cost run appends its rows to, beside the pages.
+///
+/// A third file for the same reason [`SWEEPS`] is a second one. A cost run drives both engines five
+/// times per measurement over a corpus of benchmarks and takes a long time, a corpus run is minutes,
+/// and a table where either one leaves half the columns empty is a table nobody can read down.
+pub const COSTS: &str = "cost.tsv";
+
+/// The columns of that file, in order.
+///
+/// One run writes several rows: one for the whole corpus, one per suite, and one per benchmark in
+/// the worst [`WORST`]. The rows of a run share the `when` and `machine` fields, which is how they
+/// are read back as one measurement, and the six provenance fields and the three run totals are
+/// repeated on every row rather than written once. That is a denormalised table on purpose, because
+/// the alternative is a row whose meaning depends on another row somewhere above it, and one row of
+/// this file should say what it is a measurement of on its own.
+pub const COST_COLUMNS: [&str; 22] = [
+    "when",
+    "machine",
+    "rudb",
+    "rudb_commit",
+    "compat_commit",
+    "duckdb",
+    "scope",
+    "what",
+    "benchmarks",
+    "time",
+    "time_low",
+    "time_high",
+    "cpu",
+    "cpu_low",
+    "cpu_high",
+    "memory",
+    "memory_low",
+    "memory_high",
+    "load_share",
+    "measured",
+    "skipped",
+    "refused",
+];
+
+/// How many of the worst benchmarks a cost run prints and records.
+///
+/// Section 11.2 says twenty and says why: an engine that is even on average and two hundred times
+/// slower on one shape has a bug rather than a distribution, and twenty rows is enough to see
+/// whether the worst is one shape or a spread.
+pub const WORST: usize = 20;
+
+/// What a cost row is a measurement of.
+const CORPUS: &str = "corpus";
+
+/// A row that is one suite of the benchmark corpus.
+const SUITE: &str = "suite";
+
+/// A row that is one benchmark on its own.
+const BENCHMARK: &str = "benchmark";
 
 /// Everything about the run that is not a number out of it.
 ///
@@ -288,20 +347,21 @@ impl Sweep {
         if fields.len() != SWEEP_COLUMNS.len() {
             return None;
         }
+        let columns = &SWEEP_COLUMNS[..];
         let mut reasons = Vec::with_capacity(Untested::ALL.len());
         for why in Untested::ALL {
-            reasons.push((why, number(&fields, column(why))?));
+            reasons.push((why, number(columns, &fields, column(why))?));
         }
         Some(Self {
-            stamp: word(&fields, "when")?.to_owned(),
-            host: word(&fields, "machine")?.to_owned(),
-            rudb: word(&fields, "rudb")?.to_owned(),
-            rudb_commit: word(&fields, "rudb_commit")?.to_owned(),
-            compat_commit: word(&fields, "compat_commit")?.to_owned(),
-            duckdb_version: word(&fields, "duckdb")?.to_owned(),
+            stamp: word(columns, &fields, "when")?.to_owned(),
+            host: word(columns, &fields, "machine")?.to_owned(),
+            rudb: word(columns, &fields, "rudb")?.to_owned(),
+            rudb_commit: word(columns, &fields, "rudb_commit")?.to_owned(),
+            compat_commit: word(columns, &fields, "compat_commit")?.to_owned(),
+            duckdb_version: word(columns, &fields, "duckdb")?.to_owned(),
             names: tally(&fields, "names")?,
             overloads: tally(&fields, "overloads")?,
-            crashes: number(&fields, "crashes")?,
+            crashes: number(columns, &fields, "crashes")?,
             reasons,
         })
     }
@@ -327,24 +387,212 @@ const fn column(why: Untested) -> &'static str {
 }
 
 /// One named field of a row, or nothing when the name is not a column.
-fn word<'a>(fields: &[&'a str], name: &str) -> Option<&'a str> {
-    let at = SWEEP_COLUMNS.iter().position(|column| *column == name)?;
+///
+/// By name and not by position, so that a row and its header cannot drift apart without the reader
+/// stopping rather than reporting the column next to the one it meant.
+fn word<'a>(columns: &[&str], fields: &[&'a str], name: &str) -> Option<&'a str> {
+    let at = columns.iter().position(|column| *column == name)?;
     fields.get(at).copied()
 }
 
 /// One named field of a row as a count.
-fn number(fields: &[&str], name: &str) -> Option<usize> {
-    word(fields, name)?.parse().ok()
+fn number(columns: &[&str], fields: &[&str], name: &str) -> Option<usize> {
+    word(columns, fields, name)?.parse().ok()
+}
+
+/// One named field of a row as a ratio.
+fn real(columns: &[&str], fields: &[&str], name: &str) -> Option<f64> {
+    word(columns, fields, name)?.parse().ok()
 }
 
 /// The four columns of one tally, which are its name and its name with three suffixes.
 fn tally(fields: &[&str], what: &str) -> Option<Tally> {
+    let columns = &SWEEP_COLUMNS[..];
     Some(Tally {
-        total: number(fields, what)?,
-        passed: number(fields, &format!("{what}_passed"))?,
-        failed: number(fields, &format!("{what}_failed"))?,
-        untested: number(fields, &format!("{what}_untested"))?,
+        total: number(columns, fields, what)?,
+        passed: number(columns, fields, &format!("{what}_passed"))?,
+        failed: number(columns, fields, &format!("{what}_failed"))?,
+        untested: number(columns, fields, &format!("{what}_untested"))?,
     })
+}
+
+/// One benchmark rudb is slow on, as the worst list records it.
+///
+/// Three ratios and no quartiles, because a benchmark on its own is one number on each axis. The
+/// quartile columns of its row in the file repeat the median, since there is nothing else they could
+/// truthfully say, and this struct does not carry them so that nobody reads a spread into them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Worst {
+    /// What the benchmark calls itself.
+    pub name: String,
+    /// Wall clock, rudb over the pin.
+    pub time: f64,
+    /// Processor time, rudb over the pin.
+    pub cpu: f64,
+    /// Peak resident set, rudb over the pin.
+    pub memory: f64,
+    /// How much of the number is the load rather than the query.
+    pub load_share: f64,
+}
+
+/// One cost run, as it is written down and read back.
+///
+/// The three granularities section 11.2 asks for, in one value: the whole corpus, then per suite,
+/// then the benchmarks rudb is worst on. The benchmarks nobody could measure are not in it beyond
+/// their counts, for the same reason a sweep does not carry its failing calls: they go to whoever ran
+/// it, in full, and what belongs on a page is the numbers and enough provenance to say what they are
+/// numbers about.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cost {
+    /// When the run happened, in UTC.
+    pub stamp: String,
+    /// The machine it ran on. Section 11.2 excludes server3 from producing these, because a ratio
+    /// off a shared machine is not a ratio, and this is the field that says which machine it was.
+    pub host: String,
+    /// The rudb version on one side of every ratio.
+    pub rudb: String,
+    /// The commit that rudb was built from.
+    pub rudb_commit: String,
+    /// The commit of this harness, with a note when the tree was dirty.
+    pub compat_commit: String,
+    /// What the DuckDB on the other side of every ratio called itself.
+    pub duckdb_version: String,
+    /// How many benchmarks both engines answered.
+    pub measured: usize,
+    /// How many were never put to an engine.
+    pub skipped: usize,
+    /// How many an engine declined or took too long over.
+    pub refused: usize,
+    /// The three ratios over everything measured, when anything was.
+    pub overall: Option<Ratios>,
+    /// The median load share over everything measured, which is how much of the whole number is
+    /// building the tables rather than reading them.
+    pub load_share: f64,
+    /// The three ratios per suite, worst median wall clock first.
+    pub groups: Vec<(String, Ratios)>,
+    /// The benchmarks rudb is worst on, slowest first.
+    pub worst: Vec<Worst>,
+}
+
+impl Cost {
+    /// The most recent cost run recorded beside the pages in a directory, if there is one.
+    ///
+    /// The rows of one run share a stamp and a machine, so the last row that parses names the run to
+    /// read back and every row with that pair belongs to it. Rows a half written file left behind are
+    /// stepped over rather than reported, and no cost run at all is nothing rather than an error.
+    #[must_use]
+    pub fn latest(dir: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(dir.join(COSTS)).ok()?;
+        let rows: Vec<Row> = text.lines().filter_map(Row::parse).collect();
+        let last = rows.last()?;
+        let (stamp, host) = (last.stamp.clone(), last.host.clone());
+        Self::assembled(rows.iter().filter(|row| row.stamp == stamp && row.host == host))
+    }
+
+    /// The rows of one run, back into the run they were written from.
+    fn assembled<'a>(rows: impl Iterator<Item = &'a Row>) -> Option<Self> {
+        let mut cost: Option<Self> = None;
+        for row in rows {
+            let into = cost.get_or_insert_with(|| Self {
+                stamp: row.stamp.clone(),
+                host: row.host.clone(),
+                rudb: row.rudb.clone(),
+                rudb_commit: row.rudb_commit.clone(),
+                compat_commit: row.compat_commit.clone(),
+                duckdb_version: row.duckdb_version.clone(),
+                measured: row.measured,
+                skipped: row.skipped,
+                refused: row.refused,
+                overall: None,
+                load_share: 0.0,
+                groups: Vec::new(),
+                worst: Vec::new(),
+            });
+            match row.scope.as_str() {
+                CORPUS => {
+                    into.overall = Some(row.ratios);
+                    into.load_share = row.load_share;
+                }
+                SUITE => into.groups.push((row.what.clone(), row.ratios)),
+                BENCHMARK => into.worst.push(Worst {
+                    name: row.what.clone(),
+                    time: row.ratios.time.median,
+                    cpu: row.ratios.cpu.median,
+                    memory: row.ratios.memory.median,
+                    load_share: row.load_share,
+                }),
+                _ => {}
+            }
+        }
+        cost
+    }
+
+    /// Whether this run measured the same engine on the same machine as the run beside it.
+    ///
+    /// The same test [`Sweep::matches`] makes and it matters more here. A correctness number off
+    /// another build is a number about another build, which is bad enough. A ratio off another
+    /// machine is not a ratio at all, because the divisor came from different hardware.
+    #[must_use]
+    pub fn matches(&self, p: &Provenance) -> bool {
+        self.rudb_commit == p.rudb_commit && self.host == p.host
+    }
+}
+
+/// One line of the cost file, before the rows of a run are put back together.
+#[derive(Debug, Clone, PartialEq)]
+struct Row {
+    stamp: String,
+    host: String,
+    rudb: String,
+    rudb_commit: String,
+    compat_commit: String,
+    duckdb_version: String,
+    scope: String,
+    what: String,
+    ratios: Ratios,
+    load_share: f64,
+    measured: usize,
+    skipped: usize,
+    refused: usize,
+}
+
+impl Row {
+    /// One line of the file, or nothing when it is the header or half written.
+    fn parse(line: &str) -> Option<Self> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != COST_COLUMNS.len() {
+            return None;
+        }
+        let columns = &COST_COLUMNS[..];
+        let count = number(columns, &fields, "benchmarks")?;
+        let spread = |what: &str| {
+            Some(Spread {
+                median: real(columns, &fields, what)?,
+                low: real(columns, &fields, &format!("{what}_low"))?,
+                high: real(columns, &fields, &format!("{what}_high"))?,
+                count,
+            })
+        };
+        Some(Self {
+            stamp: word(columns, &fields, "when")?.to_owned(),
+            host: word(columns, &fields, "machine")?.to_owned(),
+            rudb: word(columns, &fields, "rudb")?.to_owned(),
+            rudb_commit: word(columns, &fields, "rudb_commit")?.to_owned(),
+            compat_commit: word(columns, &fields, "compat_commit")?.to_owned(),
+            duckdb_version: word(columns, &fields, "duckdb")?.to_owned(),
+            scope: word(columns, &fields, "scope")?.to_owned(),
+            what: word(columns, &fields, "what")?.to_owned(),
+            ratios: Ratios {
+                time: spread("time")?,
+                cpu: spread("cpu")?,
+                memory: spread("memory")?,
+            },
+            load_share: real(columns, &fields, "load_share")?,
+            measured: number(columns, &fields, "measured")?,
+            skipped: number(columns, &fields, "skipped")?,
+            refused: number(columns, &fields, "refused")?,
+        })
+    }
 }
 
 /// The page itself.
@@ -356,13 +604,14 @@ pub struct Page<'a> {
     run: &'a Isolated,
     provenance: &'a Provenance,
     sweep: Option<&'a Sweep>,
+    cost: Option<&'a Cost>,
 }
 
 impl<'a> Page<'a> {
     /// The page for one corpus run.
     #[must_use]
     pub const fn of(run: &'a Isolated, provenance: &'a Provenance) -> Self {
-        Self { run, provenance, sweep: None }
+        Self { run, provenance, sweep: None, cost: None }
     }
 
     /// The same page with the most recent function sweep carried onto it.
@@ -372,6 +621,17 @@ impl<'a> Page<'a> {
     #[must_use]
     pub const fn with(mut self, sweep: Option<&'a Sweep>) -> Self {
         self.sweep = sweep;
+        self
+    }
+
+    /// The same page with the most recent cost run carried onto it.
+    ///
+    /// Carried and not computed, for the same reason the sweep is. Optional for the same reason too,
+    /// and on a machine that has never run one the three resource ratios go back to being named under
+    /// the numbers nothing measures yet.
+    #[must_use]
+    pub const fn with_cost(mut self, cost: Option<&'a Cost>) -> Self {
+        self.cost = cost;
         self
     }
 }
@@ -527,6 +787,136 @@ impl fmt::Display for Page<'_> {
             writeln!(f)?;
         }
 
+        if let Some(cost) = self.cost {
+            writeln!(f, "## Resources")?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Not measured by this run either. The sqllogictest corpus above cannot produce a ratio, because a record there only means anything under a session that replayed every statement before it, so timing one record would time the replay. These come off the benchmark corpus, where every file carries its own load and one query, and they are carried here from the most recent `rudb-compat cost` run written down beside these pages."
+            )?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Each number is rudb over the pinned binary, so one is even and the goal in section 11.6 is 0.1 on all three. The median of several runs with the quartiles beside it, never the minimum. Three numbers and not one, because they fail differently: an engine can be fast and enormous, which is a chunk size, and it can be even on wall clock and far behind on processor time, which is an engine getting its speed from cores rather than from work."
+            )?;
+            writeln!(f)?;
+            writeln!(f, "    benchmarks  {:>7}  measured on both engines", cost.measured)?;
+            writeln!(
+                f,
+                "    refused     {:>7}  one engine declined it or took too long",
+                cost.refused
+            )?;
+            writeln!(f, "    skipped     {:>7}  never put to an engine", cost.skipped)?;
+            writeln!(f)?;
+            match cost.overall {
+                None => {
+                    writeln!(
+                        f,
+                        "No benchmark was measured on both engines in that run, so there is no ratio over the whole corpus. The counts above say why."
+                    )?;
+                    writeln!(f)?;
+                }
+                Some(ratios) => {
+                    writeln!(f, "### The whole corpus")?;
+                    writeln!(f)?;
+                    for (what, spread) in
+                        [("time", ratios.time), ("cpu", ratios.cpu), ("memory", ratios.memory)]
+                    {
+                        writeln!(
+                            f,
+                            "    {what:<8}{:>8.2}   quartiles {:.2} to {:.2} over {} benchmarks",
+                            spread.median, spread.low, spread.high, spread.count
+                        )?;
+                    }
+                    writeln!(f)?;
+                    if ratios.at_goal() {
+                        writeln!(f, "All three medians are at or below the goal of a tenth.")?;
+                    } else {
+                        writeln!(
+                            f,
+                            "The goal is {:.1} on all three and this is not at it yet. A feature that lands correct and slow is still better than a feature that does not land, per section 11.6, and the number is here so that nobody has to take anybody's word for where it is.",
+                            Ratios::GOAL
+                        )?;
+                    }
+                    writeln!(f)?;
+                    writeln!(
+                        f,
+                        "A benchmark here is the load and the query in one process, because rudb has no storage format yet, tamnd/rudb#103, so there is no way to build a table once and then time a query against it. Some of the median number above is therefore the load rather than the query, {:.0} percent of it, taken on the side that answers everything. The row counts are cut down to a million, so these are ratios at a million rows and they say nothing about a ratio at a hundred million.",
+                        cost.load_share * 100.0
+                    )?;
+                    writeln!(f)?;
+                }
+            }
+            if !cost.groups.is_empty() {
+                writeln!(f, "### Per suite")?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "Worst median wall clock first. A suite with one benchmark in it is left out, because one benchmark is an anecdote and putting it in a table beside a suite of a hundred invites somebody to read it as a trend."
+                )?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "    {:<24}{:>9}{:>9}{:>9}{:>7}",
+                    "suite", "time", "cpu", "memory", "n"
+                )?;
+                for (group, ratios) in &cost.groups {
+                    writeln!(
+                        f,
+                        "    {group:<24}{:>9.2}{:>9.2}{:>9.2}{:>7}",
+                        ratios.time.median,
+                        ratios.cpu.median,
+                        ratios.memory.median,
+                        ratios.time.count
+                    )?;
+                }
+                writeln!(f)?;
+            }
+            if !cost.worst.is_empty() {
+                writeln!(f, "### The worst {}", cost.worst.len())?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "This is the column that gets read. An engine that is even on average and two hundred times slower on one shape has a bug rather than a distribution, and an average hides that by construction. The load share says how much of each row is building the tables rather than reading them, so a row at ninety percent is an ingestion problem and a row at ten is a query problem."
+                )?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "    {:<40}{:>9}{:>9}{:>9}{:>8}",
+                    "benchmark", "time", "cpu", "memory", "load"
+                )?;
+                for one in &cost.worst {
+                    writeln!(
+                        f,
+                        "    {:<40}{:>9.2}{:>9.2}{:>9.2}{:>7.0}%",
+                        fitted(&one.name, 39),
+                        one.time,
+                        one.cpu,
+                        one.memory,
+                        one.load_share * 100.0
+                    )?;
+                }
+                writeln!(f)?;
+            }
+            writeln!(f, "    measured    {} on {}", cost.stamp, cost.host)?;
+            writeln!(f, "    engine      {} at {}", cost.rudb, cost.rudb_commit)?;
+            writeln!(f, "    rudb-compat {}", cost.compat_commit)?;
+            writeln!(f, "    duckdb      {}", cost.duckdb_version)?;
+            writeln!(f)?;
+            if cost.matches(p) {
+                writeln!(
+                    f,
+                    "That is the same engine build on the same machine as the corpus numbers above."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "That is not the engine build and machine the corpus numbers above came from. Section 11.2 says the resource numbers need their provenance more than the correctness numbers do, and this is the case it was written for: a ratio whose two sides came off different hardware is not a ratio."
+                )?;
+            }
+            writeln!(f)?;
+        }
+
         writeln!(f, "## What this page does not say yet")?;
         writeln!(f)?;
         writeln!(
@@ -536,6 +926,9 @@ impl fmt::Display for Page<'_> {
         writeln!(f)?;
         for (what, needs) in MISSING {
             if what == FUNCTIONS && self.sweep.is_some() {
+                continue;
+            }
+            if what == RESOURCES && self.cost.is_some() {
                 continue;
             }
             writeln!(f, "    {what:<20}{needs}")?;
@@ -567,6 +960,9 @@ impl fmt::Display for Page<'_> {
 /// The row of [`MISSING`] that a recorded sweep takes off the list.
 const FUNCTIONS: &str = "function coverage";
 
+/// The row of [`MISSING`] that a recorded cost run takes off the list.
+const RESOURCES: &str = "resource ratios";
+
 /// The four numbers section 11.2 asks for that nothing here computes yet.
 ///
 /// Kept as data rather than as paragraphs so that deleting a row is the whole of the work when one
@@ -584,8 +980,8 @@ const MISSING: [(&str, &str); 4] = [
         "five levels over the records where the pinned binary errored, needs the error comparison in section 8.2",
     ),
     (
-        "resource ratios",
-        "rudb over duckdb on time, processor time and peak resident set, as medians with the quartiles, over the whole corpus and per feature and over the worst twenty records, needs a corpus run that measures",
+        RESOURCES,
+        "rudb over duckdb on time, processor time and peak resident set, as medians with the quartiles, over the whole corpus and per suite and over the worst twenty, needs a cost run beside these pages, which `rudb-compat cost --out` writes",
     ),
 ];
 
@@ -599,6 +995,88 @@ pub fn header() -> String {
 #[must_use]
 pub fn sweep_header() -> String {
     SWEEP_COLUMNS.join("\t")
+}
+
+/// The header line of the cost file.
+#[must_use]
+pub fn cost_header() -> String {
+    COST_COLUMNS.join("\t")
+}
+
+/// One cost run as the rows of that file, the whole corpus first.
+///
+/// Several rows and not one, because the page wants three granularities and a table with a column
+/// per suite would have a column count that changed with the corpus. The scope column says which of
+/// the three a row is, and [`Cost::latest`] reads them back into one value by the stamp and the
+/// machine they share.
+///
+/// The quartile columns of a benchmark row repeat its median. A benchmark on its own is one number
+/// on each axis and there is nothing else those columns could truthfully hold, and [`Worst`] does not
+/// carry them so that nobody reads a spread into a repeat.
+#[must_use]
+pub fn cost_rows(costs: &Costs, p: &Provenance) -> Vec<String> {
+    let mut rows = Vec::with_capacity(1 + costs.measured.len());
+    let totals = [
+        costs.measured.len().to_string(),
+        costs.skipped.len().to_string(),
+        costs.refused.len().to_string(),
+    ];
+    let mut push = |scope: &str, what: &str, ratios: &Ratios, share: f64| {
+        let mut fields = vec![
+            p.stamp.clone(),
+            p.host.clone(),
+            p.rudb.clone(),
+            p.rudb_commit.clone(),
+            p.compat_commit.clone(),
+            p.duckdb_version.clone(),
+            scope.to_owned(),
+            what.to_owned(),
+            ratios.time.count.to_string(),
+        ];
+        for spread in [&ratios.time, &ratios.cpu, &ratios.memory] {
+            fields.push(format!("{:.4}", spread.median));
+            fields.push(format!("{:.4}", spread.low));
+            fields.push(format!("{:.4}", spread.high));
+        }
+        fields.push(format!("{share:.4}"));
+        fields.extend(totals.iter().cloned());
+        rows.push(fields.join("\t"));
+    };
+    if let Some(ratios) = costs.overall() {
+        push(CORPUS, "everything measured", &ratios, share(&costs.measured, None));
+    }
+    for (group, ratios) in costs.per_group() {
+        push(SUITE, &group, &ratios, share(&costs.measured, Some(&group)));
+    }
+    for one in costs.worst(WORST) {
+        let flat = |value: f64| Spread { median: value, low: value, high: value, count: 1 };
+        let ratios =
+            Ratios { time: flat(one.time()), cpu: flat(one.cpu()), memory: flat(one.memory()) };
+        push(BENCHMARK, &one.name, &ratios, one.load_share());
+    }
+    rows
+}
+
+/// The median load share over some of what a run measured.
+///
+/// Printed beside every ratio because a page that said rudb was three times slower and did not say
+/// that nine tenths of the number was `CREATE TABLE` would be a page that sends people to the wrong
+/// file.
+fn share(all: &[Measured], group: Option<&str>) -> f64 {
+    let values: Vec<f64> = all
+        .iter()
+        .filter(|one| group.is_none_or(|group| one.group == group))
+        .map(Measured::load_share)
+        .collect();
+    Spread::of(&values).map_or(0.0, |spread| spread.median)
+}
+
+/// A name cut to something a column can hold.
+fn fitted(name: &str, width: usize) -> String {
+    if name.chars().count() <= width {
+        return name.to_owned();
+    }
+    name.chars().take(width.saturating_sub(3)).chain("...".chars()).collect()
 }
 
 /// One sweep as a row of that file.
@@ -673,11 +1151,12 @@ pub fn write(
     run: &Isolated,
     p: &Provenance,
     sweep: Option<&Sweep>,
+    cost: Option<&Cost>,
 ) -> Result<PathBuf, HarnessError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
     let page = dir.join(p.filename());
-    std::fs::write(&page, Page::of(run, p).with(sweep).to_string())
+    std::fs::write(&page, Page::of(run, p).with(sweep).with_cost(cost).to_string())
         .map_err(|e| HarnessError::new(format!("cannot write {}: {e}", page.display())))?;
     append(&dir.join(SERIES), &header(), &row(run, p))?;
     Ok(page)
@@ -697,6 +1176,29 @@ pub fn record(dir: &Path, coverage: &Coverage, p: &Provenance) -> Result<PathBuf
         .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
     let file = dir.join(SWEEPS);
     append(&file, &sweep_header(), &sweep_row(coverage, p))?;
+    Ok(file)
+}
+
+/// Write one cost run down beside the pages, and say which file it went in.
+///
+/// No page of its own, the same as a sweep. The rows of the run go in together, so a file that was
+/// read while this was writing has either none of a run in it or all of it rather than the corpus row
+/// without the suites under it.
+///
+/// # Errors
+///
+/// When the directory cannot be made or the file cannot be appended to.
+pub fn measured(dir: &Path, costs: &Costs, p: &Provenance) -> Result<PathBuf, HarnessError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
+    let file = dir.join(COSTS);
+    let rows = cost_rows(costs, p);
+    if rows.is_empty() {
+        return Err(HarnessError::new(
+            "nothing was measured on both engines, so there is no cost row to write".to_owned(),
+        ));
+    }
+    append(&file, &cost_header(), &rows.join("\n"))?;
     Ok(file)
 }
 
@@ -842,12 +1344,13 @@ fn parts(unix: u64) -> (i64, u32, u32, u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        COLUMNS, Page, Provenance, SWEEP_COLUMNS, Sweep, header, parts, pinned, row, short, stamp,
-        sweep_header, sweep_row,
+        COLUMNS, COST_COLUMNS, Cost, Page, Provenance, Row, SWEEP_COLUMNS, Sweep, cost_header,
+        cost_rows, header, parts, pinned, row, short, stamp, sweep_header, sweep_row,
     };
     use std::path::Path;
 
     use crate::conform::{Failure, Reason, Skips};
+    use crate::cost::{Costs, Measured};
     use crate::coverage::{Coverage, Tally, Untested};
     use crate::isolate::Isolated;
 
@@ -1042,6 +1545,176 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(super::SWEEPS)).expect("the file");
         assert_eq!(text.lines().count(), 3, "a header and two rows\n{text}");
         assert!(text.starts_with(&sweep_header()), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Five benchmarks in two suites, with ratios chosen so the quartiles are readable by hand.
+    ///
+    /// Time and memory come out the same on each one, which they never do on a real machine and
+    /// which makes it obvious here when a column has been read out of the wrong place.
+    fn costs() -> Costs {
+        Costs {
+            measured: vec![
+                one("micro", "a", 300),
+                one("micro", "b", 200),
+                one("micro", "c", 100),
+                one("tpch", "q1", 900),
+                one("tpch", "q2", 800),
+            ],
+            skipped: vec![("dbgen".to_owned(), crate::cost::Skipped::Generator)],
+            refused: vec![("window".to_owned(), "rudb said Not Implemented".to_owned())],
+        }
+    }
+
+    /// One benchmark that took `ms` on rudb and a hundred milliseconds on the pin.
+    fn one(group: &str, name: &str, ms: u64) -> Measured {
+        let usage = |ms: u64| crate::resource::Usage {
+            wall: std::time::Duration::from_millis(ms),
+            cpu: std::time::Duration::from_millis(ms),
+            peak: ms * 1024,
+        };
+        Measured {
+            name: format!("{group}/{name}"),
+            group: group.to_owned(),
+            ours: usage(ms),
+            theirs: usage(100),
+            our_load: usage(ms / 2),
+            their_load: usage(50),
+        }
+    }
+
+    fn cost() -> Cost {
+        let rows: Vec<Row> =
+            cost_rows(&costs(), &provenance()).iter().filter_map(|row| Row::parse(row)).collect();
+        assert_eq!(rows.len(), 8, "one corpus row, two suites and five benchmarks");
+        Cost::assembled(rows.iter()).expect("the rows it just wrote")
+    }
+
+    #[test]
+    fn a_cost_run_beside_the_pages_puts_the_three_resource_ratios_on_one() {
+        let cost = cost();
+        let page = Page::of(&run(), &provenance()).with_cost(Some(&cost)).to_string();
+        assert!(page.contains("## Resources"), "{page}");
+        assert!(page.contains("benchmarks        5  measured on both engines"), "{page}");
+        assert!(page.contains("refused           1"), "{page}");
+        assert!(page.contains("skipped           1"), "{page}");
+        for what in ["time", "cpu", "memory"] {
+            let line = format!("{what:<8}{:>8.2}   quartiles 2.00 to 8.00 over 5 benchmarks", 3.0);
+            assert!(page.contains(&line), "{what} is not on it\n{page}");
+        }
+        assert!(page.contains("goal is 0.1 on all three"), "{page}");
+        assert!(page.contains("50 percent of it"), "the load share is not said\n{page}");
+    }
+
+    #[test]
+    fn the_three_granularities_are_all_on_the_page_and_the_worst_reads_top_down() {
+        let cost = cost();
+        let page = Page::of(&run(), &provenance()).with_cost(Some(&cost)).to_string();
+        assert!(page.contains("### The whole corpus"), "{page}");
+        assert!(page.contains("### Per suite"), "{page}");
+        assert!(page.contains("### The worst 5"), "{page}");
+        let suites = page.split("### Per suite").nth(1).expect("the heading");
+        let tpch = suites.find("tpch").expect("the slower suite");
+        let micro = suites.find("micro").expect("the quicker suite");
+        assert!(tpch < micro, "the suites are not worst first\n{suites}");
+        let worst = page.split("### The worst 5").nth(1).expect("the heading");
+        let first = worst.find("tpch/q1").expect("the slowest benchmark");
+        let last = worst.find("micro/c").expect("the quickest benchmark");
+        assert!(first < last, "the benchmarks are not slowest first\n{worst}");
+    }
+
+    #[test]
+    fn the_ratios_a_cost_run_carried_are_not_named_as_numbers_nothing_measures() {
+        let cost = cost();
+        let page = Page::of(&run(), &provenance()).with_cost(Some(&cost)).to_string();
+        let missing = page.split("## What this page does not say yet").nth(1).expect("the heading");
+        assert!(!missing.contains("resource ratios"), "{missing}");
+        for still in ["statement coverage", "function coverage", "error levels"] {
+            assert!(missing.contains(still), "{still} came off the list too\n{missing}");
+        }
+    }
+
+    #[test]
+    fn a_cost_run_from_another_machine_says_a_ratio_off_other_hardware_is_not_one() {
+        let same = cost();
+        let page = Page::of(&run(), &provenance()).with_cost(Some(&same)).to_string();
+        assert!(page.contains("the same engine build on the same machine"), "{page}");
+
+        let mut elsewhere = cost();
+        elsewhere.host = "gamingpc".to_owned();
+        let page = Page::of(&run(), &provenance()).with_cost(Some(&elsewhere)).to_string();
+        assert!(page.contains("is not a ratio"), "{page}");
+    }
+
+    #[test]
+    fn a_cost_row_has_exactly_the_fields_its_header_says_it_has() {
+        assert_eq!(cost_header().split('\t').count(), COST_COLUMNS.len());
+        for row in cost_rows(&costs(), &provenance()) {
+            assert_eq!(row.split('\t').count(), COST_COLUMNS.len(), "{row}");
+            assert!(!row.contains('\n'), "a row that is two rows\n{row}");
+        }
+    }
+
+    #[test]
+    fn a_cost_run_reads_back_as_the_three_granularities_it_was_written_from() {
+        let cost = cost();
+        let overall = cost.overall.expect("five benchmarks were measured");
+        assert!((overall.time.median - 3.0).abs() < 1e-9, "{overall:?}");
+        assert!((overall.memory.median - 3.0).abs() < 1e-9, "{overall:?}");
+        assert_eq!(overall.time.count, 5);
+        assert_eq!(cost.groups.len(), 2);
+        assert_eq!(cost.groups[0].0, "tpch");
+        assert!((cost.groups[0].1.time.median - 8.5).abs() < 1e-9, "{:?}", cost.groups[0].1);
+        assert_eq!(cost.worst.len(), 5);
+        assert_eq!(cost.worst[0].name, "tpch/q1");
+        assert!((cost.worst[0].time - 9.0).abs() < 1e-9, "{:?}", cost.worst[0]);
+        assert_eq!(cost.measured, 5);
+        assert_eq!(cost.skipped, 1);
+        assert_eq!(cost.refused, 1);
+        assert_eq!(cost.host, "server2");
+        assert_eq!(cost.rudb_commit, "cfdf975e68");
+    }
+
+    #[test]
+    fn a_row_of_the_cost_file_that_is_not_one_is_stepped_over() {
+        assert_eq!(Row::parse(&cost_header()), None, "the header is not a measurement");
+        assert_eq!(Row::parse(""), None);
+        let rows = cost_rows(&costs(), &provenance());
+        let short = rows[0].replace("\tcorpus\t", "\t");
+        assert_eq!(Row::parse(&short), None, "a row missing a field is not most of one");
+    }
+
+    #[test]
+    fn the_rows_of_one_cost_run_come_back_without_the_rows_of_the_one_before_it() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(Cost::latest(&dir), None, "a machine that never measured carries nothing");
+
+        let older = Provenance { stamp: "2026-09-01 00:00:00 UTC".to_owned(), ..provenance() };
+        let mut smaller = costs();
+        smaller.measured.truncate(2);
+        super::measured(&dir, &smaller, &older).expect("a directory it can make");
+        super::measured(&dir, &costs(), &provenance()).expect("the same directory again");
+
+        let read = Cost::latest(&dir).expect("two runs were written");
+        assert_eq!(read.measured, 5, "the older run came back");
+        assert_eq!(read.worst.len(), 5, "rows of the older run were read into this one");
+        let text = std::fs::read_to_string(dir.join(super::COSTS)).expect("the file");
+        assert!(text.starts_with(&cost_header()), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_run_that_measured_nothing_writes_no_row_rather_than_a_row_of_zeroes() {
+        let nothing = Costs::default();
+        assert!(cost_rows(&nothing, &provenance()).is_empty());
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("empty-cost-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(super::measured(&dir, &nothing, &provenance()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
