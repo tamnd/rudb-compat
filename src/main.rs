@@ -166,6 +166,7 @@ fn main() -> ExitCode {
             text(&args, "--out"),
         ),
         Some("vendor") => fetch(refresh),
+        Some("reach") => reach(rest.get(1).copied()),
         Some("report") => report(rest.get(1).copied(), slow, refresh, limits, text(&args, "--out")),
         Some("reduce") => reduce(
             rest.get(1).copied(),
@@ -728,6 +729,30 @@ fn slt(
             ExitCode::FAILURE
         }
     }
+}
+
+/// Say what the generators reached inside the engine, from a report `scripts/reach` produced.
+///
+/// It reads a file rather than running anything, because producing the file means building the
+/// engine instrumented and running every generator over it, which is a script and twenty minutes
+/// and not something a subcommand should do behind somebody's back.
+fn reach(path: Option<&str>) -> ExitCode {
+    let Some(path) = path else {
+        eprintln!("rudb-compat: reach needs an lcov report, which scripts/reach writes");
+        return ExitCode::FAILURE;
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("rudb-compat: cannot read {path}: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The harness is in the report because the harness is the binary that ran. How much of it a
+    // generator reaches is not the question this is here to answer.
+    let reach = rudb_compat::reach::Reach::read(&text).engine("rudb-compat/");
+    print!("{reach}");
+    if reach.is_empty() { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
 /// Read a `--shard k/n`, which is every file when it is not there.
@@ -1828,6 +1853,11 @@ fn help() {
     println!("                report reads it back. Takes --count, --runs, --group, --seconds");
     println!("                and --out.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
+    println!("  reach <file>  say which parts of the engine the generators never reach, from an");
+    println!("                lcov report that scripts/reach produces. Feedback for the");
+    println!("                generators and not a number this project publishes, because line");
+    println!("                coverage of an engine says very little about whether it matches");
+    println!("                another engine.");
     println!("  levels        print the four compatibility levels and their current status");
     println!(
         "  reduce <sql>  shrink a failing query to a minimal reproduction, keeping it failing"

@@ -1,0 +1,63 @@
+#!/bin/sh
+# Run every generator with the engine instrumented, and say what they never reached.
+#
+#   scripts/reach              on the gaming machine, which is where this belongs
+#   scripts/reach server3      somewhere else
+#   scripts/reach gpc 20000    twenty thousand cases per generator instead of two thousand
+#
+# This is feedback for the generators and it is not a number the project publishes. Line coverage of
+# an engine says very little about whether it matches another engine, which is section 10.5 of the
+# generation spec. What it answers is the question a generator cannot answer about itself: which
+# parts of the binder and the executor is it never reaching, so that a million generated statements
+# do not turn out to be a million variations of the same three code paths.
+#
+# The engine is a dependency of this crate rather than a member of its workspace, and cargo-llvm-cov
+# instruments the workspace and nothing else unless the dependency is named. That is what --dep-
+# coverage is for, and it is why the crate list is written out here. A run that forgets it produces
+# a full report of the harness reaching itself, which looks exactly like a measurement, so
+# `rudb-compat reach` says so rather than printing it.
+#
+# A generator that cannot run on the machine is reported and stepped over rather than ending the
+# run. `sqlsmith` is DuckDB's own and needs a DuckDB with that extension in it, which the pinned
+# development build has no published binary for, so most machines produce a report without it and
+# the run says so instead of stopping with three quarters of the work already done.
+#
+# It is a rebuild of the whole engine with instrumentation on and then four generators over it, so
+# it is twenty minutes and a remote machine rather than something to run before a commit.
+set -e
+
+host=${1:-gpc}
+count=${2:-2000}
+seed=7
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+name=$(basename "$root")
+remote="gate/$name"
+
+# The query path and not every crate in the engine. A generator that writes SQL has no way to reach
+# the storage or the parquet reader, so a row saying it reached none of them would be noise in a
+# report whose whole job is to be a work list.
+deps=rudb-parse,rudb-bind,rudb-plan,rudb-ir,rudb-opt,rudb-exec,rudb-pipeline,rudb-functions,rudb-kernels,rudb-catalog
+
+rsync -a --delete \
+  --exclude '/target' \
+  --rsync-path "mkdir -p ~/$remote && rsync" \
+  "$root/" "$host:$remote/"
+
+# The clean is not optional. cargo does not rebuild a dependency because the coverage wrapper was
+# given a different list of crate names, so a second run with more crates in it quietly reports the
+# first run's crates and nothing else.
+# shellcheck disable=SC2029
+ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
+  rm -rf target/llvm-cov-target && \
+  for gen in grammar tlp norec sqlsmith; do \
+    echo \"\$gen\" && \
+    cargo llvm-cov --no-report --dep-coverage $deps run -q -- \$gen --count $count --seed $seed >/dev/null \
+      || echo \"\$gen did not run here, and the report is short by whatever it reaches\"; \
+  done && \
+  cargo llvm-cov report --summary-only >/dev/null && \
+  cov=\$(rustc --print target-libdir)/../bin/llvm-cov && \
+  \$cov export -format=lcov \
+    -instr-profile=target/llvm-cov-target/rudb-compat.profdata \
+    -object target/llvm-cov-target/debug/rudb-compat > target/reach.info && \
+  target/llvm-cov-target/debug/rudb-compat reach target/reach.info"

@@ -375,6 +375,16 @@ The last run is the one to read. The unoptimized plan is the right answer by con
 
 Turning a pass off is a `SET`, so this only works through a driver that remembers what it was told, and the setting is put back after each run whatever happened, because the engine here is the one the next record uses.
 
+## What the generators never reach
+
+Every generator here can tell you what it produced and none of them can tell you what it never produced. `scripts/reach` builds the engine with `-C instrument-coverage` on, runs the grammar generator, both partitioning oracles and upstream's `sqlsmith` over it, and `rudb-compat reach` reads the lcov back and says which crates and which files of rudb the run never entered. It is a rebuild and twenty minutes, so it is a remote machine and not a pre commit check.
+
+The first run says the generators reach 32.4 percent of the 20171 lines of the engine's query path, and the interesting part is not that number. It is that 22 files were never entered at all, and the largest of them are `rudb-exec/src/group.rs`, `rudb-kernels/src/aggregate.rs`, `rudb-exec/src/join.rs`, `rudb-exec/src/sort.rs`, `rudb-exec/src/topn.rs` and `rudb-exec/src/setop.rs`. Read as a sentence about the generators rather than about the engine, that says the generated queries never aggregate, never join, never sort and never take a union, which is a work list for the generators that no amount of looking at their output would have produced.
+
+This is feedback and not a published number, and the difference matters. Line coverage of an engine says very little about whether it matches another engine, so it does not go on the page and nothing gates on it. Section 10.5 of the generation spec is the decision and section 10.5.1 is what this first run found.
+
+The engine is a dependency of this crate rather than a member of its workspace, and `cargo llvm-cov` instruments the workspace and nothing else unless the dependency is named, which is what the crate list in the script is for. A run that forgets it produces a full report of the harness reaching itself, which reads exactly like a measurement, so `reach` refuses to print a report with no engine in it and says which half of the setup is wrong.
+
 ## Which of the catalog is worth anything
 
 Every percentage this project publishes is unweighted, and says so, because nobody has the weights. The weights have to come from queries somebody wrote because they wanted an answer, and the nearest thing to a pile of those already in the vendored clone is upstream's own benchmark suite. It is ClickBench, the join order benchmark over IMDB, TPC-H, TPC-DS, h2oai, LDBC, the JSON benchmarks, the taxi data and several hundred micro benchmarks.

@@ -48,6 +48,7 @@ pub mod oracles;
 pub mod predicate;
 pub mod queries;
 pub mod quote;
+pub mod reach;
 pub mod reduce;
 pub mod replay;
 pub mod report;
