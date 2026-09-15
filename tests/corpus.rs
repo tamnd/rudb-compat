@@ -12,8 +12,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use rudb_compat::conform::run_path;
-use rudb_compat::isolate::{Limits, run_corpus};
+use rudb_compat::isolate::{Isolated, Limits, decode_run, encode_run, run_corpus};
 use rudb_compat::rudb::Rudb;
+use rudb_compat::shard::Shard;
 use rudb_compat::shell::{Session, Shell};
 
 #[test]
@@ -125,8 +126,8 @@ fn the_isolating_runner_gets_the_same_answer_as_the_one_in_this_process() {
 
     let exe = Path::new(env!("CARGO_BIN_EXE_rudb-compat"));
     let limits = Limits { time: Duration::from_secs(60), ..Limits::default() };
-    let apart =
-        run_corpus(exe, Path::new("corpus/slt"), false, limits).expect("the corpus is there");
+    let apart = run_corpus(exe, Path::new("corpus/slt"), false, limits, Shard::whole())
+        .expect("the corpus is there");
 
     assert!(apart.stopped.is_empty(), "{:?}", apart.stopped);
     assert_eq!(apart.files, inline.files);
@@ -134,4 +135,34 @@ fn the_isolating_runner_gets_the_same_answer_as_the_one_in_this_process() {
     assert_eq!(apart.failed, inline.failed);
     assert_eq!(apart.skips, inline.skipped);
     assert_eq!(apart.failures, inline.failures);
+}
+
+/// Four shards of the same corpus add up to the whole of it.
+///
+/// This is the property the whole sharding scheme rests on, so it is checked against a run that was
+/// not sharded rather than against the sum of the parts, which would pass on a split that dropped
+/// the same file from every shard.
+#[test]
+fn the_four_shards_of_a_corpus_add_up_to_the_corpus() {
+    let exe = Path::new(env!("CARGO_BIN_EXE_rudb-compat"));
+    let limits = Limits { time: Duration::from_secs(60), ..Limits::default() };
+    let whole = run_corpus(exe, Path::new("corpus/slt"), false, limits, Shard::whole())
+        .expect("the corpus is there");
+
+    let mut merged = Isolated::default();
+    for at in 1..=4 {
+        let shard = Shard::parse(&format!("{at}/4")).expect("a shard");
+        let part = run_corpus(exe, Path::new("corpus/slt"), false, limits, shard)
+            .expect("the corpus is there");
+        assert!(part.files < whole.files, "a quarter of eight files is not eight files");
+        // Through the encoding, because that is the trip a real shard makes, over scp and back.
+        merged.absorb(decode_run(&encode_run(&part)));
+    }
+
+    assert_eq!(merged.files, whole.files);
+    assert_eq!(merged.passed, whole.passed);
+    assert_eq!(merged.failed, whole.failed);
+    assert_eq!(merged.skips, whole.skips);
+    assert_eq!(merged.failures.len(), whole.failures.len());
+    assert_eq!(merged.kinds, whole.kinds);
 }

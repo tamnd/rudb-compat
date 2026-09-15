@@ -1,0 +1,84 @@
+#!/bin/sh
+# Run the upstream corpus in slices, one machine per slice, and fold the answers back together.
+#
+#   scripts/shard                       four slices over server1, server2, server3 and gpc
+#   scripts/shard server2 gpc           two slices over the two machines named
+#
+# Every machine gets the whole working tree and the argument --shard k/n, refreshes its own copy of
+# the corpus, takes every kth file of the sorted list, and writes what it found to a file. The shards are collected onto the first
+# machine named and added up there by `rudb-compat merge`, which prints what one unsharded run would
+# have printed. Nothing is built on the laptop this is typed on, which is the same rule scripts/gate
+# follows and for the same reason: the disk is full and this crate builds all of rudb.
+#
+# This is worth reading before it is worth running. The corpus is 364 processor seconds of work and
+# one file of it is 125, so a run cannot finish faster than that one file however many machines it
+# is spread over. Sharding buys nothing until the join operator behind that file lands, and it is
+# here because it is short and because that day is coming. Section 9.8 of the harness spec has the
+# measurements. A merged run also prints no page, because a page names the machine it was measured
+# on and this has several.
+#
+# The refresh is not optional. The corpus is fetched per machine and the upstream ref is a branch
+# that moves, so two machines that fetched on different days hold different corpora, and a shard is
+# a slice of a sorted list of files. The first run of this was nine files apart between two machines
+# and merged into a number that was neither of theirs. Each shard now writes down the commit it ran
+# over and `merge` refuses a set that does not agree.
+set -e
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+name=$(basename "$root")
+remote="gate/$name"
+
+hosts=${*:-server1 server2 server3 gpc}
+of=$(echo "$hosts" | wc -w | tr -d ' ')
+out="$root/target/shard"
+mkdir -p "$out"
+rm -f "$out"/*.out
+
+at=0
+running=""
+for host in $hosts; do
+  at=$((at + 1))
+  rsync -a --delete \
+    --exclude '/target' \
+    --rsync-path "mkdir -p ~/$remote && rsync" \
+    "$root/" "$host:$remote/"
+  # Backgrounded, because the point of the exercise is that they run at the same time. Each one
+  # writes its own log so a machine that failed can be read afterwards rather than being untangled
+  # from the others in the terminal.
+  # shellcheck disable=SC2029
+  ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
+    cargo run --release -q -- slt --refresh --shard $at/$of --out target/shard.out" >"$out/$at.log" 2>&1 &
+  running="$running $!"
+  echo "shard $at/$of on $host"
+done
+
+# Waited for one at a time rather than with a bare `wait`, which reports only the last one. A shard
+# that failed and was not noticed is a merged number that is quietly missing a quarter of the
+# corpus, which is the one outcome here that is worse than no number at all.
+echo "waiting for $of machines"
+for pid in $running; do
+  wait "$pid" || { echo "a shard failed, the logs are in $out"; exit 1; }
+done
+
+# Collected onto the first machine rather than onto this one, because that machine has a built
+# binary already and this one is not allowed to have one. Everything a run writes goes under
+# target, which is the one directory the rsync above leaves alone.
+home=$(echo "$hosts" | cut -d' ' -f1)
+# shellcheck disable=SC2029
+ssh "$home" "rm -rf ~/$remote/target/shards"
+at=0
+for host in $hosts; do
+  at=$((at + 1))
+  if [ "$host" = "$home" ]; then
+    # shellcheck disable=SC2029
+    ssh "$host" "mkdir -p ~/$remote/target/shards && cp ~/$remote/target/shard.out ~/$remote/target/shards/$at.out"
+  else
+    rsync -a "$host:$remote/target/shard.out" "$out/$at.out"
+    rsync -a --rsync-path "mkdir -p ~/$remote/target/shards && rsync" \
+      "$out/$at.out" "$home:$remote/target/shards/$at.out"
+  fi
+done
+
+# shellcheck disable=SC2029
+ssh "$home" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
+  cargo run --release -q -- merge target/shards/*.out"
