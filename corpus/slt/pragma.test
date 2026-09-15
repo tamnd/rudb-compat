@@ -1,0 +1,114 @@
+# name: corpus/slt/pragma.test
+# description: the pragma table functions, which describe a name rather than read a file
+# group: [smoke]
+
+statement ok
+CREATE TABLE t(a INTEGER NOT NULL, b VARCHAR);
+
+statement ok
+CREATE VIEW v AS SELECT a FROM t;
+
+# SQLite's six columns about a table. cid counts from zero, which is SQLite's numbering and not the
+# one based ordinal_position the standard views report.
+
+query ITTTTT
+SELECT * FROM pragma_table_info('t');
+----
+0	a	INTEGER	true	NULL	false
+1	b	VARCHAR	false	NULL	false
+
+# The name is split under the identifier rule rather than taken whole, so a qualified name and a
+# fully qualified one in the wrong case both find the same table.
+
+query IT
+SELECT cid, name FROM pragma_table_info('main.t');
+----
+0	a
+1	b
+
+query IT
+SELECT cid, name FROM pragma_table_info('MEMORY.MAIN.T');
+----
+0	a
+1	b
+
+# Every column of a view is nullable whatever the column underneath was declared as, so the NOT NULL
+# on a is gone by the time it is read through v.
+
+query ITTTTT
+SELECT * FROM pragma_table_info('v');
+----
+0	a	INTEGER	false	NULL	false
+
+# The same columns again in the six DESCRIBE answers with, where nullability is the word rather than
+# the boolean and the sense of it is the other way round.
+
+query TTTTTT
+SELECT * FROM pragma_show('t');
+----
+a	INTEGER	NO	NULL	NULL	NULL
+b	VARCHAR	YES	NULL	NULL	NULL
+
+query TTTTTT
+SELECT * FROM pragma_show('v');
+----
+a	INTEGER	YES	NULL	NULL	NULL
+
+# An ordinary relation, which is the point of having these as functions and not only as statements.
+# An alias, a column list of its own, a qualified reference and a filter all work because none of
+# them know they are looking at a pragma.
+
+query TT
+SELECT info.name, info.type FROM pragma_table_info('t') AS info WHERE info.cid = 1;
+----
+b	VARCHAR
+
+query T
+SELECT n FROM pragma_table_info('t') AS info(c, n, ty, nn, d, k) WHERE c = 0;
+----
+a
+
+# A view the engine ships with is described the same way anything else is, and describing it is what
+# binds it.
+
+query I
+SELECT count(*) FROM pragma_table_info('duckdb_views');
+----
+13
+
+# A name that is not there is the catalog's own complaint. The pin adds a did you mean line to this
+# and rudb does not, so the record checks the sentence they agree on.
+
+statement error
+SELECT * FROM pragma_table_info('nope');
+----
+Table with name nope does not exist!
+
+# A null is a name spelled NULL rather than a complaint about nulls, because both engines turn
+# whatever they were handed into text before they go looking.
+
+statement error
+SELECT * FROM pragma_show(NULL);
+----
+Table with name NULL does not exist!
+
+statement error
+SELECT * FROM pragma_table_info();
+----
+"pragma_table_info"(VARCHAR)
+
+statement error
+SELECT * FROM pragma_table_info('a', 'b');
+----
+"pragma_table_info"(VARCHAR)
+
+statement error
+SELECT * FROM pragma_show(3);
+----
+"pragma_show"(VARCHAR)
+
+statement ok
+DROP VIEW v;
+
+statement ok
+DROP TABLE t;
