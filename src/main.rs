@@ -240,10 +240,11 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 12] = [
+    const VALUED: [&str; 13] = [
         "--limit",
         "--memory",
         "--out",
+        "--shard",
         "--budget",
         "--file",
         "--count",
@@ -1847,4 +1848,36 @@ fn help() {
     println!("carries what every statement is supposed to produce. Everything else here compares");
     println!("two live engines and needs a duckdb binary on the path.");
     println!("The design is spec/14-rudb-compat.md in https://github.com/tamnd/rudb.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::positional;
+
+    fn split(line: &str) -> Vec<String> {
+        line.split_whitespace().map(ToOwned::to_owned).collect()
+    }
+
+    #[test]
+    fn a_flag_that_takes_a_value_does_not_leave_the_value_looking_like_a_path() {
+        // What this is guarding is the whole reason the list exists. A flag missing from it reads
+        // its own value as the subcommand's argument, so `slt --shard 1/2` went looking for a
+        // corpus directory called --shard and said it could not read it.
+        let args = split("slt --shard 1/2 --out target/shard.out --slow");
+        assert_eq!(positional(&args), vec!["slt"]);
+        let args = split("slt corpus/slt --shard 1/2");
+        assert_eq!(positional(&args), vec!["slt", "corpus/slt"]);
+    }
+
+    #[test]
+    fn the_equals_spelling_of_a_valued_flag_is_dropped_too() {
+        let args = split("slt --shard=1/2 --limit=30 corpus/slt");
+        assert_eq!(positional(&args), vec!["slt", "corpus/slt"]);
+    }
+
+    #[test]
+    fn merge_keeps_every_file_it_was_given() {
+        let args = split("merge a.out b.out c.out");
+        assert_eq!(positional(&args), vec!["merge", "a.out", "b.out", "c.out"]);
+    }
 }
