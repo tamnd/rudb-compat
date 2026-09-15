@@ -27,11 +27,16 @@ use std::fmt;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{Duration, Instant};
+
+/// One number per child spawned by this process, so no two of them share an output file.
+static TICKET: AtomicUsize = AtomicUsize::new(0);
 
 use crate::conform::{Failure, Reason, Reasons, Skips, Summary};
 use crate::engine::HarnessError;
 use crate::kinds::Kinds;
+use crate::shard::Shard;
 
 /// How long a statement may run and how large a file may get.
 ///
@@ -231,7 +236,8 @@ impl Isolated {
         out
     }
 
-    fn absorb(&mut self, other: Self) {
+    /// Fold another run into this one, which is how the shards of a split run come back together.
+    pub fn absorb(&mut self, other: Self) {
         self.files += other.files;
         self.passed += other.passed;
         self.failed += other.failed;
@@ -252,6 +258,10 @@ impl Isolated {
 /// it as an argument rather than calling `current_exe` here is what lets the tests point it at
 /// something that is not a whole harness.
 ///
+/// `shard` is which slice of the sorted file list to run, which is [`Shard::whole`] for an ordinary
+/// run. The selection happens after the sort and before anything is spawned, so a shard of a shard
+/// is not a thing and the same `k/n` always names the same files.
+///
 /// # Errors
 ///
 /// When the corpus cannot be walked, or a child cannot be spawned at all, which is a broken
@@ -261,8 +271,9 @@ pub fn run_corpus(
     path: &Path,
     slow: bool,
     limits: Limits,
+    shard: Shard,
 ) -> Result<Isolated, HarnessError> {
-    let files = crate::conform::files(path, slow)?;
+    let files = shard.keep(crate::conform::files(path, slow)?);
     let base = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
     let names: Vec<String> =
         files.iter().map(|f| f.strip_prefix(base).unwrap_or(f).display().to_string()).collect();
@@ -321,7 +332,13 @@ impl Running {
         at: usize,
         limits: Limits,
     ) -> Result<Self, HarnessError> {
-        let out = std::env::temp_dir().join(format!("rudb-compat-{}-{at}.out", std::process::id()));
+        // The process id is not enough on its own. Two runs inside one process is an ordinary thing
+        // now that a run can be a shard, and the tests do exactly that, so a counter goes in the
+        // name as well. Two runs sharing a file is two children writing over each other and a
+        // summary that is neither of them.
+        let ticket = TICKET.fetch_add(1, AtomicOrdering::Relaxed);
+        let out =
+            std::env::temp_dir().join(format!("rudb-compat-{}-{ticket}.out", std::process::id()));
         let sink = File::create(&out)
             .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", out.display())))?;
         let errors = sink
@@ -424,32 +441,50 @@ fn resident(pid: u32) -> Option<u64> {
 /// wrong than this is.
 #[must_use]
 pub fn encode(summary: &Summary) -> String {
+    encode_run(&Isolated::from(summary))
+}
+
+/// Write a whole run in the same form, which is how the shards of one run are folded together.
+///
+/// The same writer as [`encode`] rather than a second one beside it. A child has no cut off files
+/// and a shard does, so this is the longer of the two cases and the child's is this with an empty
+/// list, and a format with two writers is a format where a new row goes into one of them.
+#[must_use]
+pub fn encode_run(run: &Isolated) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "counts\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        summary.files,
-        summary.passed,
-        summary.failed,
-        summary.skipped.conditional,
-        summary.skipped.mode,
-        summary.skipped.maybe,
-        summary.skipped.unsupported,
-        summary.skipped.engine,
-        summary.skipped.machine,
-        summary.skipped.unreadable
+        run.files,
+        run.passed,
+        run.failed,
+        run.skips.conditional,
+        run.skips.mode,
+        run.skips.maybe,
+        run.skips.unsupported,
+        run.skips.engine,
+        run.skips.machine,
+        run.skips.unreadable
     ));
     // One line per statement kind the file had a record of, rather than the SQL of every record
     // that passed. The parse that decided the kind happened in the child and there is no reason to
     // do it again in the parent, and the whole corpus is four thousand files against a surface of
     // thirty six, so this is at most thirty six short lines per file.
-    out.push_str(&format!("unclassified\t{}\n", summary.kinds.unclassified));
-    for (kind, tally) in summary.kinds.rows() {
+    out.push_str(&format!("unclassified\t{}\n", run.kinds.unclassified));
+    for (kind, tally) in run.kinds.rows() {
         out.push_str(&format!("kind\t{}\t{}\t{}\n", escape(kind), tally.passed, tally.failed));
     }
-    for (name, why) in &summary.skipped_files {
-        out.push_str(&format!("skipfile\t{}\t{}\n", escape(name), escape(&why.to_string())));
+    for (name, why) in &run.skipped_files {
+        out.push_str(&format!("skipfile\t{}\t{}\n", escape(name), escape(why)));
     }
-    for failure in &summary.failures {
+    for (name, why) in &run.stopped {
+        let (kind, value) = match why {
+            Stopped::Time(how_long) => ("time", how_long.as_secs().to_string()),
+            Stopped::Memory(bytes) => ("memory", bytes.to_string()),
+            Stopped::Died(what) => ("died", what.clone()),
+        };
+        out.push_str(&format!("stopfile\t{}\t{kind}\t{}\n", escape(name), escape(&value)));
+    }
+    for failure in &run.failures {
         out.push_str(&format!(
             "failure\t{}\t{}\t{}\t{}\t{}\n",
             escape(&failure.file),
@@ -462,6 +497,27 @@ pub fn encode(summary: &Summary) -> String {
     out
 }
 
+impl From<&Summary> for Isolated {
+    fn from(summary: &Summary) -> Self {
+        Self {
+            files: summary.files,
+            passed: summary.passed,
+            failed: summary.failed,
+            skips: summary.skipped,
+            skipped_files: summary
+                .skipped_files
+                .iter()
+                .map(|(name, why)| (name.clone(), why.to_string()))
+                .collect(),
+            failures: summary.failures.clone(),
+            // A summary comes out of one process running files in order, so nothing in it was cut
+            // off from outside. The list is the parent's to fill in.
+            stopped: Vec::new(),
+            kinds: summary.kinds.clone(),
+        }
+    }
+}
+
 /// Read back what [`encode`] wrote.
 ///
 /// A line that is not one of the three known kinds is ignored, which is what lets the child write
@@ -469,6 +525,31 @@ pub fn encode(summary: &Summary) -> String {
 #[must_use]
 pub fn decode(name: &str, text: &str) -> Isolated {
     let mut out = Isolated::default();
+    let counted = read_lines(text, &mut out);
+    // A child that exited zero without saying anything is a child that was cut off between the
+    // work and the printing, and counting it as an empty file would quietly lose it.
+    if !counted {
+        out.files = 1;
+        out.stopped.push((name.to_owned(), Stopped::Died("said nothing".to_owned())));
+    }
+    out
+}
+
+/// Read back a whole run written by [`encode_run`], which is one shard of a sharded corpus.
+///
+/// No file name and no fallback for a run that says nothing, which is the one difference from
+/// [`decode`]. A shard that produced nothing is a machine that did not run, and inventing a cut off
+/// file for it would put a made up row on the page. The caller knows which shard it asked for and
+/// says so itself.
+#[must_use]
+pub fn decode_run(text: &str) -> Isolated {
+    let mut out = Isolated::default();
+    read_lines(text, &mut out);
+    out
+}
+
+/// Read the lines of either form, and say whether a `counts` line was among them.
+fn read_lines(text: &str, out: &mut Isolated) -> bool {
     let mut counted = false;
     for line in text.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -507,6 +588,19 @@ pub fn decode(name: &str, text: &str) -> Isolated {
             ["skipfile", file, why] => {
                 out.skipped_files.push((unescape(file), unescape(why)));
             }
+            // Only a shard writes one of these, because a child is the thing that gets cut off and
+            // cannot report on itself. A kind nobody knows becomes `Died` with the words that came,
+            // for the same reason an unreadable failure reason becomes `Runtime`: the file was cut
+            // off either way and dropping the line would put it back in the denominator.
+            ["stopfile", file, kind, value] => {
+                let value = unescape(value);
+                let why = match *kind {
+                    "time" => Stopped::Time(Duration::from_secs(value.parse().unwrap_or(0))),
+                    "memory" => Stopped::Memory(value.parse().unwrap_or(0)),
+                    _ => Stopped::Died(value),
+                };
+                out.stopped.push((unescape(file), why));
+            }
             // A reason that does not parse becomes `Runtime` rather than dropping the failure.
             // Losing a failure would make the pass rate look better than it is, and `Runtime` is
             // the row that means the harness has nothing more specific to say, so it is where an
@@ -523,13 +617,7 @@ pub fn decode(name: &str, text: &str) -> Isolated {
             _ => {}
         }
     }
-    // A child that exited zero without saying anything is a child that was cut off between the
-    // work and the printing, and counting it as an empty file would quietly lose it.
-    if !counted {
-        out.files = 1;
-        out.stopped.push((name.to_owned(), Stopped::Died("said nothing".to_owned())));
-    }
-    out
+    counted
 }
 
 fn escape(text: &str) -> String {
@@ -636,6 +724,44 @@ mod tests {
         kinds.charge("SELECT FROM WHERE", false);
         kinds.charge("not sql at all", false);
         kinds
+    }
+
+    #[test]
+    fn a_run_with_cut_off_files_in_it_survives_the_trip_out_and_back() {
+        // The shard trip rather than the child trip. A child has no cut off files, because a file
+        // that was cut off is one nobody heard from, so this is the row the two forms differ on and
+        // it is the row a merged page would quietly lose.
+        let run = Isolated {
+            files: 3,
+            passed: 1,
+            failed: 1,
+            stopped: vec![
+                ("slow.test".to_owned(), Stopped::Time(Duration::from_secs(120))),
+                ("fat.test".to_owned(), Stopped::Memory(2048)),
+                ("gone.test".to_owned(), Stopped::Died("signal: 9\tkilled".to_owned())),
+            ],
+            kinds: kinds(),
+            ..Isolated::default()
+        };
+        let back = decode_run(&encode_run(&run));
+        assert_eq!(back.files, 3);
+        assert_eq!(back.stopped.len(), 3);
+        assert_eq!(back.stopped[0], ("slow.test".to_owned(), Stopped::Time(Duration::from_secs(120))));
+        assert_eq!(back.stopped[1], ("fat.test".to_owned(), Stopped::Memory(2048)));
+        assert_eq!(back.stopped[2].1, Stopped::Died("signal: 9\tkilled".to_owned()));
+        assert_eq!(back.cut_off(), Cut { timeout: 1, memory: 1, crashed: 1 });
+        assert_eq!(back.kinds, kinds());
+    }
+
+    #[test]
+    fn a_shard_that_wrote_nothing_is_an_empty_run_rather_than_an_invented_file() {
+        // The one place `decode_run` and `decode` differ on purpose. A child that says nothing was
+        // cut off between the work and the printing, and a shard that says nothing is a machine
+        // that never ran, which is the caller's problem and not a row on the page.
+        let back = decode_run("");
+        assert_eq!(back.files, 0);
+        assert!(back.stopped.is_empty());
+        assert_eq!(decode("b.test", "").stopped.len(), 1);
     }
 
     #[test]

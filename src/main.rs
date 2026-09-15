@@ -18,6 +18,7 @@ use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::grammar::{RULE, STATEMENTS};
 use rudb_compat::isolate::{Isolated, Limits};
+use rudb_compat::shard::Shard;
 use rudb_compat::norec::CASES as PREDICATES;
 use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::queries::{Histogram, Query, histogram};
@@ -92,7 +93,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("slt") => slt(rest.get(1).copied(), slow, refresh, limits),
+        Some("slt") => match shard(&args) {
+            Ok(shard) => slt(rest.get(1).copied(), slow, refresh, limits, shard, text(&args, "--out")),
+            Err(why) => {
+                eprintln!("rudb-compat: {why}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("merge") => merge(&rest[1..]),
         // Not in the help. This is the harness re-running itself for one file, which is how the
         // corpus run survives a query that does not stop, and running it by hand is only ever
         // debugging the runner rather than debugging the engine.
@@ -678,11 +686,37 @@ fn verdict(report: &Report) -> ExitCode {
 }
 
 /// Run the sqllogictest corpus, either a path that was given or the upstream one.
-fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCode {
-    let run = corpus_dir(path, refresh).and_then(|dir| corpus(&dir, slow, limits));
+fn slt(
+    path: Option<&str>,
+    slow: bool,
+    refresh: bool,
+    limits: Limits,
+    shard: Shard,
+    out: Option<&str>,
+) -> ExitCode {
+    let run = corpus_dir(path, refresh).and_then(|dir| corpus(&dir, slow, limits, shard));
     match run {
         Ok(total) => {
-            print_corpus(&Rudb::new(), &total);
+            if let Some(out) = out {
+                // The whole run in the form `merge` reads, rather than the failures in full. A
+                // shard is written down to be added to three others and not to be read by a person,
+                // and the failure dump is tens of megabytes.
+                if let Err(e) = std::fs::write(out, rudb_compat::isolate::encode_run(&total)) {
+                    eprintln!("rudb-compat: cannot write {out}: {e}");
+                    return ExitCode::FAILURE;
+                }
+                println!("shard   {shard}");
+                println!(
+                    "{} files, {} passed, {} failed, written to {out}",
+                    total.files, total.passed, total.failed
+                );
+            } else {
+                if !shard.is_whole() {
+                    println!("shard   {shard}");
+                    println!();
+                }
+                print_corpus(&Rudb::new(), &total);
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -690,6 +724,37 @@ fn slt(path: Option<&str>, slow: bool, refresh: bool, limits: Limits) -> ExitCod
             ExitCode::FAILURE
         }
     }
+}
+
+/// Read a `--shard k/n`, which is every file when it is not there.
+fn shard(args: &[String]) -> Result<Shard, String> {
+    text(args, "--shard").map_or_else(|| Ok(Shard::whole()), Shard::parse)
+}
+
+/// Fold the shards of one corpus run back together and print what a whole run would have printed.
+///
+/// No page and no series row. A page carries the provenance of one machine and a sharded run has
+/// several, and until sharding is worth doing there is no reason to invent a provenance block that
+/// names four of them. Section 9.8 of the harness spec has the measurements behind that sentence.
+fn merge(files: &[&str]) -> ExitCode {
+    if files.is_empty() {
+        eprintln!("rudb-compat: merge needs the files the shards were written to");
+        return ExitCode::FAILURE;
+    }
+    let mut total = Isolated::default();
+    for file in files {
+        match std::fs::read_to_string(file) {
+            Ok(text) => total.absorb(rudb_compat::isolate::decode_run(&text)),
+            Err(e) => {
+                eprintln!("rudb-compat: cannot read {file}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    println!("merged  {} shards", files.len());
+    println!();
+    print_corpus(&Rudb::new(), &total);
+    ExitCode::SUCCESS
 }
 
 /// Run the corpus against both oracles, the file and the pinned binary, and print what they split
@@ -988,7 +1053,8 @@ fn report(
             return ExitCode::FAILURE;
         }
     };
-    let total = match corpus(&dir, slow, limits) {
+    // The page is over the whole corpus, so a shard does not reach here. Section 9.8.
+    let total = match corpus(&dir, slow, limits, Shard::whole()) {
         Ok(total) => total,
         Err(e) => {
             eprintln!("rudb-compat: {e}");
@@ -1558,10 +1624,15 @@ const fn root() -> &'static str {
 /// does and is deliberate. The corpus is thousands of statements against a database that is being
 /// built, so a nonzero exit would mean the job is red every day until the day it is finished and
 /// nobody would read it. What CI watches is the number going down.
-fn corpus(path: &Path, slow: bool, limits: Limits) -> Result<Isolated, HarnessError> {
+fn corpus(
+    path: &Path,
+    slow: bool,
+    limits: Limits,
+    shard: Shard,
+) -> Result<Isolated, HarnessError> {
     let exe = std::env::current_exe()
         .map_err(|e| HarnessError::new(format!("cannot find this binary to re-run it: {e}")))?;
-    rudb_compat::isolate::run_corpus(&exe, path, slow, limits)
+    rudb_compat::isolate::run_corpus(&exe, path, slow, limits, shard)
 }
 
 /// Print a corpus run.
@@ -1638,7 +1709,13 @@ fn help() {
     println!("  parse <file>  ask both engines which statements in a file are SQL");
     println!("  query <sql>   run one statement on both engines and print the differences");
     println!("  run <file>    run every statement in a file of SQL and print the differences");
-    println!("  slt [path]    run sqllogictest and print the pass rate, upstream if no path");
+    println!("  slt [path]    run sqllogictest and print the pass rate, upstream if no path.");
+    println!("                Takes --shard to run one slice of the corpus and --out to");
+    println!("                write that slice down for merge to fold back in.");
+    println!("  merge <file...>");
+    println!("                fold the shards of one corpus run back together and print");
+    println!("                what a whole run would have printed. No page and no series");
+    println!("                row, because a page carries the provenance of one machine.");
     println!("  functions [n] print the function catalog off the pinned DuckDB, or the calls the");
     println!("                generator would put to the overloads of one name");
     println!("  coverage [n]  run those calls on both engines and print the function coverage");
@@ -1720,6 +1797,12 @@ fn help() {
     println!("  --strict-messages  require error text to match and not only the error kind");
     println!("  --slow             include the .test_slow files, which slt leaves out by default");
     println!("  --refresh          fetch the corpus again even if it is already there");
+    println!("  --shard <k/n>      run the kth of n slices of the corpus, both counted from");
+    println!("                     one. Round robin over the sorted file list, which is what");
+    println!("                     cargo nextest does with --partition count:k/n. Today this");
+    println!("                     buys nothing, because one file is 125 of the corpus's 364");
+    println!("                     processor seconds and no split goes below its slowest");
+    println!("                     file. Section 9.8 of the harness spec has the numbers.");
     println!("  --pinned           make `duckdb`, `functions` and `coverage` fail when the binary");
     println!("                     is not the pinned commit");
     println!("  --shell            drive both engines as command line binaries rather than one");

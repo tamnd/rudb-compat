@@ -53,6 +53,7 @@ pub mod replay;
 pub mod report;
 pub mod resource;
 pub mod rudb;
+pub mod shard;
 pub mod shell;
 pub mod slt;
 pub mod sqlsmith;

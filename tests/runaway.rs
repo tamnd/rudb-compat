@@ -19,6 +19,7 @@ use rudb_compat::conform::Reason;
 use rudb_compat::duckdb::Duckdb;
 use rudb_compat::engine::{Engine, Outcome};
 use rudb_compat::isolate::{Limits, run_corpus};
+use rudb_compat::shard::Shard;
 
 #[test]
 fn a_query_the_engine_stops_is_a_failed_record_and_not_a_killed_process() {
@@ -40,7 +41,7 @@ fn a_query_the_engine_stops_is_a_failed_record_and_not_a_killed_process() {
     // The cap is not small: it is the size of the process and the process is a database, so a cap
     // the engine could actually reach first has to leave room for the binary underneath it.
     let limits = Limits { time: Duration::from_secs(1), memory: 128 * 1024 * 1024 };
-    let run = run_corpus(exe, &dir, false, limits).expect("the files are there");
+    let run = run_corpus(exe, &dir, false, limits, Shard::whole()).expect("the files are there");
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(run.stopped.is_empty(), "a file was killed from outside: {:?}", run.stopped);

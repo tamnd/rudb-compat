@@ -1,0 +1,62 @@
+#!/bin/sh
+# Run the upstream corpus in slices, one machine per slice, and fold the answers back together.
+#
+#   scripts/shard                       four slices over server1, server2, server3 and gpc
+#   scripts/shard server2 gpc           two slices over the two machines named
+#
+# Every machine gets the whole working tree and the argument --shard k/n, takes every kth file of
+# the sorted list, and writes what it found to a file this script copies back. The last step is
+# `rudb-compat merge`, which adds the files up and prints what one unsharded run would have printed.
+#
+# This is worth reading before it is worth running. The corpus is 364 processor seconds of work and
+# one file of it is 125, so a run cannot finish faster than that one file however many machines it
+# is spread over. Sharding buys nothing until the join operator behind that file lands, and it is
+# here because it is short and because that day is coming. Section 9.8 of the harness spec has the
+# measurements. A merged run also prints no page, because a page names the machine it was measured
+# on and this has several.
+set -e
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+name=$(basename "$root")
+remote="gate/$name"
+
+hosts=${*:-server1 server2 server3 gpc}
+of=$(echo "$hosts" | wc -w | tr -d ' ')
+out="$root/target/shard"
+mkdir -p "$out"
+rm -f "$out"/*.out
+
+at=0
+running=""
+for host in $hosts; do
+  at=$((at + 1))
+  rsync -a --delete \
+    --exclude '/target' \
+    --rsync-path "mkdir -p ~/$remote && rsync" \
+    "$root/" "$host:$remote/"
+  # Backgrounded, because the point of the exercise is that they run at the same time. Each one
+  # writes its own log so a machine that failed can be read afterwards rather than being untangled
+  # from the others in the terminal.
+  # shellcheck disable=SC2029
+  ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
+    cargo run --release -q -- slt --shard $at/$of --out shard.out" >"$out/$at.log" 2>&1 &
+  running="$running $!"
+  echo "shard $at/$of on $host"
+done
+
+# Waited for one at a time rather than with a bare `wait`, which reports only the last one. A shard
+# that failed and was not noticed is a merged number that is quietly missing a quarter of the
+# corpus, which is the one outcome here that is worse than no number at all.
+echo "waiting for $of machines"
+for pid in $running; do
+  wait "$pid" || { echo "a shard failed, the logs are in $out"; exit 1; }
+done
+
+at=0
+for host in $hosts; do
+  at=$((at + 1))
+  rsync -a "$host:$remote/shard.out" "$out/$at.out"
+done
+
+cd "$root"
+cargo run --release -q -- merge "$out"/*.out
