@@ -1,0 +1,119 @@
+# name: corpus/slt/pragma_build.test
+# description: the pragma table functions that report on the build and the process
+# group: [smoke]
+
+# These four say what the engine is rather than what is in it, so almost nothing here can check a
+# value. A version string and a platform string are different on every build and on every machine,
+# and a record that pinned either one would be a record that says rudb has to lie. What is the same
+# on both engines is the shape: how many rows, which columns, which types, and how the three strings
+# are built out of each other.
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pragma_version());
+----
+library_version	VARCHAR
+source_id	VARCHAR
+codename	VARCHAR
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pragma_platform());
+----
+platform	VARCHAR
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pragma_user_agent());
+----
+user_agent	VARCHAR
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM pragma_database_size());
+----
+database_name	VARCHAR
+database_size	VARCHAR
+block_size	BIGINT
+total_blocks	BIGINT
+used_blocks	BIGINT
+free_blocks	BIGINT
+wal_size	VARCHAR
+memory_usage	VARCHAR
+memory_limit	VARCHAR
+
+# One row each, because there is one build and one process.
+
+query I
+SELECT count(*) FROM pragma_version();
+----
+1
+
+query I
+SELECT count(*) FROM pragma_platform();
+----
+1
+
+query I
+SELECT count(*) FROM pragma_user_agent();
+----
+1
+
+# The version carries a leading v, the source id is text either way round, and the codename is what
+# both engines say while they are before a named release.
+
+query TTT
+SELECT library_version LIKE 'v%', source_id IS NOT NULL, codename FROM pragma_version();
+----
+true	true	Development Version
+
+# The platform is two words joined by an underscore and it is lower case, because the string is the
+# name in an extension download path rather than a description of anything.
+
+query TT
+SELECT strpos(platform, '_') > 1, platform = lower(platform) FROM pragma_platform();
+----
+true	true
+
+# The user agent is built out of the other two, which is the part of it that is the same on both
+# engines. What goes in front of the version differs, and so does whatever a client appends.
+
+query TT
+SELECT user_agent LIKE '%' || library_version || '%', user_agent LIKE '%(' || platform || ')%' FROM pragma_user_agent(), pragma_version(), pragma_platform();
+----
+true	true
+
+# One row for the one database that is attached and none for the internal ones. Seven of the nine
+# columns are zero because nothing here is on disk, and that is the answer rather than a placeholder.
+
+query TTIIIIT
+SELECT database_name, database_size, block_size, total_blocks, used_blocks, free_blocks, wal_size FROM pragma_database_size();
+----
+memory	0 bytes	0	0	0	0	0 bytes
+
+# The last two come off the live memory budget on both engines, so they are not null and they are
+# not the zeros above.
+
+query TT
+SELECT memory_usage IS NOT NULL, memory_limit IS NOT NULL FROM pragma_database_size();
+----
+true	true
+
+# None of the four takes anything, and what they say about that is the sentence every other arity
+# mismatch gets, with the one overload spelled out and the name quoted.
+
+statement error
+SELECT * FROM pragma_version('t');
+----
+"pragma_version"()
+
+statement error
+SELECT * FROM pragma_platform(1);
+----
+"pragma_platform"()
+
+statement error
+SELECT * FROM pragma_user_agent('a', 'b');
+----
+"pragma_user_agent"()
+
+statement error
+SELECT * FROM pragma_database_size(0);
+----
+"pragma_database_size"()
