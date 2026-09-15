@@ -1,0 +1,141 @@
+# name: corpus/slt/information_schema.test
+# description: the databases a session starts with and the standard views that describe them
+# group: [smoke]
+
+# A session has three databases before anybody attaches anything. memory is the one a person creates
+# in and the other two belong to the engine, which is what the internal column is saying.
+
+query TTTT
+SELECT database_name, path, internal, type FROM duckdb_databases() ORDER BY database_name;
+----
+memory	NULL	false	duckdb
+system	NULL	true	duckdb
+temp	NULL	true	duckdb
+
+# Five schemas across those three. The standard view of them reports an owner because the standard
+# says there is one, and neither engine has users, so both answer with the name of the engine.
+
+query TTTT
+SELECT catalog_name, schema_name, schema_owner, sql_path FROM information_schema.schemata ORDER BY catalog_name, schema_name;
+----
+memory	main	duckdb	NULL
+system	information_schema	duckdb	NULL
+system	main	duckdb	NULL
+system	pg_catalog	duckdb	NULL
+temp	main	duckdb	NULL
+
+# A view the engine ships with is not bound until somebody reads it, and until then it cannot say
+# how many columns it has. That is not a gap, it is the answer: the body is text and binding it is
+# what produces the list. Reading the view fills both columns in, which is the second half of this.
+
+query IT
+SELECT column_count, is_bound FROM duckdb_views() WHERE view_name = 'character_sets';
+----
+NULL	false
+
+query TTTT
+SELECT character_set_name, character_repertoire, form_of_use, default_collate_name FROM information_schema.character_sets;
+----
+UTF8	UCS	UTF8	ucs_basic
+
+query IT
+SELECT column_count, is_bound FROM duckdb_views() WHERE view_name = 'character_sets';
+----
+8	true
+
+statement ok
+CREATE TABLE t (a INTEGER NOT NULL, b VARCHAR, c DECIMAL(9,2));
+
+statement ok
+CREATE VIEW v AS SELECT a, b FROM t;
+
+# The standard view of tables is a union of the two wrappers, so a table and a view are both in it
+# and they are told apart by table_type rather than by which table they came out of.
+
+query TTTTT
+SELECT table_catalog, table_schema, table_name, table_type, is_insertable_into FROM information_schema.tables ORDER BY table_name;
+----
+memory	main	t	BASE TABLE	YES
+memory	main	v	VIEW	NO
+
+# And nothing the engine owns is in it, which is the whole reason the wrappers exist.
+
+query T
+SELECT table_name FROM information_schema.tables WHERE table_schema = 'information_schema';
+----
+
+# A view's columns are listed next to a table's. is_nullable is the word rather than the boolean,
+# which is the standard's spelling and most of the reason a client reads this view instead of
+# duckdb_columns(). The precision of a decimal is reported and the length of a varchar is not,
+# because the length modifier is parsed and then dropped before a column reaches a catalog.
+
+query TTITTII
+SELECT table_name, column_name, ordinal_position, is_nullable, data_type, character_maximum_length, numeric_precision FROM information_schema.columns ORDER BY table_name, ordinal_position;
+----
+t	a	1	NO	INTEGER	NULL	32
+t	b	2	YES	VARCHAR	NULL	NULL
+t	c	3	YES	DECIMAL(9,2)	NULL	9
+v	a	1	YES	INTEGER	NULL	32
+v	b	2	YES	VARCHAR	NULL	NULL
+
+# The standard view of views reports the body as the statement written back out, the same text
+# duckdb_views() reports, and answers the four trigger questions with no because neither engine has
+# triggers to answer about.
+
+query TTTTTT
+SELECT table_catalog, table_schema, table_name, view_definition, check_option, is_updatable FROM information_schema.views WHERE table_schema = 'main' AND table_catalog = 'memory' ORDER BY table_name;
+----
+memory	main	v	CREATE VIEW v AS SELECT a, b FROM t;	NONE	NO
+
+# duckdb_tables and duckdb_tables() are different questions and the parentheses are the difference.
+# The bare name is a view over the function with the engine's own rows taken out, so it answers what
+# somebody made, and the function answers what is really there. The count from the function is
+# written as a comparison because how many views an engine ships with is its own business.
+
+query I
+SELECT count(*) FROM duckdb_tables;
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_views;
+----
+1
+
+query T
+SELECT count(*) > 1 FROM duckdb_views();
+----
+true
+
+# The list of attached databases under the name SQLite gave it, which is a view over the same
+# function and the one member of the pragma family that is not a table function. The oid in the seq
+# column is not compared, because an allocation counter says what order a process happened to create
+# things in and matching it would mean matching an accident.
+
+query TT
+SELECT name, file FROM pragma_database_list;
+----
+memory	NULL
+
+# Nothing goes into a database the engine owns, whichever way the name is written, and nothing comes
+# out of one either.
+
+statement error
+CREATE TABLE information_schema.x (a INTEGER);
+----
+Cannot create entry in system catalog
+
+statement error
+CREATE TABLE system.main.x (a INTEGER);
+----
+Cannot create entry in system catalog
+
+statement error
+CREATE TABLE temp.main.x (a INTEGER);
+----
+Only TEMPORARY table names can use the "temp" catalog
+
+statement error
+DROP VIEW duckdb_views;
+----
+Cannot drop internal catalog entry "duckdb_views"!

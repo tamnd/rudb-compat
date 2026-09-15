@@ -70,7 +70,11 @@ fi
 
 pin=""
 if [ "$update" = yes ]; then
-  pin="cargo update -p rudb && "
+  # The whole lock file rather than the one package, because rudb is pinned by git branch and cargo
+  # refuses to name a git dependency there: `cargo update -p rudb` is `package ID specification
+  # `rudb` did not match any packages`. Nothing else here is a git dependency, so the two commands
+  # move the same line.
+  pin="cargo update && "
   echo "refreshing the rudb pin before the gate, so the pass rate is of today's rudb"
 fi
 
