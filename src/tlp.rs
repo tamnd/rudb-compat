@@ -52,6 +52,7 @@ use std::fmt;
 use crate::compare::{Difference, MessageMatch, Ordering, Rules, compare};
 use crate::engine::{Cell, Engine, HarnessError, Outcome, Table};
 use crate::predicate::{Predicates, TABLE, fixture};
+use crate::replay::{Run, Shape};
 use crate::sqlsmith::generalised;
 
 /// How many predicates a run tries when nobody said a number.
@@ -465,6 +466,27 @@ impl Found {
     #[must_use]
     pub fn refusals(&self) -> usize {
         self.refused.values().sum()
+    }
+
+    /// This run as a row for the generated series.
+    ///
+    /// The findings are not grouped and the groups column repeats them, because what this reports is
+    /// a predicate whose three parts did not add up and there is nothing to group that by until the
+    /// reducer has been over it. The engine column says which engine, since `--pinned` puts the
+    /// whole thing to DuckDB instead and a run that found nothing against the pinned binary is a
+    /// different fact from a run that found nothing against rudb.
+    #[must_use]
+    pub fn recorded(&self, engines: &'static str) -> Run {
+        Run {
+            mode: "tlp",
+            shape: Shape::Flag("--form", self.form.spelling().to_owned()),
+            seed: self.seed,
+            cases: self.cases,
+            usable: self.cases - self.refusals(),
+            findings: self.broken.len(),
+            groups: self.broken.len(),
+            engines,
+        }
     }
 
     /// Whether the run found anything, which is what the exit code is.

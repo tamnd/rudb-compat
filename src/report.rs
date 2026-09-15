@@ -199,10 +199,11 @@ impl Provenance {
             },
             corpus_path: corpus.display().to_string(),
             upstream,
-            // There is no generator in this harness yet, so there is nothing for a seed to make
-            // repeatable. The row is here because section 11.2 asks for it, and a row that says
-            // what it is waiting for is how the next person finds where to put it.
-            seed: "none, nothing in this run generates anything".to_owned(),
+            // A corpus run reads statements somebody wrote down, so there is nothing here for a
+            // seed to make repeatable. The generated modes fill this row in properly, through
+            // `crate::replay::provenance`, and what they put in it is the command that reproduces
+            // the run rather than the bare number.
+            seed: "none, this run reads a corpus and generates nothing".to_owned(),
         }
     }
 
@@ -700,7 +701,7 @@ pub fn record(dir: &Path, coverage: &Coverage, p: &Provenance) -> Result<PathBuf
 }
 
 /// Add one row to a file, starting it with its header when it is not there yet.
-fn append(path: &Path, header: &str, row: &str) -> Result<(), HarnessError> {
+pub(crate) fn append(path: &Path, header: &str, row: &str) -> Result<(), HarnessError> {
     use std::io::Write as _;
     let fresh = !path.exists();
     let mut file = std::fs::OpenOptions::new()

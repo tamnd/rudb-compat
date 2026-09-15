@@ -414,6 +414,33 @@ The row counts are cut down. The suite builds tables of a hundred million rows b
 
 Two thirds of the corpus produces no ratio and the reasons are counted rather than dropped. Four hundred and seventy four are skipped before either engine sees them, almost all of them behind a `require` for httpfs or parquet or json or one of the two data generators. Three hundred and thirty nine are refused, which is one engine declining the load or the query, and every one of those is rudb: a hundred and seven not implemented, a hundred more in the load, and a hundred and six between a catalog, binder or parser error. Nine are rudb taking longer than thirty seconds on something the pinned binary answers in under one, and those are the interesting ones, because a benchmark stopped on our side leaves the ratios above rather than making them worse. The timeout count is part of the result and not a footnote.
 
+## Getting a generated run back
+
+Four modes here write their own input and every one of them can find something nobody has time to look at the day it turns up. So each of them ends by printing what it was measured against and appending one row to `target/report/generated.tsv`.
+
+```
+grammar on server2, 2026-09-15 00:45:38 UTC
+put to the pinned duckdb and rudb
+
+  rudb           rudb from git at 1dbe862509
+  harness        4a0bbfa4d6
+  duckdb         v2.0.0-dev84237 cc7e7bac7f md5 3051ffc8ff809c3856697f6bbce994a8
+  pinned         yes, this is the commit the grammar is vendored from
+  corpus         none, this run wrote its own cases
+  machine        linux x86_64, 32 cores
+  seed           42
+  replay with    rudb-compat grammar --rule Statement --count 2000 --seed 42
+  recorded in    target/report/generated.tsv
+```
+
+A seed on its own is not enough and that is the whole reason for the block. A seed reproduces a run against the rudb, the DuckDB and the generator that happened to be on the machine, and all three of those move, so a finding from three weeks ago is a finding about three things nobody wrote down. The six fields are the ones section 11.2 of `spec/sql/duckdb/11-the-number.md` asks for, and the md5 of the binary is there because two builds can call themselves the same version.
+
+The replay line is built out of the values the run used rather than written down beside them, so it cannot come to disagree with them, and it always gives `--count` and `--seed` even when both were defaults, because a default is a thing that changes and a recorded command should keep working after it does.
+
+The series has one row per run with a mode column, rather than one file per mode. What all four have in common is how many cases were generated, how many said anything at all, and how many of those came out wrong, and the question the series exists to answer is whether generated testing found more this month than last. Four files would make somebody open four of them to answer it.
+
+Two of the columns need reading carefully. `usable` is smaller than `cases` in every mode and by a different rule in each: a query the pinned binary cannot run says nothing about rudb, a statement neither parser accepts says nothing about either, and a predicate the engine refused says nothing either way. `groups` is smaller than `findings` in the two differential modes because they group by what the engine that refused said, and equal to it in the two oracles, because what those report is a predicate whose parts did not add up and there is nothing to group that by until the reducer has been over it.
+
 ## License
 
 Apache-2.0. See [LICENSE-APACHE](LICENSE-APACHE).

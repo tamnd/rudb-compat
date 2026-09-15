@@ -37,6 +37,7 @@ use std::fmt;
 
 use crate::engine::{Cell, Engine, HarnessError, Outcome, Table};
 use crate::predicate::{Predicates, TABLE, fixture};
+use crate::replay::{Run, Shape};
 use crate::sqlsmith::generalised;
 
 /// How many predicates a run tries when nobody said a number.
@@ -229,6 +230,24 @@ pub struct Found {
 }
 
 impl Found {
+    /// This run as a row for the generated series.
+    ///
+    /// Same shape as the TLP row and for the same reasons: nothing to group a finding by yet, and
+    /// the engine matters because `--pinned` puts it to DuckDB instead.
+    #[must_use]
+    pub fn recorded(&self, engines: &'static str) -> Run {
+        Run {
+            mode: "norec",
+            shape: Shape::Only,
+            seed: self.seed,
+            cases: self.cases,
+            usable: self.cases - self.refusals(),
+            findings: self.broken.len(),
+            groups: self.broken.len(),
+            engines,
+        }
+    }
+
     /// How many predicates the engine refused, which are the ones that say nothing either way.
     #[must_use]
     pub fn refusals(&self) -> usize {
