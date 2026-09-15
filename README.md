@@ -243,6 +243,25 @@ A query both engines refused is counted apart from the rest. The generator is a 
 
 The seed is printed whether it was given or not, because a generated run whose findings cannot be replayed is a generated run whose findings do not get fixed.
 
+## Our own generator
+
+The other half of that. sqlsmith writes queries out of a catalog, so what it produces is realistic and narrow, and all of it is `SELECT`. This one walks the same 1088 rule grammar table the matcher walks, in the other direction, so what it produces is unrealistic and wide: every statement kind the grammar has, in proportion to how cheaply the grammar can write each one, reaching clauses nobody has ever typed.
+
+```
+rudb-compat grammar --count 2000 --seed 1
+rudb-compat grammar --count 2000 --seed 1 --rule SelectStatement
+```
+
+It only asks whether each statement parses. A walk of the whole grammar writes `DROP`, `ATTACH`, `EXPORT DATABASE`, `COPY t TO 'out.csv'` and `INSTALL`, so a mode that ran what it wrote would be a mode that writes files into whatever directory somebody started it in. Both engines are asked the parse question and nothing else, which also means no session and no catalog, and that is what makes the answer a fact about the two grammars rather than about two schemas.
+
+There are two directions and they are reported apart. A statement DuckDB parses and rudb does not is the gap, and it is a query somebody cannot run at all. A statement rudb parses and DuckDB does not is a dialect we invented, which is a smaller problem and still a real one, because a parser that accepts more than the thing it is compatible with will bind something it should have refused.
+
+The first runs, 2000 statements each against the pinned binary, found nothing in the first direction and a lot in the second. From `Statement`: 83 neither engine parses, 1617 both parse, 0 in the gap, 300 in 122 groups where rudb parses and DuckDB does not. From `SelectStatement`: 262 neither parses, 474 both parse, 0 in the gap, 1264 in 159 groups the other way.
+
+The empty gap is not a compatibility result and it should not be read as one. This generator writes from the same table the matcher reads, so almost everything it writes is text our own parser accepts by construction, and a source that cannot write a statement rudb refuses cannot measure what rudb refuses. What the gap column is worth here is as a check on that construction: a nonzero number would mean the generator and the matcher disagree about the grammar they share, which would be a bug in one of them. The level two number comes from the corpus and from sqlsmith, which write statements this one cannot.
+
+The second direction is what the mode is actually for, and the groups say the same thing over and over: DuckDB checks things while it parses that its own grammar allows. `SELECT` with no select list, a CTE body that is a `CHECKPOINT`, an empty subscript, two aliases on one table reference, a window name used twice. Those are in the grammar, DuckDB's transformer refuses them, and rudb has no transformer yet so it accepts all of them. Most of that surface closes with the binder rather than with the parser, which is why these are counted and printed rather than filed one at a time.
+
 ## An oracle with one engine in it
 
 Every other check here needs a DuckDB on the machine to say what the answer should have been. This one does not, because what it tests is a property of SQL rather than an agreement between two engines. Take a predicate `p`. Every row a query can see is in exactly one of three buckets: the rows where `p` is true, the rows where it is false, and the rows where it is neither of those because something in it was NULL. So the rows of `WHERE p`, `WHERE NOT (p)` and `WHERE (p) IS NULL` put together are the rows of the query with no predicate on it at all, and that has to hold for every predicate an engine will accept. The paper is Rigger and Su, "Finding Bugs in Database Systems via Query Partitioning", OOPSLA 2020, where it is called ternary logic partitioning.

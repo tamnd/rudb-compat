@@ -39,6 +39,7 @@ pub mod csv;
 pub mod duckdb;
 pub mod engine;
 pub mod functions;
+pub mod grammar;
 pub mod hash;
 pub mod isolate;
 pub mod norec;
