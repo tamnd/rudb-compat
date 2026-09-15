@@ -1,0 +1,59 @@
+# name: corpus/slt/catalog.test
+# description: the catalog tables, and the statement duckdb_views reports for a view
+# group: [smoke]
+
+statement ok
+CREATE TABLE base (x INTEGER, s VARCHAR);
+
+statement ok
+CREATE VIEW v AS SELECT x, s FROM base WHERE x > 0;
+
+# The odd spacing, the lower case keywords and the alias list are all here on purpose. What the
+# column reports is the statement written back out and not the text anybody typed, so none of it
+# survives, and the case of a name does survive because a name is not a keyword.
+statement ok
+CREATE VIEW w(p) AS select   X  as Y from  base;
+
+query TT
+SELECT view_name, sql FROM duckdb_views() WHERE NOT internal ORDER BY view_name;
+----
+v	CREATE VIEW v AS SELECT x, s FROM base WHERE (x > 0);
+w	CREATE VIEW w (p) AS SELECT X AS Y FROM base;
+
+# column_count is the length of the list the last bind of the body produced, temporary is false on
+# anything CREATE TEMP VIEW did not make, and is_bound says the list holds something.
+query TITT
+SELECT view_name, column_count, temporary, is_bound FROM duckdb_views() WHERE NOT internal ORDER BY view_name;
+----
+v	2	false	true
+w	1	false	true
+
+# A view's columns carry the view's own oid, which is the join a client writes to go from one table
+# to the other. Three columns across the two views.
+query I
+SELECT count(*) FROM duckdb_views() v, duckdb_columns() c WHERE v.view_oid = c.table_oid;
+----
+3
+
+# The two tables have one namespace between them and neither lists what the other one does.
+query T
+SELECT view_name FROM duckdb_views() WHERE view_name = 'base';
+----
+
+query T
+SELECT table_name FROM duckdb_tables() WHERE table_name IN ('v', 'w');
+----
+
+statement ok
+DROP VIEW w;
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE NOT internal;
+----
+1
+
+statement ok
+DROP VIEW v;
+
+statement ok
+DROP TABLE base;
