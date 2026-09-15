@@ -16,6 +16,7 @@ use rudb_compat::conform::{Reason, Skipped, Summary};
 use rudb_compat::cost::{Costs, Measured};
 use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
+use rudb_compat::grammar::{RULE, STATEMENTS};
 use rudb_compat::isolate::{Isolated, Limits};
 use rudb_compat::norec::CASES as PREDICATES;
 use rudb_compat::oracles::{Split, Verdict};
@@ -122,6 +123,12 @@ fn main() -> ExitCode {
             valued(&args, "--seed").and_then(|n| u32::try_from(n).ok()),
             messages,
         ),
+        Some("grammar") => grammar(
+            valued(&args, "--count")
+                .map_or(STATEMENTS, |n| usize::try_from(n).unwrap_or(STATEMENTS)),
+            valued(&args, "--seed"),
+            text(&args, "--rule").unwrap_or(RULE),
+        ),
         Some("tlp") => tlp(
             text(&args, "--form"),
             valued(&args, "--count").map_or(CASES, |n| usize::try_from(n).unwrap_or(CASES)),
@@ -221,7 +228,7 @@ fn child_limits(rest: &[&str]) -> (Duration, u64) {
 /// Anything else is left alone, including a flag nobody knows, so that a typed flag still reaches
 /// the arm that says it is not a flag rather than being quietly dropped here.
 fn positional(args: &[String]) -> Vec<&str> {
-    const VALUED: [&str; 11] = [
+    const VALUED: [&str; 12] = [
         "--limit",
         "--memory",
         "--out",
@@ -233,6 +240,7 @@ fn positional(args: &[String]) -> Vec<&str> {
         "--group",
         "--seconds",
         "--form",
+        "--rule",
     ];
     const PLAIN: [&str; 6] =
         ["--strict-messages", "--slow", "--refresh", "--pinned", "--shell", "--measure"];
@@ -787,6 +795,51 @@ fn sqlsmith(how_many: usize, seed: Option<u32>, messages: MessageMatch) -> ExitC
         }
     };
     print!("{}", rudb_compat::sqlsmith::Found::of(&report, seed, generator.version(), setup.len()));
+    ExitCode::SUCCESS
+}
+
+/// Write statements out of our own grammar table and ask both engines whether they parse.
+///
+/// The other half of `sqlsmith`. That one is upstream's generator, writes queries out of a catalog,
+/// and what it produces is realistic and narrow. This one walks the 1088 rule table the matcher
+/// walks, in the other direction, and what it produces is unrealistic and wide: every statement
+/// kind the grammar has, in proportion to how cheaply it can write each one.
+///
+/// It only asks whether the statement parses, and that is not a shortcut. A walk of the whole
+/// grammar writes `DROP`, `ATTACH` and `COPY t TO 'out.csv'`, and a harness that ran those would be
+/// a harness that writes files into whatever directory it was started in. Both engines are asked
+/// `accepts`, which parses and stops, so the run touches nothing and needs no session either, since
+/// a parser has nothing to remember.
+///
+/// The seed is printed whether it was given or not, and with the count it replays the run exactly.
+///
+/// There is no `--messages` here, unlike every mode that compares records. Two answers are either
+/// the same or they are not, the text an engine prints when it refuses something is never compared
+/// against the other engine's, and it is only ever used to name a group in the report.
+fn grammar(how_many: usize, seed: Option<u64>, rule: &str) -> ExitCode {
+    let seed = seed.unwrap_or_else(|| u64::from(fresh_seed()));
+    let statements = match rudb_compat::grammar::generate(how_many, seed, rule) {
+        Ok(written) => written,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (mut duckdb, mut rudb) = match engines(false) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let answers = match rudb_compat::grammar::ask(&mut *duckdb, &mut *rudb, &statements) {
+        Ok(answers) => answers,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{}", rudb_compat::grammar::Found::of(&answers, seed, rule));
     ExitCode::SUCCESS
 }
 
@@ -1553,6 +1606,15 @@ fn help() {
     println!("                them to both engines, grouped by what rudb said about them. Takes");
     println!("                --count and --seed, and prints the seed either way, because a");
     println!("                generated run that cannot be replayed is one nobody can fix.");
+    println!("  grammar       write statements out of our own grammar table and ask both engines");
+    println!("                whether they parse, grouped by what the engine that refused said.");
+    println!("                The other half of sqlsmith: that one is realistic and narrow and");
+    println!("                this one is unrealistic and wide, since it reaches every statement");
+    println!("                kind the grammar has. It only asks whether a statement parses,");
+    println!("                because a walk of the whole grammar writes DROP and COPY TO and a");
+    println!("                harness that ran those would write files where it was started.");
+    println!("                Takes --count, --seed and --rule, which defaults to Statement,");
+    println!("                and prints the seed either way.");
     println!("  tlp           generate predicates and split a query on each of them three ways,");
     println!("                where it is true, where it is false and where it is neither, and");
     println!("                require the three to add back up to the query with no predicate on");
