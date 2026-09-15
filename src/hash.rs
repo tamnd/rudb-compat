@@ -6,6 +6,14 @@
 //! format, it is not going to change, and a runner that cannot check those records cannot run most
 //! of DuckDB's corpus.
 //!
+//! It is read and it is never written. Section 9.3.1 of `spec/sql/duckdb/09-the-harness.md` is the
+//! decision and the short version is that 231 of the corpus's 34329 query records store a digest,
+//! 19 of them in files an ordinary run reads, and the corpus carries no `hash-threshold` line at
+//! all. So this exists because 32 of DuckDB's files contain a digest, and for no other reason. The
+//! harness never hashes a result it could have compared, no corpus written here stores one, and
+//! there is no `hash-threshold` setting on this side. A digest that fails is one bit and there is
+//! nothing in it to reduce, which is the whole argument.
+//!
 //! This is here rather than from a crate because the harness has no dependencies outside the
 //! engines it compares, and because MD5 is a hundred lines that have not moved since 1992. Nothing
 //! here is security relevant. The digest is a checksum over a list of strings a test file already
