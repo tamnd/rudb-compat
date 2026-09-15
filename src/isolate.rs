@@ -746,7 +746,10 @@ mod tests {
         let back = decode_run(&encode_run(&run));
         assert_eq!(back.files, 3);
         assert_eq!(back.stopped.len(), 3);
-        assert_eq!(back.stopped[0], ("slow.test".to_owned(), Stopped::Time(Duration::from_secs(120))));
+        assert_eq!(
+            back.stopped[0],
+            ("slow.test".to_owned(), Stopped::Time(Duration::from_secs(120)))
+        );
         assert_eq!(back.stopped[1], ("fat.test".to_owned(), Stopped::Memory(2048)));
         assert_eq!(back.stopped[2].1, Stopped::Died("signal: 9\tkilled".to_owned()));
         assert_eq!(back.cut_off(), Cut { timeout: 1, memory: 1, crashed: 1 });

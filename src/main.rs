@@ -18,7 +18,6 @@ use rudb_compat::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use rudb_compat::engine::{Engine, HarnessError};
 use rudb_compat::grammar::{RULE, STATEMENTS};
 use rudb_compat::isolate::{Isolated, Limits};
-use rudb_compat::shard::Shard;
 use rudb_compat::norec::CASES as PREDICATES;
 use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::queries::{Histogram, Query, histogram};
@@ -27,6 +26,7 @@ use rudb_compat::replay::{self, Note};
 use rudb_compat::report::{Cost, Page, Provenance, Sweep};
 use rudb_compat::resource::{RUNS, Ratios, Spread};
 use rudb_compat::rudb::Rudb;
+use rudb_compat::shard::Shard;
 use rudb_compat::shell::{Session, Shell};
 use rudb_compat::sqlsmith::QUERIES;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
@@ -94,7 +94,9 @@ fn main() -> ExitCode {
             }
         },
         Some("slt") => match shard(&args) {
-            Ok(shard) => slt(rest.get(1).copied(), slow, refresh, limits, shard, text(&args, "--out")),
+            Ok(shard) => {
+                slt(rest.get(1).copied(), slow, refresh, limits, shard, text(&args, "--out"))
+            }
             Err(why) => {
                 eprintln!("rudb-compat: {why}");
                 ExitCode::FAILURE
@@ -1624,12 +1626,7 @@ const fn root() -> &'static str {
 /// does and is deliberate. The corpus is thousands of statements against a database that is being
 /// built, so a nonzero exit would mean the job is red every day until the day it is finished and
 /// nobody would read it. What CI watches is the number going down.
-fn corpus(
-    path: &Path,
-    slow: bool,
-    limits: Limits,
-    shard: Shard,
-) -> Result<Isolated, HarnessError> {
+fn corpus(path: &Path, slow: bool, limits: Limits, shard: Shard) -> Result<Isolated, HarnessError> {
     let exe = std::env::current_exe()
         .map_err(|e| HarnessError::new(format!("cannot find this binary to re-run it: {e}")))?;
     rudb_compat::isolate::run_corpus(&exe, path, slow, limits, shard)

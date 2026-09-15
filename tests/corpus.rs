@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use rudb_compat::conform::run_path;
 use rudb_compat::isolate::{Isolated, Limits, decode_run, encode_run, run_corpus};
-use rudb_compat::shard::Shard;
 use rudb_compat::rudb::Rudb;
+use rudb_compat::shard::Shard;
 use rudb_compat::shell::{Session, Shell};
 
 #[test]
@@ -126,8 +126,8 @@ fn the_isolating_runner_gets_the_same_answer_as_the_one_in_this_process() {
 
     let exe = Path::new(env!("CARGO_BIN_EXE_rudb-compat"));
     let limits = Limits { time: Duration::from_secs(60), ..Limits::default() };
-    let apart =
-        run_corpus(exe, Path::new("corpus/slt"), false, limits, Shard::whole()).expect("the corpus is there");
+    let apart = run_corpus(exe, Path::new("corpus/slt"), false, limits, Shard::whole())
+        .expect("the corpus is there");
 
     assert!(apart.stopped.is_empty(), "{:?}", apart.stopped);
     assert_eq!(apart.files, inline.files);

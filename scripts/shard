@@ -5,8 +5,10 @@
 #   scripts/shard server2 gpc           two slices over the two machines named
 #
 # Every machine gets the whole working tree and the argument --shard k/n, takes every kth file of
-# the sorted list, and writes what it found to a file this script copies back. The last step is
-# `rudb-compat merge`, which adds the files up and prints what one unsharded run would have printed.
+# the sorted list, and writes what it found to a file. The shards are collected onto the first
+# machine named and added up there by `rudb-compat merge`, which prints what one unsharded run would
+# have printed. Nothing is built on the laptop this is typed on, which is the same rule scripts/gate
+# follows and for the same reason: the disk is full and this crate builds all of rudb.
 #
 # This is worth reading before it is worth running. The corpus is 364 processor seconds of work and
 # one file of it is 125, so a run cannot finish faster than that one file however many machines it
@@ -39,7 +41,7 @@ for host in $hosts; do
   # from the others in the terminal.
   # shellcheck disable=SC2029
   ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
-    cargo run --release -q -- slt --shard $at/$of --out shard.out" >"$out/$at.log" 2>&1 &
+    cargo run --release -q -- slt --shard $at/$of --out target/shard.out" >"$out/$at.log" 2>&1 &
   running="$running $!"
   echo "shard $at/$of on $host"
 done
@@ -52,11 +54,25 @@ for pid in $running; do
   wait "$pid" || { echo "a shard failed, the logs are in $out"; exit 1; }
 done
 
+# Collected onto the first machine rather than onto this one, because that machine has a built
+# binary already and this one is not allowed to have one. Everything a run writes goes under
+# target, which is the one directory the rsync above leaves alone.
+home=$(echo "$hosts" | cut -d' ' -f1)
+# shellcheck disable=SC2029
+ssh "$home" "rm -rf ~/$remote/target/shards"
 at=0
 for host in $hosts; do
   at=$((at + 1))
-  rsync -a "$host:$remote/shard.out" "$out/$at.out"
+  if [ "$host" = "$home" ]; then
+    # shellcheck disable=SC2029
+    ssh "$host" "mkdir -p ~/$remote/target/shards && cp ~/$remote/target/shard.out ~/$remote/target/shards/$at.out"
+  else
+    rsync -a "$host:$remote/target/shard.out" "$out/$at.out"
+    rsync -a --rsync-path "mkdir -p ~/$remote/target/shards && rsync" \
+      "$out/$at.out" "$home:$remote/target/shards/$at.out"
+  fi
 done
 
-cd "$root"
-cargo run --release -q -- merge "$out"/*.out
+# shellcheck disable=SC2029
+ssh "$home" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
+  cargo run --release -q -- merge target/shards/*.out"
