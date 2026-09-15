@@ -107,6 +107,27 @@ impl Measured {
         if theirs == 0.0 { f64::INFINITY } else { self.ours.wall.as_secs_f64() / theirs }
     }
 
+    /// Processor time, rudb over the pin.
+    ///
+    /// Beside the wall clock and not instead of it. An engine that is even on elapsed time and far
+    /// behind here is getting its speed from cores rather than from work, and that is invisible in
+    /// every report that publishes elapsed time alone.
+    #[must_use]
+    pub fn cpu(&self) -> f64 {
+        let theirs = self.theirs.cpu.as_secs_f64();
+        if theirs == 0.0 { f64::INFINITY } else { self.ours.cpu.as_secs_f64() / theirs }
+    }
+
+    /// Peak resident set, rudb over the pin.
+    #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a resident set a double cannot count does not exist"
+    )]
+    pub fn memory(&self) -> f64 {
+        if self.theirs.peak == 0 { 0.0 } else { self.ours.peak as f64 / self.theirs.peak as f64 }
+    }
+
     /// How much of this benchmark is the load rather than the query, on the pinned binary.
     ///
     /// Taken on the pin rather than on rudb because it is the side that answers everything, so it
