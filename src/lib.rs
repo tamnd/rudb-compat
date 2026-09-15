@@ -48,6 +48,7 @@ pub mod predicate;
 pub mod queries;
 pub mod quote;
 pub mod reduce;
+pub mod replay;
 pub mod report;
 pub mod resource;
 pub mod rudb;

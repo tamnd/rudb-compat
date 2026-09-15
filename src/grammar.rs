@@ -65,6 +65,7 @@ use std::fmt;
 use rudb::generate::{Catalog, Table};
 
 use crate::engine::{Acceptance, Engine, EngineError, HarnessError};
+use crate::replay::{self, Run, Shape};
 use crate::sqlsmith::generalised;
 
 /// How many statements a run writes when nobody said a number.
@@ -258,6 +259,32 @@ impl Found {
     #[must_use]
     pub fn missing(&self) -> usize {
         self.gap.iter().map(|group| group.found).sum()
+    }
+
+    /// How many rudb parsed and DuckDB did not, which is the other direction.
+    #[must_use]
+    pub fn extra(&self) -> usize {
+        self.invented.iter().map(|group| group.found).sum()
+    }
+
+    /// This run as a row for the generated series.
+    ///
+    /// Both directions count as findings. A statement DuckDB parses and rudb does not is the worse
+    /// of the two and a statement rudb parses and DuckDB does not is still something to fix, so a
+    /// series row that counted only the first would report a clean run on a mode that found 1264
+    /// things. The two are still apart on the page, which is where somebody reads them.
+    #[must_use]
+    pub fn recorded(&self) -> Run {
+        Run {
+            mode: "grammar",
+            shape: Shape::Flag("--rule", self.rule.clone()),
+            seed: self.seed,
+            cases: self.statements,
+            usable: self.usable(),
+            findings: self.missing() + self.extra(),
+            groups: self.gap.len() + self.invented.len(),
+            engines: replay::BOTH,
+        }
     }
 }
 

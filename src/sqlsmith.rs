@@ -41,6 +41,7 @@ use std::process::Command;
 
 use crate::compare::{Difference, Side};
 use crate::engine::HarnessError;
+use crate::replay::{self, Run, Shape};
 use crate::suite::Report;
 
 /// How many queries a run asks for when nobody said a number.
@@ -254,6 +255,31 @@ impl Found {
     #[must_use]
     pub const fn usable(&self) -> usize {
         self.queries - self.unusable
+    }
+
+    /// How many queries the two engines disagreed about.
+    #[must_use]
+    pub fn differences(&self) -> usize {
+        self.shapes.iter().map(|(_, found, _)| found).sum()
+    }
+
+    /// This run as a row for the generated series.
+    ///
+    /// No shape flag. The mode takes no choice about what it generates, because the generator is
+    /// upstream's and the only thing that changes what comes out is which build of it is on the
+    /// machine, which the version column already carries.
+    #[must_use]
+    pub fn recorded(&self) -> Run {
+        Run {
+            mode: "sqlsmith",
+            shape: Shape::Only,
+            seed: u64::from(self.seed),
+            cases: self.queries,
+            usable: self.usable(),
+            findings: self.differences(),
+            groups: self.shapes.len(),
+            engines: replay::BOTH,
+        }
     }
 }
 

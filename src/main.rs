@@ -22,6 +22,7 @@ use rudb_compat::norec::CASES as PREDICATES;
 use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::queries::{Histogram, Query, histogram};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
+use rudb_compat::replay::{self, Note};
 use rudb_compat::report::{Page, Provenance, Sweep};
 use rudb_compat::resource::{RUNS, Ratios, Spread};
 use rudb_compat::rudb::Rudb;
@@ -794,7 +795,9 @@ fn sqlsmith(how_many: usize, seed: Option<u32>, messages: MessageMatch) -> ExitC
             return ExitCode::FAILURE;
         }
     };
-    print!("{}", rudb_compat::sqlsmith::Found::of(&report, seed, generator.version(), setup.len()));
+    let found = rudb_compat::sqlsmith::Found::of(&report, seed, generator.version(), setup.len());
+    print!("{found}");
+    noted(&found.recorded());
     ExitCode::SUCCESS
 }
 
@@ -839,7 +842,9 @@ fn grammar(how_many: usize, seed: Option<u64>, rule: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    print!("{}", rudb_compat::grammar::Found::of(&answers, seed, rule));
+    let found = rudb_compat::grammar::Found::of(&answers, seed, rule);
+    print!("{found}");
+    noted(&found.recorded());
     ExitCode::SUCCESS
 }
 
@@ -882,6 +887,7 @@ fn tlp(form: Option<&str>, count: usize, seed: Option<u64>, pinned: bool) -> Exi
     match rudb_compat::tlp::run(&mut *engine, form, count, seed) {
         Ok(found) => {
             print!("{found}");
+            noted(&found.recorded(if pinned { replay::PINNED } else { replay::ALONE }));
             if found.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Err(e) => {
@@ -921,12 +927,33 @@ fn norec(count: usize, seed: Option<u64>, pinned: bool) -> ExitCode {
     match found {
         Ok(found) => {
             print!("{found}");
+            noted(&found.recorded(if pinned { replay::PINNED } else { replay::ALONE }));
             if found.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
         }
         Err(e) => {
             eprintln!("rudb-compat: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Print what a generated run was measured against, and append it to the series.
+///
+/// Every one of the four generated modes ends with this, because a seed on its own reproduces a run
+/// against the rudb, the DuckDB and the generator that were on the machine at the time, and all
+/// three of those move. The six fields are the ones section 11.2 asks for.
+///
+/// A series that cannot be written is a warning and not a failure. The findings are already on the
+/// screen, they are the thing somebody ran this for, and a full disk or a read only checkout is no
+/// reason to throw them away and exit nonzero.
+fn noted(run: &replay::Run) {
+    let provenance = replay::provenance(Path::new(root()), Rudb::new().version(), run);
+    println!();
+    print!("{}", Note::of(run, &provenance));
+    let into = Path::new(root()).join(rudb_compat::report::DEST);
+    match replay::record(&into, run, &provenance) {
+        Ok(file) => println!("  recorded in    {}", file.display()),
+        Err(e) => eprintln!("rudb-compat: the run is above but it was not recorded: {e}"),
     }
 }
 
