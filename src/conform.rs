@@ -1356,6 +1356,11 @@ fn check(
                     Err(why) => fail(sql, Reason::WrongAnswer, why),
                 },
                 QueryResult::Hash { count, digest } => {
+                    // The count first and the digest second, because the count is the only part of
+                    // this that says anything a person can act on. Section 9.3.1 of the harness spec
+                    // is why the digest stands as the outcome here rather than the record being put
+                    // to a live binary: there are 19 of these in a default run and requiring a
+                    // DuckDB for them would cost the property that this runs on every commit.
                     if values.len() != *count {
                         fail(
                             sql,
