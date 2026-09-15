@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use crate::conform::{Failure, Reason, Reasons, Skips, Summary};
 use crate::engine::HarnessError;
+use crate::kinds::Kinds;
 
 /// How long a statement may run and how large a file may get.
 ///
@@ -176,6 +177,11 @@ pub struct Isolated {
     /// nobody has an answer for, and putting them in either column would be a number with nothing
     /// behind it. They are a list of names, which is the only honest thing to publish about them.
     pub stopped: Vec<(String, Stopped)>,
+    /// Which statement kind each record that ran was, folded over every file.
+    ///
+    /// A file that was cut off contributes nothing here, for the same reason it contributes to
+    /// neither the passed nor the failed count: nobody knows what its records would have done.
+    pub kinds: Kinds,
 }
 
 impl Isolated {
@@ -236,6 +242,7 @@ impl Isolated {
         self.skipped_files.extend(other.skipped_files);
         self.failures.extend(other.failures);
         self.stopped.extend(other.stopped);
+        self.kinds.absorb(&other.kinds);
     }
 }
 
@@ -431,6 +438,14 @@ pub fn encode(summary: &Summary) -> String {
         summary.skipped.machine,
         summary.skipped.unreadable
     ));
+    // One line per statement kind the file had a record of, rather than the SQL of every record
+    // that passed. The parse that decided the kind happened in the child and there is no reason to
+    // do it again in the parent, and the whole corpus is four thousand files against a surface of
+    // thirty six, so this is at most thirty six short lines per file.
+    out.push_str(&format!("unclassified\t{}\n", summary.kinds.unclassified));
+    for (kind, tally) in summary.kinds.rows() {
+        out.push_str(&format!("kind\t{}\t{}\t{}\n", escape(kind), tally.passed, tally.failed));
+    }
     for (name, why) in &summary.skipped_files {
         out.push_str(&format!("skipfile\t{}\t{}\n", escape(name), escape(&why.to_string())));
     }
@@ -475,6 +490,19 @@ pub fn decode(name: &str, text: &str) -> Isolated {
                 out.skips.machine = at(8);
                 out.skips.unreadable = at(9);
                 counted = true;
+            }
+            ["unclassified", count] => {
+                out.kinds.unclassified += count.parse().unwrap_or(0);
+            }
+            // A count that does not parse becomes zero rather than dropping the kind, because a kind
+            // that ran is a kind the corpus reached and that is true whatever the number beside it
+            // says.
+            ["kind", name, passed, failed] => {
+                out.kinds.charged(
+                    &unescape(name),
+                    passed.parse().unwrap_or(0),
+                    failed.parse().unwrap_or(0),
+                );
             }
             ["skipfile", file, why] => {
                 out.skipped_files.push((unescape(file), unescape(why)));
@@ -542,6 +570,7 @@ fn unescape(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::conform::Skipped;
+    use crate::kinds::Tally;
 
     #[test]
     fn a_summary_survives_the_trip_out_and_back() {
@@ -573,6 +602,7 @@ mod tests {
                 reason: Reason::WrongAnswer,
                 detail: "wanted 1\tgot 2".to_owned(),
             }],
+            kinds: kinds(),
         };
         let back = decode("b.test", &encode(&summary));
         assert_eq!(back.files, 1);
@@ -590,6 +620,38 @@ mod tests {
         assert_eq!(back.failures[0].reason, Reason::WrongAnswer);
         assert_eq!(back.reasons().count(Reason::WrongAnswer), 1);
         assert!(back.stopped.is_empty());
+        assert_eq!(back.kinds.tally("SelectStatement"), Tally { passed: 3, failed: 1 });
+        assert_eq!(back.kinds.tally("DropStatement"), Tally { passed: 1, failed: 0 });
+        assert_eq!(back.kinds.unclassified, 2);
+    }
+
+    /// A tally with all three of the things that have to survive the trip in it.
+    fn kinds() -> Kinds {
+        let mut kinds = Kinds::default();
+        for _ in 0..3 {
+            kinds.charge("SELECT 1", true);
+        }
+        kinds.charge("SELECT 2", false);
+        kinds.charge("DROP TABLE t", true);
+        kinds.charge("SELECT FROM WHERE", false);
+        kinds.charge("not sql at all", false);
+        kinds
+    }
+
+    #[test]
+    fn a_child_that_says_nothing_about_kinds_is_a_run_with_none_rather_than_a_broken_one() {
+        let back = decode("b.test", "counts\t1\t2\t0\t0\t0\t0\t0\t0\t0\t0\n");
+        assert_eq!(back.passed, 2);
+        assert!(back.kinds.is_empty());
+    }
+
+    #[test]
+    fn a_kind_line_with_a_count_that_is_not_a_number_keeps_the_kind() {
+        let back = decode(
+            "b.test",
+            "counts\t1\t2\t0\t0\t0\t0\t0\t0\t0\t0\nkind\tSelectStatement\tsome\t1\n",
+        );
+        assert_eq!(back.kinds.tally("SelectStatement"), Tally { passed: 0, failed: 1 });
     }
 
     #[test]

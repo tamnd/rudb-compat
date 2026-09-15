@@ -4,10 +4,15 @@
 //! and never edited by hand, with eleven numbers on it, each with a denominator and a provenance,
 //! and no single headline percentage anywhere. This module writes that page.
 //!
-//! Two of the eleven have nothing behind them today: statement coverage and the five error levels.
-//! They are printed under a heading that says so and names what would produce each one, rather than
-//! being left off the page or printed as a zero. A zero is a measurement and a missing measurement
-//! is not, and the difference between the two is the whole of section 1.2.
+//! One of the eleven has nothing behind it today, which is the five error levels, and that waits on
+//! milestone 6. It is printed under a heading that says so and names what would produce it, rather
+//! than being left off the page or printed as a zero. A zero is a measurement and a missing
+//! measurement is not, and the difference between the two is the whole of section 1.2.
+//!
+//! Statement coverage is computed by this command, out of the same records the pass rate comes out
+//! of, because section 1.2 says a statement kind counts when every record of it works or fails the
+//! way the file said, and that is a question about a corpus run rather than about a list of
+//! statements. [`crate::kinds`] is where it is worked out.
 //!
 //! Two more are measured now but not by this command: function coverage, and the three resource
 //! ratios. The sweep behind the first is every generated call to every overload in the catalog put
@@ -34,6 +39,7 @@ use crate::coverage::{Coverage, Tally, Untested};
 use crate::duckdb::{Duckdb, PINNED, PINNED_COMMIT, Pin};
 use crate::engine::{Engine, HarnessError};
 use crate::isolate::Isolated;
+use crate::kinds::Kinds;
 use crate::resource::{Ratios, Spread};
 use crate::vendor;
 
@@ -48,7 +54,7 @@ pub const SERIES: &str = "series.tsv";
 /// Tab separated because this crate has one dependency and it is the engine, so there is no
 /// serializer here and there is not going to be one. A tab separated file with a header is a table
 /// awk and every spreadsheet already read.
-pub const COLUMNS: [&str; 17] = [
+pub const COLUMNS: [&str; 21] = [
     "when",
     "machine",
     "rudb",
@@ -66,6 +72,10 @@ pub const COLUMNS: [&str; 17] = [
     "skip_harness",
     "skip_machine",
     "wrong_answers",
+    "kinds_supported",
+    "kinds_failing",
+    "kinds_untouched",
+    "kinds_unclassified",
 ];
 
 /// The file every function sweep appends one row to, beside the pages.
@@ -698,6 +708,83 @@ impl fmt::Display for Page<'_> {
         )?;
         writeln!(f)?;
 
+        if !run.kinds.is_empty() {
+            writeln!(f, "## Statements")?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "The first of the three level two denominators, computed by this run, over the {} alternatives of the Statement rule in the vendored grammar. A kind counts when every record of it either did what the file said or failed the way the file said it fails. That is section 1.2 read strictly: one failing record takes the whole kind out however many passed beside it, and a kind counts as nothing at all until a record of it has run.",
+                Kinds::surface().len()
+            )?;
+            writeln!(f)?;
+            let supported = run.kinds.supported();
+            let failing = run.kinds.failing();
+            let untouched = run.kinds.untouched();
+            let surface = Kinds::surface().len();
+            writeln!(f, "    supported   {:>7}  of {surface} statement kinds", supported.len())?;
+            writeln!(
+                f,
+                "    failing     {:>7}  at least one record of it did something else",
+                failing.len()
+            )?;
+            writeln!(
+                f,
+                "    untouched   {:>7}  no record in this corpus is one, so nothing is measured",
+                untouched.len()
+            )?;
+            writeln!(
+                f,
+                "    coverage    {:>7.1}  percent of the {surface}, which is the published number",
+                run.kinds.rate() * 100.0
+            )?;
+            writeln!(f)?;
+            if supported.is_empty() {
+                writeln!(
+                    f,
+                    "Coverage is zero while every kind the corpus writes has at least one record that did something else, which is section 1.2 working as intended rather than an engine that answers nothing. Early on the per kind table below is the thing to read, because a kind with four thousand passes and one failure counts the same in the row above as a kind with no passes at all."
+                )?;
+                writeln!(f)?;
+            }
+            writeln!(
+                f,
+                "{} records that ran were sorted into a kind and {} more could not be, because the vendored grammar does not accept them. Most of those are the corpus writing a syntax error on purpose, since a file of `statement error` records is full of them, and the rest are a hole in the grammar or the tokenizer, which is ours. The sorting is done by the parser rather than by the first word, because `WITH x AS (...) INSERT INTO t SELECT * FROM x` starts with WITH and is an insert.",
+                run.kinds.records(),
+                run.kinds.unclassified
+            )?;
+            writeln!(f)?;
+            writeln!(f, "### Per kind")?;
+            writeln!(f)?;
+            writeln!(f, "    {:<30}{:>9}{:>9}{:>9}", "kind", "records", "passed", "failed")?;
+            for (kind, tally) in run.kinds.rows() {
+                writeln!(
+                    f,
+                    "    {:<30}{:>9}{:>9}{:>9}",
+                    fitted(kind, 29),
+                    tally.records(),
+                    tally.passed,
+                    tally.failed
+                )?;
+            }
+            writeln!(f)?;
+            if untouched.is_empty() {
+                writeln!(f, "Every kind the grammar has is in the table above.")?;
+            } else if untouched.len() == 1 {
+                writeln!(
+                    f,
+                    "The one kind with no record in this corpus, which is the figure to read beside the coverage number the way section 11.3 reads the zero weight names beside function coverage: {}.",
+                    untouched[0]
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "The {} kinds with no record in this corpus, which is the figure to read beside the coverage number the way section 11.3 reads the zero weight names beside function coverage: {}.",
+                    untouched.len(),
+                    untouched.join(", ")
+                )?;
+            }
+            writeln!(f)?;
+        }
+
         writeln!(f, "## Failures by reason")?;
         writeln!(f)?;
         writeln!(
@@ -931,6 +1018,9 @@ impl fmt::Display for Page<'_> {
             if what == RESOURCES && self.cost.is_some() {
                 continue;
             }
+            if what == STATEMENTS && !self.run.kinds.is_empty() {
+                continue;
+            }
             writeln!(f, "    {what:<20}{needs}")?;
         }
         writeln!(f)?;
@@ -963,14 +1053,26 @@ const FUNCTIONS: &str = "function coverage";
 /// The row of [`MISSING`] that a recorded cost run takes off the list.
 const RESOURCES: &str = "resource ratios";
 
-/// The four numbers section 11.2 asks for that nothing here computes yet.
+/// The row of [`MISSING`] that a run with records in it takes off the list.
+///
+/// Off on any run that got as far as sorting a record, which is every run over a corpus that is
+/// there. It stays on for a run over an empty directory, where the honest thing to print is not a
+/// coverage of zero.
+const STATEMENTS: &str = "statement coverage";
+
+/// The four numbers section 11.2 asks for that a page may have nothing behind.
 ///
 /// Kept as data rather than as paragraphs so that deleting a row is the whole of the work when one
-/// of them starts being measured, and so that a reader can see there are four of them. Function
-/// coverage is still on the list, because a page written on a machine that has never run a sweep has
-/// nothing to carry and the honest thing to print then is what it would take.
+/// of them stops being one of these, and so that a reader can see how many there are. Three of the
+/// four are measured somewhere now and are still on the list, because each of the three has a run
+/// that has to have happened first, and a page written where it has not has nothing to carry. The
+/// honest thing to print then is what it would take. Only the error levels are on the list because
+/// nothing anywhere measures them, and that waits on milestone 6.
 const MISSING: [(&str, &str); 4] = [
-    ("statement coverage", "over the 36 statements in section 1.1, needs the per statement suite"),
+    (
+        STATEMENTS,
+        "over the 36 alternatives of the Statement rule, needs a run with records in it, which this was not",
+    ),
     (
         FUNCTIONS,
         "over the 1159 names in duckdb_functions() on the pin, weighted and unweighted, needs a sweep beside these pages, which `rudb-compat coverage --out` writes",
@@ -1133,6 +1235,10 @@ pub fn row(run: &Isolated, p: &Provenance) -> String {
         (skips.unsupported + skips.unreadable).to_string(),
         skips.machine.to_string(),
         run.reasons().count(Reason::WrongAnswer).to_string(),
+        run.kinds.supported().len().to_string(),
+        run.kinds.failing().len().to_string(),
+        run.kinds.untouched().len().to_string(),
+        run.kinds.unclassified.to_string(),
     ];
     fields.join("\t")
 }
@@ -1353,6 +1459,7 @@ mod tests {
     use crate::cost::{Costs, Measured};
     use crate::coverage::{Coverage, Tally, Untested};
     use crate::isolate::Isolated;
+    use crate::kinds::Kinds;
 
     fn provenance() -> Provenance {
         Provenance {
@@ -1393,7 +1500,20 @@ mod tests {
             skipped_files: vec![("a.test".to_owned(), "needs an extension".to_owned())],
             failures: vec![failure(Reason::NotImplemented), failure(Reason::Unbound)],
             stopped: Vec::new(),
+            kinds: kinds(),
         }
+    }
+
+    /// A statement tally with all four of the things the section prints in it: a kind every record
+    /// of which passed, one with a failure in it, one the corpus never writes, and a record nothing
+    /// can sort.
+    fn kinds() -> Kinds {
+        let mut kinds = Kinds::default();
+        kinds.charge("DROP TABLE t", true);
+        kinds.charge("SELECT 1", true);
+        kinds.charge("SELECT 2", false);
+        kinds.charge("SELECT FROM WHERE", false);
+        kinds
     }
 
     fn failure(reason: Reason) -> Failure {
@@ -1426,12 +1546,125 @@ mod tests {
     #[test]
     fn the_numbers_nothing_measures_yet_are_named_rather_than_left_off_or_called_zero() {
         let page = Page::of(&run(), &provenance()).to_string();
-        for missing in
-            ["statement coverage", "function coverage", "error levels", "resource ratios"]
-        {
+        for missing in ["function coverage", "error levels", "resource ratios"] {
             assert!(page.contains(missing), "{missing} is not named\n{page}");
         }
         assert!(page.contains("What this page does not say yet"), "{page}");
+    }
+
+    #[test]
+    fn a_run_that_sorted_no_records_names_statement_coverage_rather_than_printing_a_zero() {
+        // The one case where nothing has been sorted, which is a run over an empty directory. A
+        // coverage of zero there would be a measurement and this is the absence of one.
+        let empty = Isolated { kinds: Kinds::default(), ..run() };
+        let page = Page::of(&empty, &provenance()).to_string();
+        let missing = page.split("## What this page does not say yet").nth(1).expect("the heading");
+        assert!(missing.contains("statement coverage"), "{missing}");
+        assert!(!page.contains("## Statements"), "{page}");
+    }
+
+    #[test]
+    fn the_statement_section_says_the_three_answers_and_the_records_nothing_could_sort() {
+        let page = Page::of(&run(), &provenance()).to_string();
+        assert!(page.contains("## Statements"), "{page}");
+        let section = page.split("## Statements").nth(1).expect("the heading");
+        // One kind every record of which passed, one with a failure in it, thirty four nobody wrote.
+        assert!(section.contains("supported         1  of 36 statement kinds"), "{section}");
+        assert!(section.contains("failing           1"), "{section}");
+        assert!(section.contains("untouched        34"), "{section}");
+        assert!(section.contains("coverage        2.8  percent of the 36"), "{section}");
+        assert!(
+            section.contains("3 records that ran were sorted into a kind and 1 more"),
+            "{section}"
+        );
+        assert!(!section.contains("Coverage is zero"), "{section}");
+    }
+
+    #[test]
+    fn a_coverage_of_zero_says_why_rather_than_leaving_the_reader_to_guess() {
+        // Where the real corpus is today: forty thousand selects, seven thousand of them right, and
+        // one failure in the kind is enough to take the whole kind out.
+        let mut kinds = Kinds::default();
+        kinds.charged("SelectStatement", 7293, 33341);
+        let page = Page::of(&Isolated { kinds, ..run() }, &provenance()).to_string();
+        let section = page.split("## Statements").nth(1).expect("the heading");
+        assert!(section.contains("coverage        0.0"), "{section}");
+        assert!(section.contains("rather than an engine that answers nothing"), "{section}");
+    }
+
+    #[test]
+    fn the_per_kind_table_has_a_row_for_every_kind_with_a_record_and_no_others() {
+        let page = Page::of(&run(), &provenance()).to_string();
+        let table = page.split("### Per kind").nth(1).expect("the heading");
+        let rows: Vec<&str> = table
+            .lines()
+            .skip_while(|line| !line.contains("kind"))
+            .skip(1)
+            .take_while(|line| line.starts_with("    "))
+            .collect();
+        assert_eq!(rows.len(), 2, "{table}");
+        assert!(rows[0].contains("DropStatement"), "{table}");
+        assert!(rows[1].contains("SelectStatement"), "{table}");
+        assert!(!table.contains("MergeIntoStatement\n"), "{table}");
+    }
+
+    #[test]
+    fn the_kinds_the_corpus_never_writes_are_listed_and_not_just_counted() {
+        let page = Page::of(&run(), &provenance()).to_string();
+        let section = page.split("## Statements").nth(1).expect("the heading");
+        assert!(section.contains("34 kinds with no record in this corpus"), "{section}");
+        assert!(section.contains("MergeIntoStatement"), "{section}");
+    }
+
+    /// Every kind the grammar has, with one passing record each, which is the whole surface covered.
+    fn whole_surface(leave_out: &str) -> Kinds {
+        let mut kinds = Kinds::default();
+        for kind in Kinds::surface().into_iter().filter(|kind| *kind != leave_out) {
+            kinds.charged(kind, 1, 0);
+        }
+        kinds
+    }
+
+    #[test]
+    fn one_kind_left_over_is_named_in_the_singular() {
+        // The real corpus is this case, since it writes all but one of the thirty six.
+        let kinds = whole_surface("MergeIntoStatement");
+        let page = Page::of(&Isolated { kinds, ..run() }, &provenance()).to_string();
+        let section = page.split("## Statements").nth(1).expect("the heading");
+        assert!(section.contains("The one kind with no record in this corpus"), "{section}");
+        assert!(section.contains(": MergeIntoStatement."), "{section}");
+    }
+
+    #[test]
+    fn the_longest_name_the_grammar_has_fits_the_column_rather_than_being_cut_short() {
+        let kinds = whole_surface("");
+        let page = Page::of(&Isolated { kinds, ..run() }, &provenance()).to_string();
+        let table = page.split("### Per kind").nth(1).expect("the heading");
+        let rows: Vec<&str> = table
+            .lines()
+            .skip_while(|line| !line.contains("kind"))
+            .skip(1)
+            .take_while(|line| line.starts_with("    "))
+            .collect();
+        assert_eq!(rows.len(), 36, "{table}");
+        assert!(rows.iter().any(|row| row.contains("ExtensionRepositoryStatement ")), "{table}");
+        assert!(!rows.iter().any(|row| row.contains("...")), "{table}");
+        assert!(table.contains("Every kind the grammar has is in the table above."), "{table}");
+    }
+
+    #[test]
+    fn the_four_statement_counts_are_on_the_series_row_in_the_order_the_header_says() {
+        let written = row(&run(), &provenance());
+        let fields: Vec<&str> = written.split('\t').collect();
+        assert_eq!(fields.len(), COLUMNS.len());
+        let at = |name: &str| {
+            let index = COLUMNS.iter().position(|column| *column == name).expect(name);
+            fields[index]
+        };
+        assert_eq!(at("kinds_supported"), "1");
+        assert_eq!(at("kinds_failing"), "1");
+        assert_eq!(at("kinds_untouched"), "34");
+        assert_eq!(at("kinds_unclassified"), "1");
     }
 
     /// The numbers off the first full sweep, which ran on server2 in September.
@@ -1473,7 +1706,7 @@ mod tests {
         let page = Page::of(&run(), &provenance()).with(Some(&sweep)).to_string();
         let missing = page.split("## What this page does not say yet").nth(1).expect("the heading");
         assert!(!missing.contains("function coverage"), "{missing}");
-        for still in ["statement coverage", "error levels", "resource ratios"] {
+        for still in ["error levels", "resource ratios"] {
             assert!(missing.contains(still), "{still} came off the list too\n{missing}");
         }
     }
@@ -1629,7 +1862,7 @@ mod tests {
         let page = Page::of(&run(), &provenance()).with_cost(Some(&cost)).to_string();
         let missing = page.split("## What this page does not say yet").nth(1).expect("the heading");
         assert!(!missing.contains("resource ratios"), "{missing}");
-        for still in ["statement coverage", "function coverage", "error levels"] {
+        for still in ["function coverage", "error levels"] {
             assert!(missing.contains(still), "{still} came off the list too\n{missing}");
         }
     }
