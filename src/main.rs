@@ -704,7 +704,8 @@ fn slt(
                 // The whole run in the form `merge` reads, rather than the failures in full. A
                 // shard is written down to be added to three others and not to be read by a person,
                 // and the failure dump is tens of megabytes.
-                if let Err(e) = std::fs::write(out, rudb_compat::isolate::encode_run(&total)) {
+                let written = stamp(path, shard) + &rudb_compat::isolate::encode_run(&total);
+                if let Err(e) = std::fs::write(out, written) {
                     eprintln!("rudb-compat: cannot write {out}: {e}");
                     return ExitCode::FAILURE;
                 }
@@ -734,6 +735,31 @@ fn shard(args: &[String]) -> Result<Shard, String> {
     text(args, "--shard").map_or_else(|| Ok(Shard::whole()), Shard::parse)
 }
 
+/// Which corpus a shard ran over, written at the top of the file `--out` produces.
+///
+/// A shard is a slice of a sorted list of files, so two machines that are not looking at the same
+/// list are not running two halves of one corpus. That is not a hypothetical. The first real run of
+/// this had server2 at one commit of upstream and the gaming machine at another, ten files apart,
+/// because the corpus is fetched per machine and `v2.0-cyanoptera` is a branch that moves. The
+/// merged answer had five files nobody ran and a pass rate that was neither machine's. So the
+/// commit goes in the file and `merge` refuses a set of shards that do not agree on it.
+fn stamp(path: Option<&str>, shard: Shard) -> String {
+    let over = match path {
+        Some(path) => path.to_owned(),
+        None => {
+            rudb_compat::vendor::commit(Path::new(root())).unwrap_or_else(|_| "unknown".to_owned())
+        }
+    };
+    format!("corpus\t{over}\t{shard}\n")
+}
+
+/// The corpus a shard file says it ran over, which is the second field of its first line.
+fn stamped(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("corpus\t"))
+        .map(|rest| rest.split('\t').next().unwrap_or(rest))
+}
+
 /// Fold the shards of one corpus run back together and print what a whole run would have printed.
 ///
 /// No page and no series row. A page carries the provenance of one machine and a sharded run has
@@ -745,15 +771,37 @@ fn merge(files: &[&str]) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let mut total = Isolated::default();
+    let mut over: Option<String> = None;
     for file in files {
-        match std::fs::read_to_string(file) {
-            Ok(text) => total.absorb(rudb_compat::isolate::decode_run(&text)),
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
             Err(e) => {
                 eprintln!("rudb-compat: cannot read {file}: {e}");
                 return ExitCode::FAILURE;
             }
+        };
+        let Some(corpus) = stamped(&text) else {
+            eprintln!("rudb-compat: {file} does not say which corpus it ran over");
+            return ExitCode::FAILURE;
+        };
+        if corpus == "unknown" {
+            eprintln!("rudb-compat: {file} ran over a corpus it could not name, so it cannot be");
+            eprintln!("added to anything. Run the shards over a fetched corpus.");
+            return ExitCode::FAILURE;
         }
+        match &over {
+            Some(first) if first != corpus => {
+                eprintln!("rudb-compat: {file} ran over {corpus} and an earlier shard ran over");
+                eprintln!("{first}, so these are slices of two different corpora and adding them");
+                eprintln!("up would produce a number that is neither. Refresh the corpus on every");
+                eprintln!("machine and run them again.");
+                return ExitCode::FAILURE;
+            }
+            _ => over = Some(corpus.to_owned()),
+        }
+        total.absorb(rudb_compat::isolate::decode_run(&text));
     }
+    println!("corpus  {}", over.unwrap_or_default());
     println!("merged  {} shards", files.len());
     println!();
     print_corpus(&Rudb::new(), &total);
@@ -1852,7 +1900,7 @@ fn help() {
 
 #[cfg(test)]
 mod tests {
-    use super::positional;
+    use super::{Shard, positional, stamp, stamped};
 
     fn split(line: &str) -> Vec<String> {
         line.split_whitespace().map(ToOwned::to_owned).collect()
@@ -1873,6 +1921,23 @@ mod tests {
     fn the_equals_spelling_of_a_valued_flag_is_dropped_too() {
         let args = split("slt --shard=1/2 --limit=30 corpus/slt");
         assert_eq!(positional(&args), vec!["slt", "corpus/slt"]);
+    }
+
+    #[test]
+    fn a_shard_file_says_which_corpus_it_ran_over() {
+        let line = stamp(None, Shard::parse("2/4").expect("a shard"));
+        assert!(line.starts_with("corpus\t"));
+        assert!(line.ends_with("\t2/4\n"));
+        assert_eq!(stamped(&format!("{line}counts\t1\t2\t3\n")), stamped(&line));
+        assert_eq!(stamped("corpus\tabc123\t2/4\ncounts\t1\n"), Some("abc123"));
+    }
+
+    #[test]
+    fn a_shard_file_with_no_corpus_line_is_not_read_as_one_with_an_empty_name() {
+        // Two files that both say nothing would otherwise agree with each other, which is the one
+        // way the check that they ran over the same corpus could pass by saying nothing at all.
+        assert_eq!(stamped("counts\t1\t2\t3\n"), None);
+        assert_eq!(stamped(""), None);
     }
 
     #[test]

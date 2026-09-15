@@ -4,8 +4,8 @@
 #   scripts/shard                       four slices over server1, server2, server3 and gpc
 #   scripts/shard server2 gpc           two slices over the two machines named
 #
-# Every machine gets the whole working tree and the argument --shard k/n, takes every kth file of
-# the sorted list, and writes what it found to a file. The shards are collected onto the first
+# Every machine gets the whole working tree and the argument --shard k/n, refreshes its own copy of
+# the corpus, takes every kth file of the sorted list, and writes what it found to a file. The shards are collected onto the first
 # machine named and added up there by `rudb-compat merge`, which prints what one unsharded run would
 # have printed. Nothing is built on the laptop this is typed on, which is the same rule scripts/gate
 # follows and for the same reason: the disk is full and this crate builds all of rudb.
@@ -16,6 +16,12 @@
 # here because it is short and because that day is coming. Section 9.8 of the harness spec has the
 # measurements. A merged run also prints no page, because a page names the machine it was measured
 # on and this has several.
+#
+# The refresh is not optional. The corpus is fetched per machine and the upstream ref is a branch
+# that moves, so two machines that fetched on different days hold different corpora, and a shard is
+# a slice of a sorted list of files. The first run of this was nine files apart between two machines
+# and merged into a number that was neither of theirs. Each shard now writes down the commit it ran
+# over and `merge` refuses a set that does not agree.
 set -e
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -41,7 +47,7 @@ for host in $hosts; do
   # from the others in the terminal.
   # shellcheck disable=SC2029
   ssh "$host" "export PATH=\$HOME/.cargo/bin:\$PATH; cd ~/$remote && \
-    cargo run --release -q -- slt --shard $at/$of --out target/shard.out" >"$out/$at.log" 2>&1 &
+    cargo run --release -q -- slt --refresh --shard $at/$of --out target/shard.out" >"$out/$at.log" 2>&1 &
   running="$running $!"
   echo "shard $at/$of on $host"
 done
