@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 
 use crate::engine::{Cell, Engine, EngineError, HarnessError, Outcome, Table};
 use crate::hash::hash_values;
+use crate::kinds::Kinds;
 use crate::slt::{
     Directive, ParseError, QueryResult, Record, Setting, Sort, StatementResult, TestFile,
 };
@@ -547,6 +548,13 @@ pub struct Summary {
     pub skipped: Skips,
     /// Every failure, in the order they happened.
     pub failures: Vec<Failure>,
+    /// Which statement kind each record that ran was, and whether it did what the file said.
+    ///
+    /// The statement coverage number in section 1.1 comes out of this and out of nothing else. It
+    /// has to be counted here rather than worked out afterwards from the failures, because the
+    /// failures are the only records whose SQL survives the run and a kind every record of which
+    /// passed would be invisible in them.
+    pub kinds: Kinds,
 }
 
 impl Summary {
@@ -593,6 +601,7 @@ impl Summary {
         self.failed += other.failed;
         self.skipped.absorb(other.skipped);
         self.failures.extend(other.failures);
+        self.kinds.absorb(&other.kinds);
     }
 }
 
@@ -859,10 +868,12 @@ pub fn run_file_telling(
         match check(engine, file, record, &mut labels, &settings)? {
             Verdict::Ran(Ok(())) => {
                 summary.passed += 1;
+                charge(&mut summary.kinds, record, true);
                 told.insert(at, Said::Passed);
             }
             Verdict::Ran(Err(failure)) => {
                 summary.failed += 1;
+                charge(&mut summary.kinds, record, false);
                 told.insert(at, Said::Failed(failure.reason));
                 summary.failures.push(failure);
             }
@@ -1049,6 +1060,24 @@ fn effect(line: &str, loaded: &mut Vec<String>) -> Effect {
 
         // `sleep` and `set`, which speak to themselves and leave the database alone.
         _ => Effect::Skip(Gap::Harness),
+    }
+}
+
+/// Charge a record that ran to whichever of the thirty six statement kinds it is.
+///
+/// Only the two directives that carry SQL. Everything else in a file is the file talking to the
+/// runner, and the two that reach here are the two that reach the engine.
+///
+/// A record with several statements in it is charged to the first one. That is a real
+/// simplification and it is the right one: the corpus writes a `statement ok` block of two
+/// statements to set something up, and the second one being a different kind would put a record in
+/// two buckets and make the counts add up to more than the records that ran.
+fn charge(kinds: &mut Kinds, record: &Record, passed: bool) {
+    match &record.directive {
+        Directive::Statement { sql, .. } | Directive::Query { sql, .. } => {
+            kinds.charge(sql, passed);
+        }
+        _ => {}
     }
 }
 

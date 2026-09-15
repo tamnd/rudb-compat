@@ -42,6 +42,7 @@ pub mod functions;
 pub mod grammar;
 pub mod hash;
 pub mod isolate;
+pub mod kinds;
 pub mod norec;
 pub mod oracles;
 pub mod predicate;
