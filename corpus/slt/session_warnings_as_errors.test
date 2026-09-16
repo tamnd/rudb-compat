@@ -1,0 +1,37 @@
+# name: corpus/slt/session_warnings_as_errors.test
+# description: warning escalation matches the pinned no-logger configuration
+# group: [smoke]
+
+query TT
+SELECT current_setting('warnings_as_errors'), typeof(current_setting('warnings_as_errors'));
+----
+false	BOOLEAN
+
+statement ok
+SET warnings_as_errors = false;
+
+statement ok
+SET warnings_as_errors = 'no';
+
+query T
+SELECT current_setting('warnings_as_errors');
+----
+false
+
+statement error
+SET warnings_as_errors = true;
+----
+Can not set 'warnings_as_errors=true'; no logger is available. To solve, run: 'SET enable_logging=true;'
+
+query T
+SELECT current_setting('warnings_as_errors');
+----
+false
+
+statement ok
+RESET warnings_as_errors;
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'warnings_as_errors';
+----
+Escalate all warnings to errors.	BOOLEAN	GLOBAL
