@@ -1,0 +1,86 @@
+# name: corpus/slt/session_preserve_identifier_case.test
+# description: identifier folding follows the pinned session setting
+# group: [smoke]
+
+query T
+SELECT current_setting('preserve_identifier_case');
+----
+preserve_case
+
+statement ok
+CREATE TABLE MixedTable(MixedColumn INTEGER);
+
+query TT
+SELECT table_name, column_name FROM duckdb_columns() WHERE table_name = 'MixedTable';
+----
+MixedTable	MixedColumn
+
+statement ok
+SET preserve_identifier_case = 'lowercase';
+
+statement ok
+CREATE TABLE LowerTable(LowerColumn INTEGER);
+
+query TT
+SELECT table_name, column_name FROM duckdb_columns() WHERE table_name = 'lowertable';
+----
+lowertable	lowercolumn
+
+statement ok
+SET preserve_identifier_case = 'uppercase';
+
+statement ok
+CREATE TABLE UpperTable(UpperColumn INTEGER);
+
+statement ok
+CREATE TABLE "QuotedTable"("QuotedColumn" INTEGER);
+
+query TT rowsort
+SELECT table_name, column_name FROM duckdb_columns() WHERE table_name IN ('UPPERTABLE', 'QuotedTable');
+----
+QuotedTable	QuotedColumn
+UPPERTABLE	UPPERCOLUMN
+
+query T
+SELECT 'MixedString';
+----
+MixedString
+
+statement ok
+SET preserve_identifier_case = false;
+
+query T
+SELECT current_setting('preserve_identifier_case');
+----
+lowercase
+
+statement ok
+SET preserve_identifier_case = 'yes';
+
+query T
+SELECT current_setting('preserve_identifier_case');
+----
+preserve_case
+
+statement error
+SET preserve_identifier_case = 'bogus';
+----
+Unrecognized parameter for option preserve_identifier_case "bogus", expected one of: preserve_case, lowercase, uppercase
+
+statement error
+SET preserve_identifier_case = NULL;
+----
+preserve_identifier_case setting cannot be NULL
+
+statement ok
+RESET preserve_identifier_case;
+
+query T
+SELECT current_setting('preserve_identifier_case');
+----
+preserve_case
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'preserve_identifier_case';
+----
+How to fold non-quoted identifiers: 'preserve_case' keeps the case as written, 'lowercase' lowercases them, 'uppercase' uppercases them	VARCHAR	GLOBAL
