@@ -1,0 +1,88 @@
+# name: corpus/slt/session_null_division.test
+# description: session choice for zero divisors that normally raise
+# group: [smoke]
+
+query T
+SELECT current_setting('null_on_division_by_zero');
+----
+false
+
+# Slash uses IEEE arithmetic by default, and two floats keep their width.
+
+query RRTT
+SELECT 1 / 0, CAST(1 AS FLOAT) / CAST(0 AS FLOAT), typeof(1 / 0), typeof(CAST(1 AS FLOAT) / CAST(0 AS FLOAT));
+----
+inf	inf	DOUBLE	FLOAT
+
+statement error
+SELECT 1 // 0;
+----
+Division by zero in expression (1 // 0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement error
+SELECT 1 % 0;
+----
+Division by zero in expression (1 % 0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement ok
+SET null_on_division_by_zero = true;
+
+query TT
+SELECT current_setting('null_on_division_by_zero'), typeof(current_setting('null_on_division_by_zero'));
+----
+true	BOOLEAN
+
+# Ordinary slash remains IEEE, while integer division, remainder, and interval division become null.
+
+query RRRRRRRR
+SELECT 1 / 0, 1 // 0, 1 % 0, 1.0 / 0.0, 1.0 // 0.0, 1.0 % 0.0, CAST(1 AS FLOAT) / CAST(0 AS FLOAT), INTERVAL '1 day' / 0;
+----
+inf	NULL	NULL	inf	NULL	NULL	inf	NULL
+
+query TTTTTTTT
+SELECT typeof(1 / 0), typeof(1 // 0), typeof(1 % 0), typeof(1.0 / 0.0), typeof(1.0 // 0.0), typeof(1.0 % 0.0), typeof(CAST(1 AS FLOAT) / CAST(0 AS FLOAT)), typeof(INTERVAL '1 day' / 0);
+----
+DOUBLE	INTEGER	INTEGER	DOUBLE	DOUBLE	DECIMAL(2,1)	FLOAT	INTERVAL
+
+# The vector path adds nulls only at zero divisors.
+
+query LLL rowsort
+SELECT a, 10 // a, 10 % a FROM range(-1, 2) t(a);
+----
+-1	-10	0
+0	NULL	NULL
+1	10	0
+
+statement ok
+SET null_on_division_by_zero = 0;
+
+statement error
+SELECT 1 // 0;
+----
+Division by zero in expression (1 // 0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement ok
+SET null_on_division_by_zero = 'yes';
+
+query RRR
+SELECT 1 // -0.0, 1 % -0.0, CAST(1 AS DECIMAL(4,1)) // CAST(0 AS DECIMAL(4,1));
+----
+NULL	NULL	NULL
+
+statement ok
+RESET null_on_division_by_zero;
+
+query T
+SELECT current_setting('null_on_division_by_zero');
+----
+false
+
+statement error
+SET null_on_division_by_zero = 'off';
+----
+Failed to cast value: Could not convert string 'off' to BOOL
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'null_on_division_by_zero';
+----
+Return NULL instead of throwing an error when dividing by zero.	BOOLEAN	GLOBAL
