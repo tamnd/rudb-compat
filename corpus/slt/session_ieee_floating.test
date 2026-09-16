@@ -1,0 +1,81 @@
+# name: corpus/slt/session_ieee_floating.test
+# description: session choice between IEEE results and zero-divisor errors
+# group: [smoke]
+
+query TT
+SELECT current_setting('ieee_floating_point_ops'), typeof(current_setting('ieee_floating_point_ops'));
+----
+true	BOOLEAN
+
+query RRRR
+SELECT 1e0 / 0e0, 0e0 / 0e0, 1e0 % 0e0, 1e308 * 1e308;
+----
+inf	NaN	NaN	inf
+
+statement ok
+SET ieee_floating_point_ops = false;
+
+query TT
+SELECT current_setting('ieee_floating_point_ops'), typeof(current_setting('ieee_floating_point_ops'));
+----
+false	BOOLEAN
+
+statement error
+SELECT 1e0 / 0e0;
+----
+Division by zero in expression (1.0 / 0.0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement error
+SELECT 1e0 % 0e0;
+----
+Division by zero in expression (1.0 % 0.0). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement ok
+CREATE TABLE ieee_values(a DOUBLE);
+
+statement ok
+INSERT INTO ieee_values VALUES (-1.0), (0.0), (1.0);
+
+statement error
+SELECT 1e0 / a FROM ieee_values;
+----
+Division by zero in expression (1.0 / a). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+statement error
+SELECT 1e0 % a FROM ieee_values;
+----
+Division by zero in expression (1.0 % a). Use TRY(...) to return NULL for this expression, or SET null_on_division_by_zero=true to return NULL for all divisions by zero.
+
+query R
+SELECT 1e308 * 1e308;
+----
+inf
+
+statement ok
+SET null_on_division_by_zero = true;
+
+query RR
+SELECT 1e0 / 0e0, 1e0 % 0e0;
+----
+NULL	NULL
+
+statement ok
+RESET null_on_division_by_zero;
+
+statement ok
+RESET ieee_floating_point_ops;
+
+query T
+SELECT current_setting('ieee_floating_point_ops');
+----
+true
+
+statement error
+SET ieee_floating_point_ops = 'off';
+----
+Failed to cast value: Could not convert string 'off' to BOOL
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'ieee_floating_point_ops';
+----
+Use IEEE 754 behavior for supported floating point operations, returning NAN/INF instead of errors/NULL.	BOOLEAN	GLOBAL
