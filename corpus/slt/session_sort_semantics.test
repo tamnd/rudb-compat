@@ -1,0 +1,168 @@
+# name: corpus/slt/session_sort_semantics.test
+# description: session defaults for sort direction and null placement
+# group: [smoke]
+
+statement ok
+CREATE TABLE sort_defaults(x INTEGER);
+
+statement ok
+INSERT INTO sort_defaults VALUES (1), (NULL), (2);
+
+# DuckDB puts nulls last by default in both directions.
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+1
+2
+NULL
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC;
+----
+2
+1
+NULL
+
+# The direction setting applies only where the query states no direction.
+
+statement ok
+SET default_order = 'descending';
+
+query T
+SELECT current_setting('default_order');
+----
+DESC
+
+query I
+SELECT x FROM sort_defaults ORDER BY x;
+----
+2
+1
+NULL
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+1
+2
+NULL
+
+# FIRST and LAST place nulls independently of direction.
+
+statement ok
+SET default_null_order = 'first';
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+NULL
+1
+2
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC;
+----
+NULL
+2
+1
+
+statement ok
+SET default_null_order = 'last';
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+1
+2
+NULL
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC;
+----
+2
+1
+NULL
+
+# SQLite and MySQL treat null as low, while Postgres treats it as high.
+
+statement ok
+SET default_null_order = 'sqlite';
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+NULL
+1
+2
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC;
+----
+2
+1
+NULL
+
+statement ok
+SET default_null_order = 'mysql';
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+NULL
+1
+2
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC;
+----
+2
+1
+NULL
+
+statement ok
+SET default_null_order = 'postgres';
+
+query I
+SELECT x FROM sort_defaults ORDER BY x ASC;
+----
+1
+2
+NULL
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC;
+----
+NULL
+2
+1
+
+# An explicit placement wins over the session mode.
+
+query I
+SELECT x FROM sort_defaults ORDER BY x DESC NULLS LAST;
+----
+2
+1
+NULL
+
+statement ok
+RESET default_order;
+
+statement ok
+RESET default_null_order;
+
+query TT
+SELECT current_setting('default_order'), current_setting('default_null_order');
+----
+ASCENDING	NULLS_LAST
+
+statement error
+SET default_order = 'nope';
+----
+Unrecognized parameter for option DEFAULT_ORDER "nope". Expected ASC or DESC.
+
+statement error
+SET default_null_order = 'nope';
+----
+Unrecognized parameter for option NULL_ORDER "nope"
