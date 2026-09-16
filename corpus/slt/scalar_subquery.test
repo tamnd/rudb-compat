@@ -1,0 +1,60 @@
+# name: corpus/slt/scalar_subquery.test
+# description: uncorrelated scalar queries and their multi-row setting match the pinned engine
+# group: [smoke]
+
+query I
+SELECT (SELECT 42);
+----
+42
+
+query I
+SELECT 1 + (SELECT 2);
+----
+3
+
+query II rowsort
+SELECT x, (SELECT 7) FROM (VALUES (1), (2)) t(x);
+----
+1	7
+2	7
+
+query I
+SELECT (SELECT 1 WHERE false);
+----
+NULL
+
+query I
+SELECT (SELECT (SELECT 5));
+----
+5
+
+statement error
+SELECT (SELECT x, x + 1 FROM (VALUES (1)) t(x));
+----
+Subquery returns 2 columns - expected 1
+
+statement error
+SELECT (SELECT x FROM (VALUES (1), (2)) t(x));
+----
+More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.
+
+query TT
+SELECT current_setting('scalar_subquery_error_on_multiple_rows'), typeof(current_setting('scalar_subquery_error_on_multiple_rows'));
+----
+true	BOOLEAN
+
+statement ok
+SET scalar_subquery_error_on_multiple_rows = false;
+
+query I
+SELECT (SELECT x FROM (VALUES (1), (2)) t(x)) IN (1, 2);
+----
+1
+
+statement ok
+RESET scalar_subquery_error_on_multiple_rows;
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'scalar_subquery_error_on_multiple_rows';
+----
+Throw an error when a scalar subquery returns more than one row. When disabled, an arbitrary row is returned instead.	BOOLEAN	GLOBAL
