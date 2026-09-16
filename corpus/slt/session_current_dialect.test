@@ -1,0 +1,39 @@
+# name: corpus/slt/session_current_dialect.test
+# description: the installed SQL parser dialect selected by the session
+# group: [smoke]
+
+query TT
+SELECT current_setting('current_dialect'), typeof(current_setting('current_dialect'));
+----
+duckdb	VARCHAR
+
+statement ok
+SET current_dialect = 'DUCKDB';
+
+query T
+SELECT current_setting('current_dialect');
+----
+DUCKDB
+
+query I
+SELECT 1;
+----
+1
+
+statement error
+SET current_dialect = 'cypher';
+----
+Dialect "cypher" is not installed
+
+statement ok
+RESET current_dialect;
+
+query T
+SELECT current_setting('current_dialect');
+----
+duckdb
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'current_dialect';
+----
+The SQL dialect used by the parser	VARCHAR	GLOBAL
