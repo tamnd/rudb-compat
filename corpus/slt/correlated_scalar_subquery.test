@@ -11,6 +11,26 @@ SELECT k, (SELECT o.k + 1) FROM (VALUES (1), (1), (2), (NULL)) o(k);
 NULL	NULL
 
 query II rowsort
+SELECT k, (SELECT o.k + x FROM (VALUES (10)) i(x)) FROM (VALUES (1), (2)) o(k);
+----
+1	11
+2	12
+
+statement ok
+CREATE TABLE empty_scalar_source(x INTEGER);
+
+query II rowsort
+SELECT k, (SELECT o.k + x FROM empty_scalar_source) FROM (VALUES (1), (2)) o(k);
+----
+1	NULL
+2	NULL
+
+statement error
+SELECT (SELECT o.k + x FROM (VALUES (10), (20)) i(x)) FROM (VALUES (1)) o(k);
+----
+More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.
+
+query II rowsort
 SELECT k, (SELECT value FROM (VALUES (1, 10), (2, 20)) i(k, value) WHERE i.k = o.k) FROM (VALUES (1), (2), (3), (NULL)) o(k);
 ----
 1	10
