@@ -11,6 +11,20 @@ SELECT k, (SELECT value FROM (VALUES (1, 10), (2, 20)) i(k, value) WHERE i.k = o
 NULL	NULL
 
 query II rowsort
+SELECT k, (SELECT count(*) FROM (VALUES (1, 10), (1, NULL), (2, 5), (NULL, 40)) i(k, value) WHERE i.k = o.k AND value > 5) FROM (VALUES (1), (2), (3), (NULL)) o(k);
+----
+1	1
+2	0
+3	0
+NULL	0
+
+query II rowsort
+SELECT k, (SELECT count(1) FROM (VALUES (1), (1), (2)) i(k) WHERE i.k = o.k) FROM (VALUES (1), (3)) o(k);
+----
+1	2
+3	0
+
+query II rowsort
 SELECT k, (SELECT value FROM (VALUES (1, 10), (1, 20)) i(k, value) WHERE i.k = o.k AND value > 10) FROM (VALUES (1), (2)) o(k);
 ----
 1	20
