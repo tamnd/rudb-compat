@@ -1,0 +1,39 @@
+# name: corpus/slt/session_errors_as_json.test
+# description: structured errors follow the pinned session setting
+# group: [smoke]
+
+query TT
+SELECT current_setting('errors_as_json'), typeof(current_setting('errors_as_json'));
+----
+false	BOOLEAN
+
+statement ok
+SET errors_as_json = true;
+
+statement error
+SELECT * FROM nonexistent_table;
+----
+MISSING_ENTRY
+
+statement error
+SELECT cbl FROM (VALUES (42)) t(col);
+----
+COLUMN_NOT_FOUND
+
+statement error
+SECT 1;
+----
+SYNTAX_ERROR
+
+statement ok
+RESET errors_as_json;
+
+statement error
+SELECT * FROM nonexistent_table;
+----
+Catalog Error: Table with name nonexistent_table does not exist!
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'errors_as_json';
+----
+Output error messages as structured JSON instead of as a raw string	BOOLEAN	GLOBAL
