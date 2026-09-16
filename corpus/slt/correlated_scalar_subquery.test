@@ -1,5 +1,5 @@
 # name: corpus/slt/correlated_scalar_subquery.test
-# description: correlated scalar filters unnest to set-based single joins
+# description: correlated scalar filters and aggregates unnest to set-based single joins
 # group: [smoke]
 
 query II rowsort
@@ -20,3 +20,11 @@ statement error
 SELECT (SELECT value FROM (VALUES (1, 10), (1, 20)) i(k, value) WHERE i.k = o.k) FROM (VALUES (1)) o(k);
 ----
 More than one row returned by a subquery used as an expression - scalar subqueries can only return a single row.
+
+query II rowsort
+SELECT k, (SELECT sum(value) FROM (VALUES (1, 10), (1, 20), (2, 5), (NULL, 40)) i(k, value) WHERE i.k = o.k AND value > 5) FROM (VALUES (1), (2), (3), (NULL)) o(k);
+----
+1	30
+2	NULL
+3	NULL
+NULL	NULL
