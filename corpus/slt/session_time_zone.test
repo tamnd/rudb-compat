@@ -20,6 +20,20 @@ SELECT TIMESTAMPTZ '2020-01-01 12:00:00+00', TIMESTAMPTZ '2020-07-01 12:00:00+00
 ----
 2020-01-01 07:00:00-05	2020-07-01 08:00:00-04	2020-07-01 12:00:00
 
+# Converting the instant to text uses the same session offset.
+# The first query goes through a prepared projection over a vector and the second is evaluated inside the VALUES source.
+
+query T rowsort
+SELECT CAST(stamp AS VARCHAR) FROM (VALUES (TIMESTAMPTZ '2020-01-01 12:00:00+00'), (TIMESTAMPTZ '2020-07-01 12:00:00+00')) AS t(stamp);
+----
+2020-01-01 07:00:00-05
+2020-07-01 08:00:00-04
+
+query T
+VALUES (CAST(TIMESTAMPTZ '2020-07-01 12:00:00+00' AS VARCHAR));
+----
+2020-07-01 08:00:00-04
+
 # The local context answers are shifted from the one statement instant. The zoned answers still
 # denote that instant, and the local answers carry the shifted wall clock without a zone.
 
