@@ -1184,7 +1184,7 @@ fn fitted(name: &str, width: usize) -> String {
 /// One sweep as a row of that file.
 ///
 /// The same fields in the same order as [`SWEEP_COLUMNS`], which a test checks, and which
-/// [`Sweep::parse`] reads back by name rather than by position so that the two cannot drift apart
+/// `Sweep::parse` reads back by name rather than by position so that the two cannot drift apart
 /// without the test noticing first.
 #[must_use]
 pub fn sweep_row(coverage: &Coverage, p: &Provenance) -> String {
