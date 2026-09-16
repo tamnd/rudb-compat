@@ -1,0 +1,45 @@
+# name: corpus/slt/in_subquery.test
+# description: uncorrelated IN and NOT IN subqueries match the pinned engine
+# group: [smoke]
+
+query I
+SELECT 1 IN (SELECT x FROM (VALUES (1), (2)) t(x));
+----
+1
+
+query I
+SELECT 3 IN (SELECT x FROM (VALUES (1), (2)) t(x));
+----
+0
+
+query I
+SELECT 3 IN (SELECT x FROM (VALUES (1), (NULL)) t(x));
+----
+NULL
+
+query I
+SELECT NULL IN (SELECT x FROM (VALUES (1), (2)) t(x));
+----
+NULL
+
+query I
+SELECT NULL IN (SELECT x FROM (VALUES (1)) t(x) WHERE false);
+----
+0
+
+query I
+SELECT 3 NOT IN (SELECT x FROM (VALUES (1), (NULL)) t(x));
+----
+NULL
+
+query II rowsort
+SELECT x, x IN (SELECT y FROM (VALUES (1), (3)) candidates(y)) FROM (VALUES (1), (2), (3)) outer_rows(x);
+----
+1	1
+2	0
+3	1
+
+query I
+SELECT 1 IN (SELECT '1');
+----
+1
