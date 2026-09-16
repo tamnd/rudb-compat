@@ -7,6 +7,11 @@ SHOW show_behavior;
 ----
 AUTO
 
+query T
+SHOW ShOw_BeHaViOr;
+----
+AUTO
+
 statement ok
 CREATE TABLE demo(i INTEGER, s VARCHAR);
 
