@@ -1,0 +1,50 @@
+# name: corpus/slt/session_dialect_compatibility_mode.test
+# description: session selection of the pinned dialect compatibility modes
+# group: [smoke]
+
+query TT
+SELECT current_setting('dialect_compatibility_mode'), typeof(current_setting('dialect_compatibility_mode'));
+----
+NONE	VARCHAR
+
+statement ok
+SET dialect_compatibility_mode = 'spark';
+
+query T
+SELECT current_setting('dialect_compatibility_mode');
+----
+spark
+
+statement ok
+SET GLOBAL dialect_compatibility_mode = 'SPARK';
+
+query T
+SELECT current_setting('dialect_compatibility_mode');
+----
+SPARK
+
+statement ok
+SET dialect_compatibility_mode = 'none';
+
+query T
+SELECT current_setting('dialect_compatibility_mode');
+----
+none
+
+statement error
+SET dialect_compatibility_mode = 'nope';
+----
+Enum value: unrecognized value "nope" for enum "DialectCompatibilityMode"
+
+statement ok
+RESET GLOBAL dialect_compatibility_mode;
+
+query T
+SELECT current_setting('dialect_compatibility_mode');
+----
+NONE
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'dialect_compatibility_mode';
+----
+Enable SQL dialect compatibility for a certain engine (e.g. `SET dialect_compatibility_mode='spark'`)	VARCHAR	GLOBAL
