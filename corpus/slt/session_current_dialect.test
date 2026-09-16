@@ -37,3 +37,23 @@ query TTT
 SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'current_dialect';
 ----
 The SQL dialect used by the parser	VARCHAR	GLOBAL
+
+query T
+SELECT dialect_name FROM duckdb_dialects();
+----
+duckdb
+
+query TT
+SELECT name, description FROM duckdb_grammar_extensions();
+----
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM duckdb_grammar_extensions());
+----
+name	VARCHAR
+description	VARCHAR
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('duckdb_dialects', 'duckdb_grammar_extensions');
+----
+2
