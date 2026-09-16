@@ -310,7 +310,12 @@ impl Engine for Shell {
         if rows.failed {
             return Ok(Outcome::Error(EngineError::parse(&rows.stderr)));
         }
-        let rows = quote::read(&rows.stdout)?;
+        let stdout = if self.name.starts_with("duckdb") {
+            without_duckdb_warnings(&rows.stdout)
+        } else {
+            &rows.stdout
+        };
+        let rows = quote::read(stdout)?;
         // Nothing written at all is a statement with no result set, which is what a CREATE TABLE
         // and a SET produce on both shells. That is a result and not an absence of one, and asking
         // DESCRIBE about it would turn it into a parser error that says nothing about the engine.
@@ -321,7 +326,12 @@ impl Engine for Shell {
         if types.failed {
             return Ok(Outcome::Rows(undescribable(&rows, &EngineError::parse(&types.stderr))));
         }
-        assemble(&quote::read(&types.stdout)?, &rows)
+        let stdout = if self.name.starts_with("duckdb") {
+            without_duckdb_warnings(&types.stdout)
+        } else {
+            &types.stdout
+        };
+        assemble(&quote::read(stdout)?, &rows)
             .map(Outcome::Rows)
             .map_err(|e| HarnessError::new(format!("{}: {e}", self.name)))
     }
@@ -347,6 +357,20 @@ impl Engine for Shell {
             Ok(Acceptance::Accepted)
         }
     }
+}
+
+/// Removes DuckDB warning blocks from the result stream consumed by the quote reader.
+///
+/// The shell writes warnings to standard output with ANSI markers even in batch mode.
+/// They are not result rows, and treating one as a row makes a successful `SET` look like a query and prevents [`Session`] from replaying it.
+fn without_duckdb_warnings(mut output: &str) -> &str {
+    const HEADING: &str = "\u{1b}[90mWARNING:\n\u{1b}[00m";
+    const RESET: &str = "\u{1b}[00m";
+    while let Some(after_heading) = output.strip_prefix(HEADING) {
+        let Some(end) = after_heading.find(RESET) else { break };
+        output = &after_heading[end + RESET.len()..];
+    }
+    output
 }
 
 /// A shell that remembers what it has been told, so that a file of statements runs as one session.
@@ -476,8 +500,17 @@ fn devnull() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, Shell};
+    use super::{Session, Shell, without_duckdb_warnings};
     use crate::engine::{Cell, Engine, Outcome};
+
+    #[test]
+    fn duckdb_warnings_are_not_read_as_result_rows() {
+        let warning =
+            "\u{1b}[90mWARNING:\n\u{1b}[00m\u{1b}[90mThe setting is deprecated.\n\n\u{1b}[00m";
+        assert_eq!(without_duckdb_warnings(warning), "");
+        let followed = format!("{warning}'value'\n");
+        assert_eq!(without_duckdb_warnings(&followed), "'value'\n");
+    }
 
     /// Every test here needs both binaries on the machine. A developer without one gets a skipped
     /// test and a line saying so rather than a red build, for the same reason `crate::duckdb` does
