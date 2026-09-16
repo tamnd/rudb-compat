@@ -166,3 +166,41 @@ statement error
 SET default_null_order = 'nope';
 ----
 Unrecognized parameter for option NULL_ORDER "nope"
+
+# A non-integer literal cannot change row order and needs an explicit session opt-in.
+
+statement error
+SELECT 2 AS x ORDER BY 'fixed';
+----
+ORDER BY non-integer literal has no effect.
+
+statement ok
+SET order_by_non_integer_literal = true;
+
+query I
+SELECT 2 AS x ORDER BY 'fixed';
+----
+2
+
+query I
+SELECT 2 AS x ORDER BY 1.5;
+----
+2
+
+query I
+SELECT 2 AS x ORDER BY NULL;
+----
+2
+
+statement ok
+RESET order_by_non_integer_literal;
+
+query T
+SELECT current_setting('order_by_non_integer_literal');
+----
+false
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'order_by_non_integer_literal';
+----
+Allow ordering by non-integer literals - ordering by such literals has no effect.	BOOLEAN	GLOBAL
