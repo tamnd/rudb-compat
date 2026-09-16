@@ -197,7 +197,7 @@ fn table(result: &rudb::QueryResult) -> Table {
             row.into_iter()
                 .map(|value| match value {
                     Value::Null => Cell::Null,
-                    other => Cell::Text(other.to_string()),
+                    other => Cell::Text(result.value_text(&other)),
                 })
                 .collect()
         })

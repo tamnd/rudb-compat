@@ -1,0 +1,62 @@
+# name: corpus/slt/session_time_zone.test
+# description: the session time zone and the one argument form of age
+# group: [smoke]
+
+# The setting is case insensitive when named and keeps the IANA name as its value.
+
+statement ok
+SET timezone = 'America/New_York';
+
+query T
+SELECT current_setting('TimeZone');
+----
+America/New_York
+
+# A zoned timestamp is an instant. The session zone decides how that instant is printed, including
+# the daylight-saving offset at that date, while an unzoned timestamp is unchanged.
+
+query TTT
+SELECT TIMESTAMPTZ '2020-01-01 12:00:00+00', TIMESTAMPTZ '2020-07-01 12:00:00+00', TIMESTAMP '2020-07-01 12:00:00';
+----
+2020-01-01 07:00:00-05	2020-07-01 08:00:00-04	2020-07-01 12:00:00
+
+# The local context answers are shifted from the one statement instant. The zoned answers still
+# denote that instant, and the local answers carry the shifted wall clock without a zone.
+
+query TTTT
+SELECT now() = current_timestamp, localtimestamp = current_localtimestamp(), current_time = get_current_time(), localtime = current_localtime();
+----
+true	true	true	true
+
+# One argument measures from the session-local current date at midnight. These equalities hold the
+# reference moment still without writing down a date that becomes stale tomorrow.
+
+query TTT
+SELECT age(DATE '2020-02-28') = age(current_date, DATE '2020-02-28'), age(TIMESTAMP '2020-02-28 12:00:00') = age(current_date, TIMESTAMP '2020-02-28 12:00:00'), typeof(age(DATE '2020-02-28'));
+----
+true	true	INTERVAL
+
+# A non-hour offset is kept rather than rounded, which exercises the minute part of the offset.
+
+statement ok
+SET TIME ZONE 'Asia/Kathmandu';
+
+query TT
+SELECT current_setting('timezone'), TIMESTAMPTZ '2020-07-01 12:00:00+00';
+----
+Asia/Kathmandu	2020-07-01 17:45:00+05:45
+
+# LOCAL and DEFAULT are the standard spellings for restoring the operating-system zone. A fixed
+# expected name would make this record about the runner rather than about the engine, so the record
+# checks that both statements are accepted and leaves the host name to the shell comparison.
+
+statement ok
+SET TIME ZONE LOCAL;
+
+statement ok
+SET TIME ZONE DEFAULT;
+
+statement error
+SET TimeZone = 'not/a_zone';
+----
+Unknown TimeZone 'not/a_zone'!
