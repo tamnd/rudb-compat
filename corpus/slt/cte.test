@@ -1,0 +1,41 @@
+# name: corpus/slt/cte.test
+# description: non-recursive CTEs inline through the existing subquery path
+# group: [smoke]
+
+query I
+WITH t AS (SELECT 1 AS x) SELECT x FROM t;
+----
+1
+
+query I
+WITH first AS (SELECT 2 AS x), second(y) AS NOT MATERIALIZED (SELECT x + 1 FROM first) SELECT y FROM second;
+----
+3
+
+query I
+WITH t AS (SELECT 4 AS x) SELECT left_t.x + right_t.x FROM t left_t, t right_t;
+----
+8
+
+query II rowsort
+WITH t AS (SELECT * FROM (VALUES (2), (1), (NULL)) source(x)) SELECT x, x + 10 FROM t;
+----
+1	11
+2	12
+NULL	NULL
+
+query I
+WITH outer_t AS (SELECT 3 AS x) SELECT (WITH inner_t AS (SELECT x + 1 AS y FROM outer_t) SELECT y FROM inner_t);
+----
+4
+
+statement ok
+CREATE TABLE named_like_cte(x INTEGER);
+
+statement ok
+INSERT INTO named_like_cte VALUES (99);
+
+query I
+WITH named_like_cte AS (SELECT 5 AS x) SELECT x FROM named_like_cte;
+----
+5
