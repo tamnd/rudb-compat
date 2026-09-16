@@ -3,6 +3,14 @@
 # group: [smoke]
 
 query II rowsort
+SELECT k, (SELECT o.k + 1) FROM (VALUES (1), (1), (2), (NULL)) o(k);
+----
+1	2
+1	2
+2	3
+NULL	NULL
+
+query II rowsort
 SELECT k, (SELECT value FROM (VALUES (1, 10), (2, 20)) i(k, value) WHERE i.k = o.k) FROM (VALUES (1), (2), (3), (NULL)) o(k);
 ----
 1	10
