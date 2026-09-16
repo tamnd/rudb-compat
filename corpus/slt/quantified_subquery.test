@@ -1,0 +1,45 @@
+# name: corpus/slt/quantified_subquery.test
+# description: uncorrelated ANY and ALL comparisons match the pinned engine
+# group: [smoke]
+
+query I
+SELECT 2 = ANY (SELECT x FROM (VALUES (1), (2)) t(x));
+----
+1
+
+query I
+SELECT 2 <> ANY (SELECT x FROM (VALUES (2), (3)) t(x));
+----
+1
+
+query I
+SELECT 2 > ALL (SELECT x FROM (VALUES (0), (1)) t(x));
+----
+1
+
+query I
+SELECT 2 = ALL (SELECT x FROM (VALUES (2), (2)) t(x));
+----
+1
+
+query I
+SELECT 2 = ALL (SELECT x FROM (VALUES (2), (NULL)) t(x));
+----
+NULL
+
+query I
+SELECT NULL = ANY (SELECT x FROM (VALUES (1)) t(x) WHERE false);
+----
+0
+
+query I
+SELECT NULL = ALL (SELECT x FROM (VALUES (1)) t(x) WHERE false);
+----
+1
+
+query II rowsort
+SELECT x, x < ANY (SELECT y FROM (VALUES (2), (4)) candidates(y)) FROM (VALUES (1), (3), (5)) outer_rows(x);
+----
+1	1
+3	1
+5	0
