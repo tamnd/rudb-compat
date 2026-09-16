@@ -1,0 +1,32 @@
+# name: corpus/slt/session_allow_parser_override.test
+# description: parser override selection matches the pinned default-only setting
+# group: [smoke]
+
+query TT
+SELECT current_setting('allow_parser_override_extension'), typeof(current_setting('allow_parser_override_extension'));
+----
+DEFAULT	VARCHAR
+
+statement ok
+SET allow_parser_override_extension = DEFAULT;
+
+statement ok
+SET allow_parser_override_extension = 'default';
+
+query T
+SELECT current_setting('allow_parser_override_extension');
+----
+DEFAULT
+
+statement error
+SET allow_parser_override_extension = true;
+----
+Enum value: unrecognized value "true" for enum "AllowParserOverride"
+
+statement ok
+RESET allow_parser_override_extension;
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'allow_parser_override_extension';
+----
+Allow extensions to override the current parser	VARCHAR	GLOBAL
