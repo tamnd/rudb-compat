@@ -1,5 +1,5 @@
 # name: corpus/slt/exists_subquery.test
-# description: uncorrelated EXISTS and NOT EXISTS match the pinned engine
+# description: EXISTS and NOT EXISTS match the pinned engine
 # group: [smoke]
 
 query I
@@ -36,3 +36,15 @@ query I
 SELECT EXISTS (SELECT EXISTS (SELECT 1));
 ----
 1
+
+query I rowsort
+SELECT k FROM (VALUES (1), (2), (3), (NULL)) o(k) WHERE EXISTS (SELECT 1 FROM (VALUES (1), (1), (3), (NULL)) i(k) WHERE i.k = o.k);
+----
+1
+3
+
+query I rowsort
+SELECT k FROM (VALUES (1), (2), (3)) o(k) WHERE NOT EXISTS (SELECT 1 FROM (VALUES (1, 5), (2, 20)) i(k, value) WHERE i.k = o.k AND value > 10);
+----
+1
+3
