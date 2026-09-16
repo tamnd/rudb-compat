@@ -1,0 +1,90 @@
+# name: corpus/slt/session_disable_timestamptz_casts.test
+# description: session guard for local timestamp to zoned timestamp casts
+# group: [smoke]
+
+statement ok
+SET TimeZone = 'UTC';
+
+query TT
+SELECT current_setting('disable_timestamptz_casts'), typeof(current_setting('disable_timestamptz_casts'));
+----
+false	BOOLEAN
+
+query T
+SELECT TIMESTAMP '2024-01-02 03:04:05'::TIMESTAMPTZ;
+----
+2024-01-02 03:04:05+00
+
+statement ok
+SET disable_timestamptz_casts = true;
+
+query TT
+SELECT current_setting('disable_timestamptz_casts'), typeof(current_setting('disable_timestamptz_casts'));
+----
+true	BOOLEAN
+
+statement error
+SELECT TIMESTAMP '2024-01-02 03:04:05'::TIMESTAMPTZ;
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement error
+SELECT TRY_CAST(TIMESTAMP '2024-01-02 03:04:05' AS TIMESTAMPTZ);
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement error
+SELECT TIMESTAMP '2024-01-02 03:04:05' = TIMESTAMPTZ '2024-01-02 03:04:05+00';
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement error
+SELECT CASE WHEN true THEN TIMESTAMP '2024-01-02 03:04:05' ELSE TIMESTAMPTZ '2024-01-02 03:04:05+00' END;
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement error
+SELECT DATE '2024-01-02'::TIMESTAMPTZ;
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement error
+VALUES (TIMESTAMP '2024-01-02 03:04:05'), (TIMESTAMPTZ '2024-01-02 03:04:05+00');
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement error
+SELECT TIMESTAMP '2024-01-02 03:04:05' UNION ALL SELECT TIMESTAMPTZ '2024-01-02 03:04:05+00';
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+statement ok
+CREATE TABLE zoned(z TIMESTAMPTZ);
+
+statement error
+INSERT INTO zoned SELECT TIMESTAMP '2024-01-02 03:04:05';
+----
+Casting from TIMESTAMP to TIMESTAMP WITH TIME ZONE without an explicit time zone has been disabled  - use "AT TIME ZONE ..."
+
+query T
+SELECT '2024-01-02 03:04:05'::TIMESTAMPTZ;
+----
+2024-01-02 03:04:05+00
+
+statement ok
+RESET disable_timestamptz_casts;
+
+query T
+SELECT current_setting('disable_timestamptz_casts');
+----
+false
+
+statement error
+SET disable_timestamptz_casts = 'off';
+----
+Failed to cast value: Could not convert string 'off' to BOOL
+
+query TTT
+SELECT '[' || description || ']', input_type, scope FROM duckdb_settings() WHERE name = 'disable_timestamptz_casts';
+----
+[Disable casting from timestamp to timestamptz ]	BOOLEAN	GLOBAL
