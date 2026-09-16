@@ -1,0 +1,64 @@
+# name: corpus/slt/session_regex_semantics.test
+# description: session choice between partial and full regex match operators
+# group: [smoke]
+
+query T
+SELECT current_setting('regex_match_operator_semantics');
+----
+partial
+
+query TTTT
+SELECT 'abc' ~ 'b', 'abc' !~ 'b', 'ABC' ~* 'b', 'ABC' !~* 'b';
+----
+true	false	true	false
+
+statement ok
+SET regex_match_operator_semantics = 'full';
+
+query T
+SELECT current_setting('regex_match_operator_semantics');
+----
+full
+
+query TTTT
+SELECT 'abc' ~ 'b', 'abc' !~ 'b', 'ABC' ~* 'b', 'ABC' !~* 'b';
+----
+false	true	false	true
+
+# SIMILAR TO always uses full matching and does not follow the regex operator setting.
+
+query TT
+SELECT 'abc' SIMILAR TO 'b', 'abc' NOT SIMILAR TO 'b';
+----
+false	true
+
+statement ok
+SET regex_match_operator_semantics = 'PARTIAL';
+
+query T
+SELECT current_setting('regex_match_operator_semantics');
+----
+PARTIAL
+
+query T
+SELECT 'abc' ~ 'b';
+----
+true
+
+statement error
+SET regex_match_operator_semantics = 'nope';
+----
+Enum value: unrecognized value "nope" for enum "RegexMatchOperatorSemantics"
+
+statement ok
+RESET regex_match_operator_semantics;
+
+query T
+SELECT current_setting('regex_match_operator_semantics');
+----
+partial
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'regex_match_operator_semantics';
+----
+Configures whether regex match operators use partial or full string matching	VARCHAR	GLOBAL
