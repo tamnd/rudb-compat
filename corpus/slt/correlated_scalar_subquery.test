@@ -3,6 +3,26 @@
 # group: [smoke]
 
 query II rowsort
+SELECT k, (SELECT count(o.k) FROM (VALUES (10), (20)) i(x)) FROM (VALUES (1), (NULL)) o(k);
+----
+1	2
+NULL	0
+
+query II rowsort
+SELECT k, (SELECT sum(o.k) FROM (VALUES (10), (20)) i(x)) FROM (VALUES (1), (NULL)) o(k);
+----
+1	2
+NULL	NULL
+
+statement ok
+CREATE TABLE empty_aggregate_source(x INTEGER);
+
+query I
+SELECT (SELECT count(o.k) FROM empty_aggregate_source) FROM (VALUES (1)) o(k);
+----
+0
+
+query II rowsort
 SELECT k, (SELECT o.k + 1) FROM (VALUES (1), (1), (2), (NULL)) o(k);
 ----
 1	2
