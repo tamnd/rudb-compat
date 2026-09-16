@@ -28,7 +28,7 @@
 //! parser error and so is `DESCRIBE CREATE TABLE t(i INT)`, and the same goes for every INSERT,
 //! UPDATE, DELETE, SET, PRAGMA, CALL, EXPLAIN and transaction control statement. Wrapping one of
 //! those anyway does not produce a wrong answer, it produces a parser error attributed to DuckDB,
-//! which is worse: it says the pinned binary cannot parse its own CREATE TABLE. So [`describable`]
+//! which is worse: it says the pinned binary cannot parse its own CREATE TABLE. So `describable`
 //! decides first, and a statement that is not a query is run bare and reported as having succeeded
 //! with no rows.
 //!

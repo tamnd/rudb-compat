@@ -1,0 +1,95 @@
+# name: corpus/slt/pragma_statement.test
+# description: the PRAGMA statement, which is the same query as the function of that name
+# group: [smoke]
+
+statement ok
+CREATE TABLE t(a INTEGER NOT NULL, b VARCHAR);
+
+# PRAGMA name is rewritten to SELECT * FROM pragma_name(args) on both engines, and the pin gives
+# that away in its own error messages, which print the rewritten call back with a caret under it.
+# So every record here is a record about the function of that name written another way.
+
+query ITTTTT
+PRAGMA table_info('t');
+----
+0	a	INTEGER	true	NULL	false
+1	b	VARCHAR	false	NULL	false
+
+# A bare name in the parentheses is the name of a table and not a column reference, because there is
+# no FROM clause here for a column to come out of. A qualified one arrives as one name and not two.
+
+query ITTTTT
+PRAGMA table_info(t);
+----
+0	a	INTEGER	true	NULL	false
+1	b	VARCHAR	false	NULL	false
+
+query ITTTTT
+PRAGMA table_info(main.t);
+----
+0	a	INTEGER	true	NULL	false
+1	b	VARCHAR	false	NULL	false
+
+# PRAGMA name = value is a SET written another way and moves the same setting.
+
+statement ok
+PRAGMA memory_limit = '1GiB';
+
+query T
+SELECT current_setting('memory_limit');
+----
+1.0 GiB
+
+statement ok
+RESET memory_limit;
+
+# A name that is not a pragma is the pragma namespace's own complaint, and the name goes back out
+# as it was typed rather than folded to one case.
+
+statement error
+PRAGMA nope;
+----
+Pragma Function with name nope does not exist!
+
+statement error
+PRAGMA NOPE;
+----
+Pragma Function with name NOPE does not exist!
+
+# A pragma that exists and was called wrongly is complained about as a pragma, not as the pragma_
+# name it was rewritten into. A user who wrote a pragma and is told about a function they never
+# named has been handed the rewrite to debug instead of their own statement.
+
+statement error
+PRAGMA table_info;
+----
+PRAGMA "table_info"(VARCHAR)
+
+statement error
+PRAGMA table_info('a', 'b');
+----
+'table_info(VARCHAR, VARCHAR)'
+
+statement error
+PRAGMA table_info(1);
+----
+'table_info(INTEGER)'
+
+# One that takes nothing prints no parentheses at all on the candidate line, which is not the same
+# as the empty pair the function spelling of the same complaint prints.
+
+statement error
+PRAGMA version(1);
+----
+PRAGMA "version"
+
+# Empty parentheses are a parser error rather than a call with no arguments, because the rule is a
+# list of expressions and a list of none of them does not match.
+
+statement error
+PRAGMA version();
+----
+syntax error at or near ")"
+
+statement ok
+DROP TABLE t;
