@@ -1,0 +1,74 @@
+# name: corpus/slt/session_integer_division.test
+# description: session choice between floating point and integer division
+# group: [smoke]
+
+query T
+SELECT current_setting('integer_division');
+----
+false
+
+query RT
+SELECT 7 / 2, typeof(7 / 2);
+----
+3.500	DOUBLE
+
+statement ok
+SET integer_division = true;
+
+query T
+SELECT current_setting('integer_division');
+----
+true
+
+# Integer operands truncate and keep their promoted integer type.
+
+query IT
+SELECT 7 / 2, typeof(7 / 2);
+----
+3	INTEGER
+
+query LT
+SELECT 7::BIGINT / 2::SMALLINT, typeof(7::BIGINT / 2::SMALLINT);
+----
+3	BIGINT
+
+# Decimal operands still use floating point division when the setting is enabled.
+
+query RT
+SELECT 7.5 / 2.0, typeof(7.5 / 2.0);
+----
+3.750	DOUBLE
+
+statement ok
+SET integer_division = 0;
+
+query RT
+SELECT 7 / 2, typeof(7 / 2);
+----
+3.500	DOUBLE
+
+statement ok
+SET integer_division = 'yes';
+
+query I
+SELECT 7 / 2;
+----
+3
+
+statement ok
+RESET integer_division;
+
+query T
+SELECT current_setting('integer_division');
+----
+false
+
+statement error
+SET integer_division = 'off';
+----
+Failed to cast value: Could not convert string 'off' to BOOL
+
+query TTT
+SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'integer_division';
+----
+Whether or not the / operator defaults to integer division, or to floating point division	BOOLEAN	GLOBAL
