@@ -134,7 +134,7 @@ The suites behind the four levels arrive with M2 in [`spec/17-milestones.md`](ht
 
 **Errors are results.** A query that errors on DuckDB has to error here, with a matching code and, where it is specified, a matching message. Succeeding where DuckDB fails is a failure, the same as failing where DuckDB succeeds.
 
-**Every failure is reduced and bisected automatically.** A forty-line generated query that returns the wrong answer tells you nothing about why. The harness shrinks it and then bisects it against the optimizer passes, so the report names the pass that introduced the difference. That is the single highest-value piece of tooling in here, because most wrong answers come from a rewrite and finding out which one by hand costs an afternoon each. The shrinking half is `rudb-compat reduce` and it works. The bisector waits on rudb having a setting that turns one optimizer pass off.
+**Every failure is reduced and bisected automatically.** A forty-line generated query that returns the wrong answer tells you nothing about why. The harness shrinks it and then bisects it against the optimizer passes, so the report names the pass that introduced the difference. That is the single highest-value piece of tooling in here, because most wrong answers come from a rewrite and finding out which one by hand costs an afternoon each. The shrinking half is `rudb-compat reduce` and the naming half is `rudb-compat bisect`, and both of them work. `rudb-compat sweep` is the same question asked of the whole corpus at once, before anybody has a failure in hand.
 
 ## The four levels
 
