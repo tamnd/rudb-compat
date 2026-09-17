@@ -6,7 +6,9 @@
 //! not mean anything, so the release is the thing to pin and the files follow from it.
 //!
 //! The clone lands under `target`, which is already ignored and already the place a build puts
-//! things it can recreate. Nothing here is committed and nothing here needs to be.
+//! things it can recreate. Nothing here is committed and nothing here needs to be. That choice has
+//! one sharp edge and it cost every conformance number CI ever published: a Rust build cache saves
+//! and restores `target`, and what comes back is not always what went in. See [`filled`].
 //!
 //! The small corpus in `corpus/slt` is a different thing and it is committed. Those files are
 //! ours, they cover what rudb is supposed to do today, and the test suite requires every one of
@@ -47,14 +49,34 @@ pub const PARTS: [&str; 4] =
 ///
 /// When git is not on the path, when the clone fails, or when upstream has moved the tests.
 pub fn corpus(root: &Path, refresh: bool) -> Result<PathBuf, HarnessError> {
-    let dest = checkout(root, refresh)?;
-    let tests = dest.join("test").join("sql");
-    if !tests.is_dir() {
+    tests(&checkout(root, refresh)?)
+}
+
+/// The tests under a checkout, once it is known to be one.
+///
+/// Split out from [`corpus`] because the two ways this can be wrong want different sentences and
+/// both are worth a test, and a test of [`corpus`] itself is a test that clones DuckDB.
+///
+/// # Errors
+///
+/// When upstream has moved the tests, and when the directory they were at holds nothing.
+fn tests(dest: &Path) -> Result<PathBuf, HarnessError> {
+    let sql = dest.join("test").join("sql");
+    if !sql.is_dir() {
         return Err(HarnessError::new(format!(
             "upstream layout changed, test/sql is missing at {REF}"
         )));
     }
-    Ok(tests)
+    // A corpus with nothing in it is not a corpus that scores zero, it is a fetch that did not
+    // happen, and the two print the same way if nobody asks. This is the backstop for that: the
+    // caller gets an error it has to say out loud instead of a directory it measures nothing in.
+    if !filled(&sql) {
+        return Err(HarnessError::new(format!(
+            "the corpus at {} has nothing in it, so it was never fetched",
+            sql.display()
+        )));
+    }
+    Ok(sql)
 }
 
 /// The whole checkout, fetching it first if it is not already there.
@@ -67,7 +89,7 @@ pub fn corpus(root: &Path, refresh: bool) -> Result<PathBuf, HarnessError> {
 /// When git is not on the path, when the clone fails, or when upstream has moved the tests.
 pub fn checkout(root: &Path, refresh: bool) -> Result<PathBuf, HarnessError> {
     let dest = root.join(DEST);
-    let here = |dest: &Path| PARTS.iter().all(|part| dest.join(part).is_dir());
+    let here = |dest: &Path| PARTS.iter().all(|part| filled(&dest.join(part)));
     if !refresh {
         if here(&dest) {
             return Ok(dest);
@@ -133,6 +155,27 @@ pub fn commit(root: &Path) -> Result<String, HarnessError> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// Whether a part of the checkout is there, which means holding something rather than existing.
+///
+/// This is the whole of the bug it was written for. The corpus lives under `target`, CI restores
+/// `target` from a Rust build cache, and that cache hands back the directory tree with the files
+/// taken out of it: `target/corpus/test/sql` comes back as a directory with nothing in it, and
+/// enough of `target/corpus/.git` comes back that `git rev-parse` still answers. Asking `is_dir`
+/// said the corpus was already fetched, so nothing was fetched, and `slt` measured four thousand
+/// one hundred and thirty seven files as zero.
+///
+/// Every conformance run this repository has ever published said `0 files, 0 passed, 0 failed,
+/// which is 0.0 percent`, from the first one on 2026-09-14 to the one that found this. A number
+/// that is zero because nothing ran looks exactly like a number that is zero because nothing
+/// passed, which is why it survived a fortnight of being on the run summary.
+///
+/// Emptiness rather than a file count, because this is on the path of every run and the answer only
+/// has to separate a checkout from the shape of one. When it says no, the caller re-clones, which
+/// is thirty seconds and correct.
+fn filled(part: &Path) -> bool {
+    std::fs::read_dir(part).is_ok_and(|mut entries| entries.next().is_some())
+}
+
 /// The sparse checkout command for every part, as git wants it.
 fn sparse(dest: &Path) -> Vec<String> {
     let mut args = vec![
@@ -159,4 +202,88 @@ fn git<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Result<(), HarnessError> {
         args.first().map(|a| a.as_ref().to_string_lossy()).unwrap_or_default(),
         String::from_utf8_lossy(&out.stderr).trim()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::{PARTS, filled};
+
+    /// A directory of our own to build checkout shapes in, named so a leftover says whose it was.
+    fn scratch(what: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rudb-compat-vendor-{}-{what}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a directory under the temp directory");
+        dir
+    }
+
+    /// The four parts, as directories and nothing else.
+    fn shape(dest: &Path) {
+        for part in PARTS {
+            std::fs::create_dir_all(dest.join(part)).expect("a directory");
+        }
+    }
+
+    /// What CI restored from the build cache for a fortnight. Every part is a directory, so asking
+    /// `is_dir` said the corpus was fetched, and none of them held a single file.
+    #[test]
+    fn a_directory_tree_with_the_files_taken_out_is_not_a_fetched_corpus() {
+        let dest = scratch("emptied");
+        shape(&dest);
+        for part in PARTS {
+            assert!(
+                dest.join(part).is_dir(),
+                "{part} is a directory, which is how this got through"
+            );
+            assert!(!filled(&dest.join(part)), "{part} holds nothing, so it is not there");
+        }
+        assert!(super::tests(&dest).is_err(), "an empty test/sql is a fetch that did not happen");
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn a_part_holding_a_file_is_there() {
+        let dest = scratch("filled");
+        shape(&dest);
+        let sql = dest.join("test/sql");
+        std::fs::write(sql.join("select.test"), "statement ok\nSELECT 1\n").expect("a file");
+        assert!(filled(&sql));
+        assert_eq!(super::tests(&dest).expect("the tests are there"), sql);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// A subdirectory counts, because upstream keeps the tests in one and an empty check that
+    /// recursed would be doing the fetch's job.
+    #[test]
+    fn a_part_holding_only_directories_is_there_too() {
+        let dest = scratch("nested");
+        shape(&dest);
+        std::fs::create_dir_all(dest.join("test/sql/join")).expect("a directory");
+        assert!(filled(&dest.join("test/sql")));
+        assert!(super::tests(&dest).is_ok());
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_there_at_all_is_not_filled() {
+        assert!(!filled(&scratch("absent").join("nothing/here")));
+    }
+
+    /// The two ways this goes wrong want different sentences: one is upstream moving the tests and
+    /// one is the fetch not having run, and somebody reading the second as the first goes looking
+    /// for a commit in DuckDB that does not exist.
+    #[test]
+    fn upstream_moving_the_tests_and_the_fetch_not_running_do_not_say_the_same_thing() {
+        let gone = scratch("gone");
+        let moved = super::tests(&gone).expect_err("there is no test/sql at all");
+        let dest = scratch("never");
+        shape(&dest);
+        let never = super::tests(&dest).expect_err("test/sql is empty");
+        assert!(moved.to_string().contains("upstream layout changed"), "{moved}");
+        assert!(never.to_string().contains("never fetched"), "{never}");
+        let _ = std::fs::remove_dir_all(&gone);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
 }
