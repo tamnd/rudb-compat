@@ -12,6 +12,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rudb_compat::conform::run_path;
+use rudb_compat::cutoff;
 use rudb_compat::isolate::{Isolated, Limits, decode_run, encode_run, run_corpus};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shard::Shard;
@@ -100,6 +101,35 @@ fn every_optimizer_pass_on_its_own_answers_the_corpus_the_same_way() {
     // this could not read would make it sweep nothing.
     assert_eq!(swept.passes(), rudb::optimizers());
     assert!(swept.passes().len() > 1, "only {:?} was swept", swept.passes());
+}
+
+/// The list of upstream files that do not stop is readable and names files that are really there.
+///
+/// The comparison itself is a whole upstream run and belongs to CI, not to `cargo test`: the files
+/// on the list cost two minutes each precisely because they do not stop. What is cheap enough to
+/// check per commit is that the list still parses and still points at something, so that a list
+/// somebody emptied or a path somebody mistyped is caught here rather than reported in CI as a
+/// file that had started finishing.
+#[test]
+fn the_list_of_files_that_do_not_stop_names_files_the_corpus_has() {
+    let text = std::fs::read_to_string(cutoff::LIST).expect("the list is committed");
+    let names = cutoff::read(&text);
+    assert!(!names.is_empty(), "an empty list would make any upstream run settled");
+    for name in &names {
+        assert!(name.ends_with(".test"), "{name} is not a sqllogictest file");
+        assert!(!name.starts_with('/'), "{name} should be relative to the corpus root");
+    }
+
+    // The corpus is vendored into target and CI fetches it before the run that uses this. A
+    // checkout that has not fetched it yet can still run the rest of this test.
+    let sql = Path::new(rudb_compat::vendor::DEST).join("test/sql");
+    if !sql.is_dir() {
+        eprintln!("skipping the path check, no vendored corpus at {}", sql.display());
+        return;
+    }
+    for name in &names {
+        assert!(sql.join(name).is_file(), "{name} is on the list and not in the corpus");
+    }
 }
 
 /// The same corpus through the shell, which is the rudb somebody who is not this harness runs.

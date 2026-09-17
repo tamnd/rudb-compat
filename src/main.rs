@@ -733,37 +733,74 @@ fn slt(
     shard: Shard,
     out: Option<&str>,
 ) -> ExitCode {
-    let run = corpus_dir(path, refresh).and_then(|dir| corpus(&dir, slow, limits, shard));
-    match run {
-        Ok(total) => {
-            if let Some(out) = out {
-                // The whole run in the form `merge` reads, rather than the failures in full. A
-                // shard is written down to be added to three others and not to be read by a person,
-                // and the failure dump is tens of megabytes.
-                let written = stamp(path, shard) + &rudb_compat::isolate::encode_run(&total);
-                if let Err(e) = std::fs::write(out, written) {
-                    eprintln!("rudb-compat: cannot write {out}: {e}");
-                    return ExitCode::FAILURE;
-                }
-                println!("shard   {shard}");
-                println!(
-                    "{} files, {} passed, {} failed, written to {out}",
-                    total.files, total.passed, total.failed
-                );
-            } else {
-                if !shard.is_whole() {
-                    println!("shard   {shard}");
-                    println!();
-                }
-                print_corpus(&Rudb::new(), &total);
-            }
-            ExitCode::SUCCESS
-        }
+    let dir = match corpus_dir(path, refresh) {
+        Ok(dir) => dir,
         Err(e) => {
             eprintln!("rudb-compat: {e}");
-            ExitCode::FAILURE
+            return ExitCode::FAILURE;
         }
+    };
+    let total = match corpus(&dir, slow, limits, shard) {
+        Ok(total) => total,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if let Some(out) = out {
+        // The whole run in the form `merge` reads, rather than the failures in full. A shard is
+        // written down to be added to three others and not to be read by a person, and the failure
+        // dump is tens of megabytes.
+        let written = stamp(path, shard) + &rudb_compat::isolate::encode_run(&total);
+        if let Err(e) = std::fs::write(out, written) {
+            eprintln!("rudb-compat: cannot write {out}: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!("shard   {shard}");
+        println!(
+            "{} files, {} passed, {} failed, written to {out}",
+            total.files, total.passed, total.failed
+        );
+        return ExitCode::SUCCESS;
     }
+
+    if !shard.is_whole() {
+        println!("shard   {shard}");
+        println!();
+    }
+    print_corpus(&Rudb::new(), &total);
+
+    // Only a whole run of the upstream corpus is comparable to the list, because the list names
+    // every file in that corpus that does not stop. A shard saw a slice of them and a path that was
+    // given is somebody's own corpus, and in both cases the names this run never reached would read
+    // as files somebody had fixed.
+    if path.is_some() || !shard.is_whole() {
+        return ExitCode::SUCCESS;
+    }
+    cutoff(&dir, &total)
+}
+
+/// Say how the files that did not stop differ from the list of the ones that never do.
+///
+/// Printed and not gated, and [`rudb_compat::cutoff`] has the measurement that decided it: two of
+/// the three names on that list go both ways on their own, so an exact comparison would be red
+/// about half the time without anything having changed.
+fn cutoff(dir: &Path, total: &Isolated) -> ExitCode {
+    let list = Path::new(root()).join(rudb_compat::cutoff::LIST);
+    let text = match std::fs::read_to_string(&list) {
+        Ok(text) => text,
+        Err(e) => {
+            // The list not being readable is this harness being broken rather than a run saying
+            // something about the engine, so it is the one thing here that is worth an exit code.
+            eprintln!("rudb-compat: cannot read {}: {e}", list.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let expected = rudb_compat::cutoff::read(&text);
+    println!();
+    print!("{}", rudb_compat::cutoff::check(&expected, total, |name| dir.join(name).exists()));
+    ExitCode::SUCCESS
 }
 
 /// Say what the generators reached inside the engine, from a report `scripts/reach` produced.
@@ -1735,6 +1772,10 @@ const fn root() -> &'static str {
 /// does and is deliberate. The corpus is thousands of statements against a database that is being
 /// built, so a nonzero exit would mean the job is red every day until the day it is finished and
 /// nobody would read it. What CI watches is the number going down.
+///
+/// The files that did not stop are reported against a written down list by [`cutoff`], which does
+/// not change that. It was going to, on the grounds that a closed set of two names can be compared
+/// exactly where a rate cannot, and then the set turned out not to be reproducible.
 fn corpus(path: &Path, slow: bool, limits: Limits, shard: Shard) -> Result<Isolated, HarnessError> {
     let exe = std::env::current_exe()
         .map_err(|e| HarnessError::new(format!("cannot find this binary to re-run it: {e}")))?;
@@ -1962,6 +2003,15 @@ fn help() {
     println!("stops the statement itself and leaves a failure the report can count. This process");
     println!("keeps a clock of its own at twelve times the statement limit and a cap on the size");
     println!("the child, and a file that reaches either of those is killed and named instead.");
+    println!();
+    println!(
+        "A whole upstream run also says how the files it killed differ from the ones named in"
+    );
+    println!(
+        "corpus/cutoff.txt, in both directions. It prints and does not fail: two of the three"
+    );
+    println!("files on that list go both ways on their own, run to run, alone on an idle machine,");
+    println!("so one run disagreeing with the list is not yet a reason to edit it.");
     println!();
     println!("DuckDB gets ten seconds on every statement everywhere, whatever --limit says, and");
     println!("the process is killed when it runs out. It is a subprocess rather than a library");
