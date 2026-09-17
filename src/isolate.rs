@@ -93,14 +93,31 @@ impl Limits {
 
     /// The budget the engine charges its operators against.
     ///
-    /// Half the resident cap, because the two count different things. The engine counts what its
-    /// operators say they are holding and the cap is the size of the process, which is that plus
-    /// the binary, the allocator's free lists and whatever the reader mapped. Setting them equal
-    /// would mean the process was over the cap while the engine still thought it had room, and the
-    /// kill from outside would win every time, which is the thing this is here to stop.
+    /// A quarter of the resident cap, because the two count different things. The engine counts
+    /// what its operators say they are holding and the cap is the size of the process, which is
+    /// that plus the binary, the allocator's free lists and whatever the reader mapped. Setting
+    /// them equal would mean the process was over the cap while the engine still thought it had
+    /// room, and the kill from outside would win every time, which is the thing this is here to
+    /// stop.
+    ///
+    /// A quarter and not a half because a half was measured and it is not enough. One sort, run on
+    /// server2 against four budgets, stopped itself at the budget every time and the process it ran
+    /// in was three times that size when it did:
+    ///
+    /// | charged | resident |
+    /// | ------- | -------- |
+    /// | 16 MB   | 64 MB    |
+    /// | 32 MB   | 111 MB   |
+    /// | 64 MB   | 205 MB   |
+    /// | 128 MB  | 392 MB   |
+    ///
+    /// Three times what it charges is rudb's number to bring down and not this crate's, and it is
+    /// filed as tamnd/rudb#735. What this crate owes it in the meantime is a cap it cannot trip
+    /// while it is inside its own budget, because a file killed from outside is a file with no
+    /// outcome at all.
     #[must_use]
     pub const fn budget(self) -> u64 {
-        self.memory / 2
+        self.memory / 4
     }
 }
 
@@ -791,9 +808,12 @@ mod tests {
         let limits = Limits::default();
         assert_eq!(limits.statement(), Duration::from_secs(10));
         assert_eq!(limits.deadline(), Duration::from_secs(120));
-        assert_eq!(limits.budget(), 1024 * 1024 * 1024);
+        assert_eq!(limits.budget(), 512 * 1024 * 1024);
         assert!(limits.statement() < limits.deadline());
-        assert!(limits.budget() < limits.memory);
+        // Reaching the budget first is not enough on its own, because the process is bigger than
+        // what the engine charges itself. Three times bigger, measured, so the gap between these
+        // two has to be wider than three times and not merely present.
+        assert!(limits.budget() * 3 < limits.memory);
     }
 
     #[test]
