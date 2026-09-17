@@ -11,9 +11,10 @@
 //! start from an empty database, and one file leaving a table behind for the next one is a pass
 //! that means nothing.
 //!
-//! There are two of them, and the difference is [`Optimizer`]. [`Rudb::new`] is the engine somebody
-//! embedding rudb gets and [`Rudb::unoptimized`] is the same engine with every rewrite turned off,
-//! which the corpus runs as well so the two can be required to agree.
+//! There are three of them, and the difference is [`Optimizer`]. [`Rudb::new`] is the engine
+//! somebody embedding rudb gets, [`Rudb::unoptimized`] is the same engine with every rewrite turned
+//! off, which the corpus runs as well so the two can be required to agree, and [`Rudb::only`] is
+//! the same engine with exactly one rewrite left on, which is what the per pass sweep runs.
 //!
 //! Everything here goes through the `rudb` crate and nothing else. That is a real constraint and
 //! not tidiness: this harness is the closest thing the project has to somebody embedding rudb, so
@@ -50,6 +51,13 @@ pub enum Optimizer {
     On,
     /// No pass runs, which is the bound plan going straight to the executor.
     Off,
+    /// This pass runs and no other one does.
+    ///
+    /// The sweep. [`Optimizer::Off`] says some pass changed an answer and this says which, because
+    /// the run that differs is the run with one pass in it. What it cannot see is a pair that only
+    /// goes wrong together, since neither of them alone is this run, and that is the case
+    /// [`Optimizer::On`] against [`Optimizer::Off`] catches and this one leaves to it.
+    Only(&'static str),
 }
 
 impl Default for Rudb {
@@ -99,6 +107,27 @@ impl Rudb {
         Self::open(Config::new(), Optimizer::Off)
     }
 
+    /// The same rudb with one optimizer pass left on and every other one turned off.
+    ///
+    /// Run the corpus once through each of these and a difference is already attributed: the run
+    /// that differs is the run with one pass in it, so nobody has to bisect afterwards. That is the
+    /// per pass half of the exit criterion in `spec/09-optimizer.md` section 9.1, and it costs one
+    /// corpus run per pass rather than one per failing record, which is why it is a nightly.
+    ///
+    /// # Panics
+    ///
+    /// If the name is not one [`rudb::optimizers`] publishes. Turning off every pass whose name is
+    /// not this one would leave every pass off, so a typo would quietly build the unoptimized
+    /// engine and report a clean sweep of a pass that never ran.
+    #[must_use]
+    pub fn only(pass: &'static str) -> Self {
+        assert!(
+            rudb::optimizers().contains(&pass),
+            "{pass} is not a pass rudb has, so leaving only it on would leave nothing on"
+        );
+        Self::open(Config::new(), Optimizer::Only(pass))
+    }
+
     /// The database, for a caller that wants to look at the catalog after a run.
     #[must_use]
     pub fn database(&self) -> &Database {
@@ -108,8 +137,9 @@ impl Rudb {
     /// Builds one, with the passes on or off as asked.
     fn open(config: Config, optimizer: Optimizer) -> Self {
         let suffix = match optimizer {
-            Optimizer::On => "",
-            Optimizer::Off => " (optimizer off)",
+            Optimizer::On => String::new(),
+            Optimizer::Off => " (optimizer off)".to_owned(),
+            Optimizer::Only(pass) => format!(" (only {pass})"),
         };
         Self {
             version: format!("rudb {}{suffix}", rudb_version()),
@@ -129,13 +159,30 @@ impl Rudb {
 /// a test of its own that says they agree.
 fn opened(config: Config, optimizer: Optimizer) -> Database {
     let database = Database::with_config(config);
-    if optimizer == Optimizer::Off {
-        let names = rudb::optimizers().join(",");
+    let off = turned_off(optimizer);
+    if !off.is_empty() {
+        let names = off.join(",");
         database
             .execute(&format!("SET disabled_optimizers = '{names}'"))
             .expect("rudb takes the pass names rudb published");
     }
     database
+}
+
+/// Which passes have to be turned off for that engine to be the one asked for.
+///
+/// Empty for [`Optimizer::On`], and empty as well for an [`Optimizer::Only`] of the one pass rudb
+/// has, which is the same thing: nothing to disable is every pass running. That case is not
+/// hypothetical, it is what the first week of E1 looked like, and a `SET` of an empty list is a
+/// statement with no meaning rather than one that turns everything on.
+fn turned_off(optimizer: Optimizer) -> Vec<&'static str> {
+    match optimizer {
+        Optimizer::On => Vec::new(),
+        Optimizer::Off => rudb::optimizers(),
+        Optimizer::Only(keep) => {
+            rudb::optimizers().into_iter().filter(|pass| *pass != keep).collect()
+        }
+    }
 }
 
 /// What version of rudb we linked, which is the version being tested.
@@ -250,7 +297,7 @@ pub fn ordering_of(sql: &str) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rudb, ordering_of};
+    use super::{Optimizer, Rudb, ordering_of};
     use crate::compare::Ordering;
     use crate::engine::{Cell, Engine, Outcome};
 
@@ -340,6 +387,41 @@ mod tests {
         // It goes in a report next to the other one, so the two have to be tellable apart.
         assert!(Rudb::unoptimized().version().contains("optimizer off"));
         assert!(!Rudb::new().version().contains("optimizer off"));
+    }
+
+    #[test]
+    fn leaving_one_pass_on_turns_off_every_other_one_and_not_that_one() {
+        // The list rather than the plan, because the plan only shows a pass that had something to
+        // do in the query that was planned, and the claim here is about all of them at once.
+        for pass in rudb::optimizers() {
+            let off = super::turned_off(Optimizer::Only(pass));
+            assert!(!off.contains(&pass), "{pass} was turned off in its own run");
+            assert_eq!(off.len(), rudb::optimizers().len() - 1, "{pass} left something else on");
+        }
+    }
+
+    #[test]
+    fn the_run_for_one_pass_really_has_that_pass_on() {
+        // Constant folding is the one with a plan that reads differently either way, so it is the
+        // one that can be checked rather than asserted. `Rudb::unoptimized` has the same check the
+        // other way round, and together they say the setting is obeyed and not merely accepted.
+        let folding = "expression_rewriter";
+        assert!(rudb::optimizers().contains(&folding), "{:?}", rudb::optimizers());
+        let plan = Rudb::only(folding).database().plan("SELECT 1 + 2").expect("that plans");
+        assert!(!plan.contains("\"+\""), "{plan}");
+    }
+
+    #[test]
+    fn a_pass_rudb_does_not_have_is_refused_rather_than_leaving_every_pass_off() {
+        let caught = std::panic::catch_unwind(|| Rudb::only("no_such_pass"));
+        assert!(caught.is_err(), "a name rudb has never heard of built an engine");
+    }
+
+    #[test]
+    fn the_run_for_one_pass_says_which_one_in_its_version() {
+        let pass = rudb::optimizers()[0];
+        let version = Rudb::only(pass).version().to_owned();
+        assert!(version.contains(&format!("only {pass}")), "{version}");
     }
 
     #[test]
