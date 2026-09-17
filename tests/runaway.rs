@@ -6,8 +6,8 @@
 //! not a failure, just a file nobody knows anything about.
 //!
 //! This is the two ways that goes wrong, written small enough to run in a second. The engine is
-//! given a one second clock and a one megabyte budget, and both files come back as records with an
-//! outcome rather than as processes that had to be killed.
+//! given a one second clock and a budget it reaches almost at once, and both files come back as
+//! records with an outcome rather than as processes that had to be killed.
 //!
 //! The other engine is here too, at the bottom. DuckDB is a subprocess rather than a library, so
 //! nothing in this harness was stopping it, and a generated call to `sleep_ms` is all it takes.
@@ -37,10 +37,13 @@ fn a_query_the_engine_stops_is_a_failed_record_and_not_a_killed_process() {
     );
 
     let exe = Path::new(env!("CARGO_BIN_EXE_rudb-compat"));
-    // A second, which is four before this runner would step in, and a cap the engine gets half of.
-    // The cap is not small: it is the size of the process and the process is a database, so a cap
-    // the engine could actually reach first has to leave room for the binary underneath it.
-    let limits = Limits { time: Duration::from_secs(1), memory: 128 * 1024 * 1024 };
+    // A second, which is twelve before this runner would step in, and a cap the engine gets a
+    // quarter of. The cap is not small: it is the size of the process and the process is a
+    // database, so a cap the engine could actually reach first has to leave room for the binary
+    // underneath it and for everything the engine allocates without charging itself for it. A
+    // quarter of 256 MB is a 64 MB budget, and the sort below was measured holding 205 MB of
+    // process while it was inside that budget, so the room this leaves is real and it is deliberate.
+    let limits = Limits { time: Duration::from_secs(1), memory: 256 * 1024 * 1024 };
     let run = run_corpus(exe, &dir, false, limits, Shard::whole()).expect("the files are there");
     let _ = std::fs::remove_dir_all(&dir);
 
