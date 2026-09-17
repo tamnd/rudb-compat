@@ -1,0 +1,82 @@
+# The per pass optimizer sweep, against the pin and against whatever rudb merged today.
+#
+# #102 in tamnd/rudb asks for this: the corpus run once per optimizer pass, with that pass on and
+# every other one off, so a record that fails is already attributed to the one rewrite that ran.
+#
+# The sweep against the pin is also a test, in tests/corpus.rs, and every pull request runs it. That
+# is not what this job is for. Cargo.toml points at a branch of tamnd/rudb and Cargo.lock pins a
+# commit on it, so the per commit gate measures the commit somebody last bumped the pin to, and a
+# pass that changed an answer this morning is invisible here until somebody bumps it again. The
+# second half of this job unpins rudb, sweeps against the tip of the branch, and is allowed to be
+# the thing that says so overnight rather than a week later inside an unrelated pull request.
+#
+# It does not open an issue or send anything. A red tick on a nightly that names a pass is the whole
+# deliverable, and a job that files things is a job somebody has to maintain.
+
+name: nightly
+
+on:
+  schedule:
+    # Half past two UTC, which is after the engine's own nightlies have pushed whatever they push.
+    - cron: "30 2 * * *"
+  # So that a change to this file can be checked without waiting a day for it.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  sweep:
+    name: per pass optimizer sweep
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: Swatinem/rust-cache@v2.9.2
+
+      # Against the pin first. This is the same answer the pull request gate got, so it failing
+      # means the nightly machine and CI disagree about a commit that already passed, which is
+      # worth telling apart from the engine having moved.
+      - name: sweep the pinned rudb
+        run: cargo run --release -q -- sweep | tee pinned.txt
+
+      # The pin comes off for this one and nothing is committed. A green run here is the pin being
+      # safe to bump, and a red one names the pass in the output above, which is the report.
+      - name: move rudb to the tip of its branch
+        run: cargo update -p rudb
+      - name: sweep the current rudb
+        run: cargo run --release -q -- sweep | tee tip.txt
+
+      - name: publish both sweeps
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Per pass optimizer sweep"
+            echo
+            echo "### The pinned rudb"
+            echo '```'
+            cat pinned.txt 2>/dev/null || echo "did not run"
+            echo '```'
+            echo
+            echo "### The tip of the rudb branch"
+            echo '```'
+            cat tip.txt 2>/dev/null || echo "did not run"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: keep the sweeps for reading
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: optimizer-sweep
+          path: |
+            pinned.txt
+            tip.txt
+          retention-days: 14
+          if-no-files-found: ignore

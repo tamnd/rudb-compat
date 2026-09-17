@@ -7,10 +7,10 @@
 //!
 //! The search is linear over the passes and not a binary search over subsets. `spec/09-optimizer.md`
 //! section 9.1 describes the bisector as a binary search, which is the right shape when the list is
-//! long, and the list is seven. Seven runs of a statement that already ran is nothing, a binary
-//! search over subsets finds one pass and quietly picks a side when two of them are involved, and
-//! the linear sweep answers the question the report actually asks, which is which passes each on
-//! their own make the difference go away.
+//! long, and the list is a handful. That many runs of a statement that already ran is nothing, a
+//! binary search over subsets finds one pass and quietly picks a side when two of them are involved,
+//! and the linear search answers the question the report actually asks, which is which passes each
+//! on their own make the difference go away.
 //!
 //! There is an eighth run with every pass off, and it is the one that earns the module. Most wrong
 //! answers are not the optimizer at all, and a run that says so costs one statement and saves

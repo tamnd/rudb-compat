@@ -16,6 +16,7 @@ use rudb_compat::isolate::{Isolated, Limits, decode_run, encode_run, run_corpus}
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shard::Shard;
 use rudb_compat::shell::{Session, Shell};
+use rudb_compat::sweep;
 
 #[test]
 fn every_file_in_the_committed_corpus_passes() {
@@ -69,6 +70,36 @@ fn the_corpus_answers_the_same_with_every_optimizer_pass_turned_off() {
     assert_eq!(unoptimized.passed, optimized.passed);
     assert_eq!(unoptimized.failed, optimized.failed);
     assert_eq!(unoptimized.failures, optimized.failures);
+}
+
+/// The same corpus once per pass, with that pass on and every other one off.
+///
+/// The test above says some pass changed an answer. This one says which, because every run in it
+/// has exactly one rewrite in it, so a record that fails is attributed by the arrangement rather
+/// than by a search afterwards. Together they are the two halves of the exit criterion in
+/// `spec/09-optimizer.md` section 9.1: the pair catches a pair of passes that are only wrong
+/// together, which no single pass run can see, and this one names the single pass, which the pair
+/// cannot.
+///
+/// #102 asks for this as a nightly. It is here as well because it is cheap: ten runs of this corpus
+/// is three and a half seconds, the fourteen seconds that made it a nightly was the upstream corpus,
+/// and a property that can be gated per commit should be.
+#[test]
+fn every_optimizer_pass_on_its_own_answers_the_corpus_the_same_way() {
+    let swept = sweep::run(Path::new("corpus/slt"), false).expect("the corpus is there");
+
+    assert!(
+        swept.clean(),
+        "{}",
+        swept.changed().iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+    );
+    // The baseline is the other test's to fail, but a baseline that failed here would make every
+    // record above it disappear off the pass lists silently, so it is worth saying out loud.
+    assert!(swept.unoptimized_failures().is_empty(), "{swept}");
+    // Every pass rudb publishes got a run. A sweep that swept nothing is clean, and a pass list
+    // this could not read would make it sweep nothing.
+    assert_eq!(swept.passes(), rudb::optimizers());
+    assert!(swept.passes().len() > 1, "only {:?} was swept", swept.passes());
 }
 
 /// The same corpus through the shell, which is the rudb somebody who is not this harness runs.

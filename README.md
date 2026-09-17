@@ -369,11 +369,45 @@ RUDB_COMPAT_RUDB=/path/to/rudb cargo run --release -- bisect "SELECT unnest([1,2
 every pass off answers the same way, so this is the binder or the executor and not the optimizer
 ```
 
-It runs the statement once per pass with that pass turned off, and then once more with every pass off. The sweep is linear rather than a binary search over subsets, because the list is seven names long, seven extra runs of a statement that already ran is nothing, and a binary search finds one pass and quietly picks a side when two of them are involved.
+It runs the statement once per pass with that pass turned off, and then once more with every pass off. The search is linear rather than a binary search over subsets, because the list is a handful of names long, that many extra runs of a statement that already ran is nothing, and a binary search finds one pass and quietly picks a side when two of them are involved.
 
 The last run is the one to read. The unoptimized plan is the right answer by construction, so a statement that is still wrong with every rewrite off is wrong in the binder or the executor, and that is worth one run because it sends somebody to the right file instead of a week of reading plans. Every difference found by hand so far has come back that way, which is a fair summary of where rudb is: the optimizer is not yet where the answers go wrong.
 
 Turning a pass off is a `SET`, so this only works through a driver that remembers what it was told, and the setting is put back after each run whatever happened, because the engine here is the one the next record uses.
+
+## The per pass sweep
+
+`bisect` is asked about a statement somebody already found. The sweep asks about all of them at once, before anybody has found anything, by running the whole corpus once per pass with that pass on and every other one off.
+
+```
+cargo run --release -- sweep
+```
+
+```
+9 passes swept over 35 files
+          0  every pass off              591 of 591 records passed
+          0  expression_rewriter         591 of 591 records passed
+          0  distinct_aggregate_rewrite  591 of 591 records passed
+          0  dependent_group_keys        591 of 591 records passed
+          0  filter_pushdown             591 of 591 records passed
+          0  empty_result_pullup         591 of 591 records passed
+          0  unused_columns              591 of 591 records passed
+          0  limit_pushdown              591 of 591 records passed
+          0  top_n                       591 of 591 records passed
+          0  late_materialization        591 of 591 records passed
+
+no pass changed an answer
+```
+
+The attribution is the arrangement rather than a search afterwards. Every run has exactly one rewrite in it, so a record that fails in one of them was changed by the pass that names the row, and nothing has to be bisected to find that out. `cargo test` runs the same sweep, because it is three and a half seconds and a property that can be gated per commit should be.
+
+The first row earns its run. Without it, a record the binder or the executor gets wrong fails in all nine of the others and is reported nine times against nine innocent passes. With it, those records come off every pass's list and are printed once at the bottom under the sentence that says the optimizer is not where to look, which is the same answer `bisect` gives for one statement.
+
+What a sweep cannot see is a pair of passes that is only wrong when both are on, because no run here has two passes in it. That is the other half of the property and it is `cargo test`'s: the committed corpus with every pass on and with every pass off has to answer identically. A clean sweep beside a red on-against-off gate is the pair, and that is a reading neither check gives on its own.
+
+The nightly runs it twice, once against the pinned rudb and once against the tip of the branch. The pin is what every pull request here measures, so a pass that changed an answer this morning is invisible until somebody bumps the pin, and the second run is what says so overnight instead of a week later inside an unrelated change.
+
+Upstream's corpus is not swept yet. This runs the corpus in this process, which is fine for a corpus every record of which is supposed to pass, and upstream has queries that do not stop. Those need the isolating runner, which re-runs this binary once per file and has no way yet to tell the child which pass to leave on.
 
 ## What the generators never reach
 

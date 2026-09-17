@@ -129,6 +129,7 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("sweep") => sweep(rest.get(1).copied(), slow),
         Some("sqlsmith") => sqlsmith(
             valued(&args, "--count").map_or(QUERIES, |n| usize::try_from(n).unwrap_or(QUERIES)),
             valued(&args, "--seed").and_then(|n| u32::try_from(n).ok()),
@@ -405,6 +406,40 @@ fn bisect(sql: &str, messages: MessageMatch) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The committed corpus, which is what a sweep runs over unless it is pointed somewhere else.
+const CORPUS: &str = "corpus/slt";
+
+/// Run the corpus once per optimizer pass, with that pass on and the rest off.
+///
+/// The other half of the property `tests/corpus.rs` gates per commit. That test says the corpus
+/// answers the same with every pass on and with every pass off, which catches a pass that changed an
+/// answer and does not say which pass. This runs the corpus once per pass with one pass on, so the
+/// run that fails is the answer.
+///
+/// It defaults to the committed corpus rather than to upstream, which is the opposite of what `slt`
+/// does, because the committed corpus is the one every record of which is supposed to pass. A path
+/// points it somewhere else, and the baseline run is what makes a corpus rudb cannot pass readable:
+/// the records rudb has not built yet fail identically in every run, so they land in the baseline
+/// and come off every pass's list. What it will not do yet is the whole of upstream, because it runs
+/// the corpus in this process and upstream has queries that do not stop.
+///
+/// It exits nonzero when a pass changed an answer, and successfully when the only failures are ones
+/// the unoptimized run has too. Those are real and they are the per commit gate's to report, and a
+/// nightly that fails for them would be red for a bug in the binder every night until somebody fixed
+/// it, which is how a nightly stops being read.
+fn sweep(path: Option<&str>, slow: bool) -> ExitCode {
+    let path = path.unwrap_or(CORPUS);
+    let swept = match rudb_compat::sweep::run(Path::new(path), slow) {
+        Ok(swept) => swept,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print!("{swept}");
+    if swept.clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// Shrink one failing statement down to the smallest one that still fails the same way.
@@ -1807,6 +1842,17 @@ fn help() {
     println!("                more with all of them off. That last run is the one to read: an");
     println!("                answer that is still wrong with every rewrite off is wrong in the");
     println!("                binder or the executor and the optimizer is not where to look.");
+    println!("  sweep [path]  run the corpus once per optimizer pass, with that pass on and every");
+    println!("                other one off, so a record that fails is already attributed to the");
+    println!("                one rewrite that ran. The committed corpus if no path. It runs the");
+    println!("                corpus with every pass off as well, and a record that fails there");
+    println!("                too is reported apart and does not fail the run, because the plan");
+    println!("                the binder produced is the right answer by construction and a");
+    println!("                record it gets wrong is not any pass's doing. What this cannot see");
+    println!("                is two passes that are only wrong together, which is what the on");
+    println!("                against off gate in the test suite is for. Exits nonzero when a");
+    println!("                pass changed an answer. This is the nightly, since it is one corpus");
+    println!("                run per pass.");
     println!("  sqlsmith      generate queries with upstream's own generator and put every one of");
     println!("                them to both engines, grouped by what rudb said about them. Takes");
     println!("                --count and --seed, and prints the seed either way, because a");
