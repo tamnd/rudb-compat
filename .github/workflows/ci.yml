@@ -123,10 +123,10 @@ jobs:
             echo '```'
             echo
             echo '```'
-            tail -2 slt.txt
+            tail -30 slt.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -2 slt.txt
+          tail -30 slt.txt
       - name: keep the failures for reading
         uses: actions/upload-artifact@v7.0.1
         with:

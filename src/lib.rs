@@ -36,6 +36,7 @@ pub mod conform;
 pub mod cost;
 pub mod coverage;
 pub mod csv;
+pub mod cutoff;
 pub mod duckdb;
 pub mod engine;
 pub mod functions;
