@@ -1,0 +1,14 @@
+# name: corpus/bench/correlated-full-join.benchmark
+# description: A correlated subquery over a full join, where both sides carry a copy of the domain and the two are equated
+# group: [rudb-correlated]
+
+name Correlated full join
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+CREATE TABLE extra AS SELECT i % 500 AS bucket, i * 2 AS amount FROM range(2000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT count(x.amount) FROM (SELECT amount FROM facts WHERE facts.bucket = parts.bucket) x FULL JOIN extra e ON e.amount = x.amount) > 100

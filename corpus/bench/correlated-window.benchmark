@@ -1,0 +1,13 @@
+# name: corpus/bench/correlated-window.benchmark
+# description: A correlated subquery with a window inside it, which has to partition by the domain and by what the query wrote
+# group: [rudb-correlated]
+
+name Correlated window
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT max(r) FROM (SELECT row_number() OVER (PARTITION BY amount % 10 ORDER BY amount) AS r FROM facts WHERE facts.bucket = parts.bucket) x) > 30

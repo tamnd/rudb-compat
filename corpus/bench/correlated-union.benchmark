@@ -1,0 +1,14 @@
+# name: corpus/bench/correlated-union.benchmark
+# description: A correlated subquery over a UNION, where both branches read the outer row
+# group: [rudb-correlated]
+
+name Correlated union
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+CREATE TABLE extra AS SELECT i % 500 AS bucket, i * 2 AS amount FROM range(2000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT count(*) FROM (SELECT amount FROM facts WHERE facts.bucket = parts.bucket UNION SELECT amount FROM extra WHERE extra.bucket = parts.bucket) x) > 400

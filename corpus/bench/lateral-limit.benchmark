@@ -1,0 +1,13 @@
+# name: corpus/bench/lateral-limit.benchmark
+# description: A lateral entry with a limit, which takes the first few matches of each outer row rather than of the whole side
+# group: [rudb-lateral]
+
+name Lateral limit
+group rudb-lateral
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(v.amount) FROM parts, LATERAL (SELECT amount FROM facts WHERE facts.bucket = parts.bucket AND facts.amount % 3 = 0 LIMIT 3) v
