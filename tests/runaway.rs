@@ -5,9 +5,11 @@
 //! were killed from outside by the runner, which left them counted in neither column: not a pass,
 //! not a failure, just a file nobody knows anything about.
 //!
-//! This is the two ways that goes wrong, written small enough to run in a second. The engine is
-//! given a one second clock and a budget it reaches almost at once, and both files come back as
-//! records with an outcome rather than as processes that had to be killed.
+//! This is the two ways that goes wrong, written small enough to run in a second. Each one gets its
+//! own run with the other limit set out of reach, because a run that gives a query a clock and a
+//! budget it can both reach is measuring which one the machine got to first. That is what this test
+//! used to do and on a loaded box the clock always won, so the file that was there to prove the
+//! memory cap works proved the clock works twice.
 //!
 //! The other engine is here too, at the bottom. DuckDB is a subprocess rather than a library, so
 //! nothing in this harness was stopping it, and a generated call to `sleep_ms` is all it takes.
@@ -22,43 +24,51 @@ use rudb_compat::isolate::{Limits, run_corpus};
 use rudb_compat::shard::Shard;
 
 #[test]
-fn a_query_the_engine_stops_is_a_failed_record_and_not_a_killed_process() {
-    let dir = scratch();
-    write(
-        &dir,
-        "clock.test",
+fn a_query_that_is_too_slow_is_a_failed_record_and_not_a_killed_process() {
+    // A second, which is twelve before this runner would step in, against a cap no query in this
+    // file is ever going to reach.
+    let limits = Limits { time: Duration::from_secs(1), memory: 64 * 1024 * 1024 * 1024 };
+    let detail = stopped_by(
+        "clock",
         "query I\nSELECT count(*) FROM range(100000000000);\n----\n100000000000\n",
+        limits,
     );
-    write(
-        &dir,
-        "budget.test",
-        "query I\nSELECT count(*) FROM (SELECT * FROM range(10000000) ORDER BY range) t;\n\
-         ----\n10000000\n",
-    );
+    assert!(detail.contains("Interrupt Error"), "{detail}");
+}
 
-    let exe = Path::new(env!("CARGO_BIN_EXE_rudb-compat"));
-    // A second, which is twelve before this runner would step in, and a cap the engine gets a
-    // quarter of. The cap is not small: it is the size of the process and the process is a
-    // database, so a cap the engine could actually reach first has to leave room for the binary
+#[test]
+fn a_query_that_is_too_large_is_a_failed_record_and_not_a_killed_process() {
+    // A cap the engine gets a quarter of, against a clock the sort underneath it finishes well
+    // inside on any machine this runs on. The cap is not small: it is the size of the process and
+    // the process is a database, so a cap the engine can reach has to leave room for the binary
     // underneath it and for everything the engine allocates without charging itself for it. A
     // quarter of 256 MB is a 64 MB budget, and the sort below was measured holding 205 MB of
     // process while it was inside that budget, so the room this leaves is real and it is deliberate.
-    let limits = Limits { time: Duration::from_secs(1), memory: 256 * 1024 * 1024 };
-    let run = run_corpus(exe, &dir, false, limits, Shard::whole()).expect("the files are there");
+    let limits = Limits { time: Duration::from_secs(120), memory: 256 * 1024 * 1024 };
+    let detail = stopped_by(
+        "budget",
+        "query I\nSELECT count(*) FROM (SELECT * FROM range(10000000) ORDER BY range) t;\n\
+         ----\n10000000\n",
+        limits,
+    );
+    assert!(detail.contains("Out of Memory Error"), "{detail}");
+}
+
+/// Run one file on its own and give back what the engine said when it stopped.
+fn stopped_by(name: &str, text: &str, limits: Limits) -> String {
+    let dir = scratch(name);
+    write(&dir, &format!("{name}.test"), text);
+
+    let exe = Path::new(env!("CARGO_BIN_EXE_rudb-compat"));
+    let run = run_corpus(exe, &dir, false, limits, Shard::whole()).expect("the file is there");
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(run.stopped.is_empty(), "a file was killed from outside: {:?}", run.stopped);
-    assert_eq!(run.files, 2);
-    assert_eq!(run.failed, 2, "{:?}", run.failures);
-    for failure in &run.failures {
-        assert_eq!(failure.reason, Reason::Stopped, "{failure}");
-    }
-
-    // And it says which limit did it, because the two are different problems. One is a query that
-    // is too slow and the other is a query that is too large.
-    let details: Vec<&str> = run.failures.iter().map(|f| f.detail.as_str()).collect();
-    assert!(details.iter().any(|d| d.contains("Interrupt Error")), "{details:?}");
-    assert!(details.iter().any(|d| d.contains("Out of Memory Error")), "{details:?}");
+    assert_eq!(run.files, 1);
+    assert_eq!(run.failed, 1, "{:?}", run.failures);
+    let failure = &run.failures[0];
+    assert_eq!(failure.reason, Reason::Stopped, "{failure}");
+    failure.detail.clone()
 }
 
 #[test]
@@ -83,8 +93,9 @@ fn a_duckdb_that_is_never_going_to_finish_is_killed_and_comes_back_as_a_record()
     assert!(elapsed < Duration::from_secs(30), "it waited {elapsed:?}, so nothing killed it");
 }
 
-fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("rudb-compat-runaway-{}", std::process::id()));
+fn scratch(name: &str) -> PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("rudb-compat-runaway-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
