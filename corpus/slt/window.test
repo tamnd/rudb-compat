@@ -259,3 +259,169 @@ statement error
 SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
 ----
 a RANGE frame with an offset
+
+# The rankings that follow do not read the frame at all. They read where the row sits in the
+# partition and which rows it ties with, so every expected value below stays the same no matter what
+# frame is written around the call. The three that count differ only on the two rows that tie on 2.
+# row_number never ties, rank ties and then leaves a gap, and dense_rank ties and does not.
+
+query IIII
+SELECT i, row_number() OVER (ORDER BY i), rank() OVER (ORDER BY i), dense_rank() OVER (ORDER BY i) FROM t ORDER BY i;
+----
+1	1	1	1
+2	2	2	2
+2	3	2	2
+3	4	4	3
+4	5	5	4
+NULL	6	6	5
+
+# rank_dense is the same function under another name.
+
+query II
+SELECT i, rank_dense() OVER (ORDER BY i) FROM t ORDER BY i;
+----
+1	1
+2	2
+2	2
+3	3
+4	4
+NULL	5
+
+# The two that divide run over the same peer groups. percent_rank starts at zero and reaches one on
+# the last row, and cume_dist starts above zero and reaches one on the last row.
+
+query IRR
+SELECT i, percent_rank() OVER (ORDER BY i), cume_dist() OVER (ORDER BY i) FROM t ORDER BY i;
+----
+1	0.000	0.167
+2	0.200	0.500
+2	0.200	0.500
+3	0.600	0.667
+4	0.800	0.833
+NULL	1.000	1.000
+
+# With no ORDER BY inside the OVER the whole partition is one peer group, so every row is first and
+# last at the same time and all four answers are constant.
+
+query IIIRR
+SELECT i, rank() OVER (), dense_rank() OVER (), percent_rank() OVER (), cume_dist() OVER () FROM t ORDER BY i;
+----
+1	1	1	0.000	1.000
+2	1	1	0.000	1.000
+2	1	1	0.000	1.000
+3	1	1	0.000	1.000
+4	1	1	0.000	1.000
+NULL	1	1	0.000	1.000
+
+# The same two calls with a frame written around them. The frame is ignored and the answers are the
+# ones above, which is the whole point of pinning it.
+
+query IIR
+SELECT i, rank() OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), cume_dist() OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM t ORDER BY i;
+----
+1	1	0.167
+2	2	0.500
+2	2	0.500
+3	4	0.667
+4	5	0.833
+NULL	6	1.000
+
+# A partition restarts the count, and the null sorts last inside its own partition rather than
+# outside every partition.
+
+query ITII
+SELECT i, j, row_number() OVER (PARTITION BY j ORDER BY i), rank() OVER (PARTITION BY j ORDER BY i) FROM t ORDER BY j, i;
+----
+1	a	1	1
+2	a	2	2
+2	a	3	2
+3	b	1	1
+4	b	2	2
+NULL	b	3	3
+
+# Five rows into three buckets is two, two and one rather than one, two and two, because the
+# remainder goes to the buckets at the front.
+
+query II
+SELECT i, ntile(3) OVER (ORDER BY i) FROM u ORDER BY i;
+----
+1	1
+2	1
+3	2
+4	2
+5	3
+
+query III
+SELECT i, j, ntile(2) OVER (PARTITION BY j ORDER BY i) FROM u ORDER BY j, i;
+----
+1	1	1
+2	1	2
+3	2	1
+4	2	1
+5	2	2
+
+# The bucket count is read off the row rather than off the plan, so it can be a column and it can
+# disagree from row to row. The first two rows ask for one bucket and the last three ask for two,
+# and every row is cut against the one partition it is actually in.
+
+query III
+SELECT i, j, ntile(j) OVER (ORDER BY i) FROM u ORDER BY i;
+----
+1	1	1
+2	1	1
+3	2	1
+4	2	2
+5	2	2
+
+# More buckets than rows leaves the extra buckets empty rather than wrapping.
+
+query II
+SELECT i, ntile(8) OVER (ORDER BY i) FROM u ORDER BY i;
+----
+1	1
+2	2
+3	3
+4	4
+5	5
+
+# A partition of one row has nothing to divide by, and percent_rank answers zero there instead of
+# refusing.
+
+query IRR
+SELECT i, percent_rank() OVER (PARTITION BY i ORDER BY i), cume_dist() OVER (PARTITION BY i ORDER BY i) FROM u ORDER BY i;
+----
+1	0.000	1.000
+2	0.000	1.000
+3	0.000	1.000
+4	0.000	1.000
+5	0.000	1.000
+
+# A bucket count that is null answers null rather than refusing, which is the ordinary rule for an
+# argument and not a special case.
+
+query II
+SELECT i, ntile(NULL) OVER (ORDER BY i) FROM u ORDER BY i;
+----
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+
+statement error
+SELECT ntile(0) OVER (ORDER BY i) FROM u;
+----
+Argument for ntile must be greater than zero
+
+# These names are only ever windows, so writing one without an OVER is refused rather than looked up
+# as a scalar, and DISTINCT inside one is refused by name.
+
+statement error
+SELECT row_number() FROM u;
+----
+Window functions are not supported here
+
+statement error
+SELECT row_number(DISTINCT) OVER (ORDER BY i) FROM u;
+----
+DISTINCT is not implemented for the window function
