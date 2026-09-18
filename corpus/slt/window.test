@@ -251,14 +251,111 @@ SELECT i, max(i) OVER (ORDER BY i DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
 1	2
 NULL	1
 
-# The one frame this does not answer yet. The distance is measured from the current row's order key
-# rather than from its position, so answering it is arithmetic over whatever type that key has, and
-# saying so is better than answering it as though it were a ROWS frame.
+# A RANGE distance is measured from the current row's order key and not from its position, so both
+# rows that hold 2 see the same frame. That is the whole difference from the ROWS frame above, and
+# it is the single easiest thing to get wrong.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY i, j;
+----
+1	1
+2	5
+2	5
+3	7
+4	7
+NULL	NULL
+
+query III
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING), count(*) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY i, j;
+----
+1	5	3
+2	8	4
+2	8	4
+3	11	4
+4	7	2
+NULL	NULL	1
+
+# Under DESC the rows before the current one hold larger keys, so 1 PRECEDING adds where it would
+# have subtracted. A frame that reaches the same distance either way answers the same under both
+# orders, and it would not if the sign were fixed rather than read off the sort key.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i DESC RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY i, j;
+----
+1	5
+2	8
+2	8
+3	11
+4	7
+NULL	NULL
+
+# The row with no key is its own peer group and no frame ever reaches it, so its count is one. An
+# end that is not a distance is answered the way it always was, which is why the last three rows of
+# the second query reach the whole partition.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 1 FOLLOWING AND 2 FOLLOWING) FROM t ORDER BY i, j;
+----
+1	7
+2	7
+2	7
+3	4
+4	NULL
+NULL	NULL
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) FROM t ORDER BY i, j;
+----
+1	5
+2	8
+2	8
+3	12
+4	12
+NULL	12
+
+# A frame whose start is past its end covers nothing, which is null and not zero and not an error.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 2 PRECEDING AND 1 PRECEDING) FROM t ORDER BY i, j;
+----
+1	NULL
+2	1
+2	1
+3	5
+4	7
+NULL	NULL
+
+# The distance is arithmetic over the key's type rather than a row count, so a fractional distance
+# does the subtraction in decimal and reaches the rows that decimal reaches.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN 1.5 PRECEDING AND 1.5 FOLLOWING) FROM t ORDER BY i, j;
+----
+1	5
+2	8
+2	8
+3	11
+4	7
+NULL	NULL
+
+# A null distance has no frame at all, and a negative one has a frame that runs backwards. Under
+# ROWS a negative distance is an empty frame and an answer of null, and under RANGE it is refused,
+# which is not an inconsistency: a row count that runs backwards still names a row.
 
 statement error
-SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN NULL PRECEDING AND CURRENT ROW) FROM t;
 ----
-a RANGE frame with an offset
+Window RANGE expressions cannot be NULL
+
+statement error
+SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;
+----
+Invalid RANGE PRECEDING value
+
+statement error
+SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN CURRENT ROW AND -1 FOLLOWING) FROM t;
+----
+Invalid RANGE FOLLOWING value
 
 # The rankings that follow do not read the frame at all. They read where the row sits in the
 # partition and which rows it ties with, so every expected value below stays the same no matter what
