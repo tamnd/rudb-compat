@@ -508,7 +508,7 @@ mod tests {
     fn our_own_benchmarks_are_read_and_every_one_of_them_has_a_group_and_a_load() {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(super::OURS);
         let found = super::ours(&dir).expect("our own benchmarks");
-        assert_eq!(found.len(), 12, "{:?}", found.iter().map(|q| &q.name).collect::<Vec<_>>());
+        assert_eq!(found.len(), 13, "{:?}", found.iter().map(|q| &q.name).collect::<Vec<_>>());
         for query in &found {
             assert!(query.group.starts_with("rudb-"), "{} is in {}", query.name, query.group);
             assert!(!query.load.is_empty(), "{} loads nothing", query.name);
