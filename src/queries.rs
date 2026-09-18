@@ -9,7 +9,15 @@
 //!
 //! ## Where the queries come from
 //!
-//! DuckDB's own benchmark suite, which is already in the vendored clone. It is ClickBench, the
+//! Two places. The second is `corpus/bench` in this crate, which is ours and is read by
+//! [`ours`]. It is there because the first one cannot measure anything built after it was
+//! written, and nothing in DuckDB's suite is a correlated subquery or a lateral join, so a
+//! release that made those work moved no number in a cost run at all. Those files are in
+//! DuckDB's own format and go through this same reader, so a benchmark of ours is a benchmark
+//! of theirs as far as everything downstream of here is concerned.
+//!
+//! The first is DuckDB's own benchmark suite, which is already in the vendored clone. It is
+//! ClickBench, the
 //! join order benchmark over IMDB, TPC-H, TPC-DS, h2oai, LDBC, the JSON benchmarks, the taxi data
 //! and several hundred micro benchmarks, and every one of those is a query somebody wrote to
 //! measure something rather than a query somebody wrote to test something. That distinction is the
@@ -42,6 +50,9 @@ use crate::functions::Overload;
 
 /// Where the benchmark suite sits inside the vendored clone.
 pub const BENCHMARKS: &str = "benchmark";
+
+/// Where our own benchmarks sit, relative to this crate.
+pub const OURS: &str = "corpus/bench";
 
 /// One query somebody wrote on purpose.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,12 +96,46 @@ pub fn read(clone: &Path) -> Result<Vec<Query>, HarnessError> {
             root.display()
         )));
     }
+    under(&root, clone)
+}
+
+/// Read the benchmarks we wrote ourselves.
+///
+/// The vendored suite says what DuckDB thought was worth measuring, and every query in it predates
+/// rudb, which is the reason to trust it and also the reason it has a hole in it. Nothing in there
+/// measures a correlated subquery or a lateral join, because those were never the thing anybody was
+/// benchmarking, so a release that made them work would move no number in a cost run. These are the
+/// benchmarks for what we built, written in DuckDB's own format and read by the same reader, so a
+/// query here is a query there and the ratio underneath it means what it means everywhere else.
+///
+/// The directory is part of this crate rather than the clone, so it needs no `--refresh` and it is
+/// there on a machine that has never fetched anything.
+///
+/// # Errors
+///
+/// When the directory is not there, which means the checkout is broken rather than stale.
+pub fn ours(dir: &Path) -> Result<Vec<Query>, HarnessError> {
+    if !dir.is_dir() {
+        return Err(HarnessError::new(format!(
+            "no benchmarks of our own at {}, which is part of the crate and should not be missing",
+            dir.display()
+        )));
+    }
+    // Named against the parent, so a file prints as `corpus/bench/name.benchmark` rather than as a
+    // bare stem, which is what tells somebody reading a report which half of the corpus a row is
+    // from.
+    let base = dir.parent().and_then(Path::parent).unwrap_or(dir);
+    under(dir, base)
+}
+
+/// Every benchmark under a directory, named relative to a base.
+fn under(root: &Path, base: &Path) -> Result<Vec<Query>, HarnessError> {
     let mut files = Vec::new();
-    walk(&root, &mut files)?;
+    walk(root, &mut files)?;
     files.sort();
     let mut found = Vec::new();
     for file in files {
-        if let Some(query) = one(clone, &file) {
+        if let Some(query) = one(base, &file) {
             found.push(query);
         }
     }
@@ -451,5 +496,28 @@ mod tests {
     fn the_matching_is_case_insensitive_because_the_corpus_shouts_and_the_catalog_does_not() {
         let counted = histogram(&[query("a", "SELECT COUNT(x)")], &[overload("count")]);
         assert_eq!(counted.used[0].0, "count", "{:?}", counted.used);
+    }
+
+    /// The benchmarks we wrote ourselves, read the way `cost` reads them.
+    ///
+    /// This is the only reader test that touches the disk, and it can be, because the directory is
+    /// part of the crate rather than something fetched. A file with a typo in a directive parses
+    /// into a query with no `run` and is skipped rather than reported, so without a test that
+    /// counts them a benchmark can quietly stop being in the corpus.
+    #[test]
+    fn our_own_benchmarks_are_read_and_every_one_of_them_has_a_group_and_a_load() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(super::OURS);
+        let found = super::ours(&dir).expect("our own benchmarks");
+        assert_eq!(found.len(), 6, "{:?}", found.iter().map(|q| &q.name).collect::<Vec<_>>());
+        for query in &found {
+            assert!(query.group.starts_with("rudb-"), "{} is in {}", query.name, query.group);
+            assert!(!query.load.is_empty(), "{} loads nothing", query.name);
+            assert!(query.file.starts_with("corpus/bench/"), "{}", query.file);
+        }
+        // Two of them at least, or `cost` leaves the group out of its per suite table.
+        for group in ["rudb-correlated", "rudb-lateral"] {
+            let how_many = found.iter().filter(|q| q.group == group).count();
+            assert!(how_many >= 2, "{group} has {how_many}");
+        }
     }
 }

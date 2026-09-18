@@ -1,0 +1,13 @@
+# name: corpus/bench/lateral-scalar-aggregate.benchmark
+# description: A lateral entry aggregating the rows that match the entry written to its left
+# group: [rudb-lateral]
+
+name Lateral entry with an aggregate
+group rudb-lateral
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(*) FROM parts, LATERAL (SELECT sum(amount) AS s FROM facts WHERE facts.bucket = parts.bucket) v WHERE v.s > 1000

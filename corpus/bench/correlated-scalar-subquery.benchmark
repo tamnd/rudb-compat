@@ -1,0 +1,13 @@
+# name: corpus/bench/correlated-scalar-subquery.benchmark
+# description: A scalar correlated subquery in a filter, which is the shape general unnesting exists for
+# group: [rudb-correlated]
+
+name Correlated scalar subquery in a filter
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT sum(amount) FROM facts WHERE facts.bucket = parts.bucket) > 1000

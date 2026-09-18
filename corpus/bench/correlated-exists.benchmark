@@ -1,0 +1,13 @@
+# name: corpus/bench/correlated-exists.benchmark
+# description: A correlated EXISTS, which becomes a semi join once the correlation is gone
+# group: [rudb-correlated]
+
+name Correlated EXISTS
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE EXISTS (SELECT 1 FROM facts WHERE facts.bucket = parts.bucket AND facts.amount % 7 = 0)
