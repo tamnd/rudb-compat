@@ -1,0 +1,12 @@
+# name: corpus/bench/lateral-table-function.benchmark
+# description: A table function whose argument reads the left row, which is the one entry the domain cannot be pushed under
+# group: [rudb-lateral]
+
+name Lateral table function reading the left row
+group rudb-lateral
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 200 AS bucket FROM range(200000) t(i);
+
+run
+SELECT sum(r.i) FROM parts, range(parts.bucket) r(i)
