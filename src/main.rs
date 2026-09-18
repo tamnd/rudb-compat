@@ -2013,9 +2013,7 @@ fn help() {
     println!(
         "A whole upstream run also says how the files it killed differ from the ones named in"
     );
-    println!(
-        "corpus/cutoff.txt, in both directions. It prints and does not fail: two of the three"
-    );
+    println!("corpus/cutoff.txt, in both directions. It prints and does not fail: both of the");
     println!("files on that list go both ways on their own, run to run, alone on an idle machine,");
     println!("so one run disagreeing with the list is not yet a reason to edit it.");
     println!();

@@ -12,16 +12,25 @@
 //!
 //! # What this actually buys, which today is nothing
 //!
-//! Measured at the pin on the gaming machine, the whole corpus is 364 processor seconds of work
-//! over 4106 files, and one file, `optimizer/table_filters.test`, is 125 of them. Seven files are
-//! 310 of the 364. A run cannot finish before its slowest file finishes, so the floor is about two
-//! minutes on any machine, and the run takes 121 seconds on 32 cores against 143 on 6. Splitting
-//! the files across four machines does not move a floor that one file sets.
+//! Measured on the gaming machine, the whole corpus is 177 processor seconds of work over 4140
+//! files and the run takes 42 seconds on 32 cores. It was 364 seconds over 4106 files and 121
+//! seconds on 32 cores when this was written, and the difference is one file. The 125 seconds that
+//! `optimizer/table_filters.test` was of the 364 are five now. tamnd/rudb#866 taught the hash join
+//! to see through the cast the binder puts around a join key and tamnd/rudb#883 gave it a residual
+//! predicate, which between them are the two things every join in that file needed.
 //!
-//! So this is here because it is fifty lines and because the tail is a join operator away from
-//! going, not because it speeds anything up now. Section 9.8 of `spec/sql/duckdb/09-the-harness.md`
-//! has the numbers and the rest of the argument, including why two machines do not currently
-//! produce the same page.
+//! The tail is still a tail. Timed 32 at a time, the seven slowest files are 157 of the 177, and
+//! the two at the top of that are the two left in `corpus/cutoff.txt`:
+//! `catalog/table/create_table_as_abort.test` and `overflow/expression_tree_depth.test`, which are
+//! 75 and 46 of the 157. Neither of them is slow work the way `table_filters` was. One builds the
+//! whole result of a statement it is about to roll back and goes over the memory cap, the other
+//! builds a three thousand term expression tree that DuckDB refuses to parse at all. A run cannot
+//! finish before its slowest file does, so the floor is still one file rather than the machine, and
+//! splitting the files across four machines still does not move it.
+//!
+//! So this is here because it is fifty lines, not because it speeds anything up now. Section 9.8 of
+//! `spec/sql/duckdb/09-the-harness.md` has the rest of the argument, including why two machines do
+//! not currently produce the same page.
 
 use std::fmt;
 
