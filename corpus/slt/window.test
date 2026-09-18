@@ -231,12 +231,12 @@ SELECT sum(i) OVER () FROM t WHERE i > 100;
 query IR
 SELECT i, avg(i) OVER (PARTITION BY j ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY j, i;
 ----
-1	1.667
-2	1.667
-2	1.667
-3	3.500
-4	3.500
-NULL	3.500
+1	1.6666666666666667
+2	1.6666666666666667
+2	1.6666666666666667
+3	3.5
+4	3.5
+NULL	3.5
 
 # A descending order inside the OVER and the same one outside it, so the frame walks the partition
 # backwards and the answer is still read top to bottom.
@@ -293,12 +293,12 @@ NULL	5
 query IRR
 SELECT i, percent_rank() OVER (ORDER BY i), cume_dist() OVER (ORDER BY i) FROM t ORDER BY i;
 ----
-1	0.000	0.167
-2	0.200	0.500
-2	0.200	0.500
-3	0.600	0.667
-4	0.800	0.833
-NULL	1.000	1.000
+1	0.0	0.16666666666666666
+2	0.2	0.5
+2	0.2	0.5
+3	0.6	0.6666666666666666
+4	0.8	0.8333333333333334
+NULL	1.0	1.0
 
 # With no ORDER BY inside the OVER the whole partition is one peer group, so every row is first and
 # last at the same time and all four answers are constant.
@@ -319,11 +319,11 @@ NULL	1	1	0.000	1.000
 query IIR
 SELECT i, rank() OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), cume_dist() OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM t ORDER BY i;
 ----
-1	1	0.167
-2	2	0.500
-2	2	0.500
-3	4	0.667
-4	5	0.833
+1	1	0.16666666666666666
+2	2	0.5
+2	2	0.5
+3	4	0.6666666666666666
+4	5	0.8333333333333334
 NULL	6	1.000
 
 # A partition restarts the count, and the null sorts last inside its own partition rather than
