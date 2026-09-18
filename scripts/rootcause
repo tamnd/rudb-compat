@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+# Rank the corpus by what the first failure in each file was.
+#
+#   rudb-compat slt --out run.tsv
+#   scripts/rootcause run.tsv
+#   scripts/rootcause before.tsv after.tsv
+#
+# Counting failures one at a time says almost nothing, because a corpus file is a script and the
+# first thing that breaks in it takes everything after it down with it. So take the first failure in
+# each file, call that the root cause, and charge every later failure in the same file to it.
+#
+# A record that says which grammar rule refused it is bucketed by that rule name, because the rule
+# name is what the engine actually said rather than a guess about what the file meant. The rest are
+# bucketed by the error text. The buckets are a judgement and the script is here so that the
+# judgement is the same one twice, which is the only way two runs are comparable. Give it two files
+# and it prints two tables from the one classifier, which is what a release does.
+
+import re
+import sys
+from collections import defaultdict
+
+BY_RULE = {
+    "AttachStatement": "ATTACH, DETACH and USE, and the qualified names that follow from them",
+    "DetachStatement": "ATTACH, DETACH and USE, and the qualified names that follow from them",
+    "UseStatement": "ATTACH, DETACH and USE, and the qualified names that follow from them",
+    "PrimaryKeyConstraint": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "UniqueConstraint": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "CheckConstraint": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "ForeignKeyConstraint": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "GeneratedColumn": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "DefaultValue": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "CreateTableConstraint": "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "CopyStatement": "COPY and the CSV and Parquet readers",
+    "StructExpression": "a LIST, STRUCT or MAP written out in a query",
+    "MapExpression": "a LIST, STRUCT or MAP written out in a query",
+    "ListExpression": "a LIST, STRUCT or MAP written out in a query",
+    "ArrayExpression": "a LIST, STRUCT or MAP written out in a query",
+    "RowExpression": "a LIST, STRUCT or MAP written out in a query",
+    "TransactionStatement": "BEGIN, COMMIT and ROLLBACK",
+    "CreateSchemaStmt": "CREATE SCHEMA and qualified schema names",
+    "CreateSequenceStmt": "sequences and nextval",
+    "CreateTriggerStmt": "CREATE TRIGGER",
+    "CreateTypeStmt": "CREATE TYPE, an enum, or a type name the parser does not know",
+    "CreateMacroStmt": "CREATE MACRO",
+    "PrepareStatement": "PREPARE, EXECUTE and DEALLOCATE",
+    "ExecuteStatement": "PREPARE, EXECUTE and DEALLOCATE",
+    "DeallocateStatement": "PREPARE, EXECUTE and DEALLOCATE",
+    "ExportClause": "EXPORT_STATE on an aggregate",
+    "AlterStatement": "ALTER",
+    "CreateIndexStmt": "CREATE INDEX",
+    "Materialized": "RECURSIVE and MATERIALIZED on a WITH",
+    "Recursive": "RECURSIVE and MATERIALIZED on a WITH",
+    "TemporaryTable": "CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW",
+    "TemporaryView": "CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW",
+}
+
+BY_TEXT = [
+    (
+        "ATTACH, DETACH and USE, and the qualified names that follow from them",
+        r"[Dd]atabase with name .* does not exist|Schema with name db\d",
+    ),
+    ("a setting or a pragma the engine does not have a name for", r"unrecognized configuration parameter"),
+    (
+        "a LIST, STRUCT or MAP written out in a query",
+        r"a list of anything but constants|a cast (from|to) .*\b(LIST|STRUCT|MAP|ARRAY)\b|\b(LIST|STRUCT|MAP)\[",
+    ),
+    (
+        "a scalar or table function name the engine does not have",
+        r"(Scalar|Table|Aggregate|Macro|Pragma) Function with name .* does not exist",
+    ),
+    (
+        "COPY and the CSV and Parquet readers",
+        r"No files found that match the pattern|named parameter .* for function read_(csv|parquet)",
+    ),
+    (
+        "CREATE TYPE, an enum, or a type name the parser does not know",
+        r"Unrecognized type name|Type with name .* does not exist",
+    ),
+    ("CREATE SCHEMA and qualified schema names", r"Schema with name "),
+    (
+        "CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW",
+        r"Not implemented Error: (CREATE )?TEMP(ORARY)? (TABLE|VIEW)",
+    ),
+    ("sequences and nextval", r"nextval|currval|Sequence with name"),
+    ("PREPARE, EXECUTE and DEALLOCATE", r"Prepared statement"),
+    ("CREATE INDEX", r"Index with name"),
+    ("a dependent join that reached execution", r"dependent join|correlated"),
+    ("a script of more than one statement", r"a script of more than one statement"),
+]
+
+ROWS = [
+    "ATTACH, DETACH and USE, and the qualified names that follow from them",
+    "a scalar or table function name the engine does not have",
+    "PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column",
+    "COPY and the CSV and Parquet readers",
+    "a LIST, STRUCT or MAP written out in a query",
+    "a setting or a pragma the engine does not have a name for",
+    "BEGIN, COMMIT and ROLLBACK",
+    "CREATE TYPE, an enum, or a type name the parser does not know",
+    "CREATE SCHEMA and qualified schema names",
+    "sequences and nextval",
+    "CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW",
+    "CREATE TRIGGER",
+    "CREATE MACRO",
+    "PREPARE, EXECUTE and DEALLOCATE",
+    "RECURSIVE and MATERIALIZED on a WITH",
+    "EXPORT_STATE on an aggregate",
+    "ALTER",
+    "CREATE INDEX",
+    "a script of more than one statement",
+    "a dependent join that reached execution",
+    "everything else",
+]
+
+COMPILED = [(name, re.compile(pattern)) for name, pattern in BY_TEXT]
+SETTING = re.compile(r"^\s*(set|pragma|reset)\b", re.IGNORECASE)
+RULE = re.compile(r"the grammar rule is (\w+)")
+
+
+def bucket_of(sql, message):
+    rule = RULE.search(message)
+    if rule and rule.group(1) in BY_RULE:
+        return BY_RULE[rule.group(1)], None
+    for candidate, pattern in COMPILED:
+        if pattern.search(message):
+            return candidate, None
+    if SETTING.match(sql):
+        return "a setting or a pragma the engine does not have a name for", None
+    return "everything else", rule.group(1) if rule else message.split("\\n")[-1][:66]
+
+
+def table(path):
+    first = {}
+    charged = defaultdict(int)
+    with open(path, "r", errors="replace") as handle:
+        for line in handle:
+            parts = line.rstrip("\n").split("\t")
+            if parts[0] != "failure" or len(parts) < 6:
+                continue
+            name, at = parts[1], int(parts[2])
+            charged[name] += 1
+            if name not in first or at < first[name][0]:
+                first[name] = (at, parts[3], parts[5])
+
+    records = defaultdict(int)
+    files = defaultdict(int)
+    rest = defaultdict(int)
+    for name, (_, sql, message) in first.items():
+        where, unnamed = bucket_of(sql, message)
+        records[where] += charged[name]
+        files[where] += 1
+        if unnamed:
+            rest[unnamed] += charged[name]
+
+    return len(first), sum(charged.values()), records, files, rest
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: scripts/rootcause <run.tsv> [<run.tsv> ...]", file=sys.stderr)
+        return 1
+    for path in sys.argv[1:]:
+        seen, total, records, files, rest = table(path)
+        print(f"{path}: {total} failures over {seen} files")
+        print("records  files  what the first failure in the file was")
+        for where in ROWS:
+            print(f"{records[where]:7d} {files[where]:6d}  {where}")
+        print("the largest single causes inside everything else")
+        for cause, count in sorted(rest.items(), key=lambda pair: -pair[1])[:12]:
+            print(f"{count:7d}         {cause}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
