@@ -14,7 +14,7 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4106 files, 22317 passed, 50277 failed, which is 30.7 percent of what was attempted
+4106 files, 22406 passed, 50188 failed, which is 30.9 percent of what was attempted
 
 40843 records not attempted, by whose gap it is
       21358  excused   the file turned the record off itself
@@ -24,6 +24,31 @@ $ rudb-compat slt
 ```
 
 That is DuckDB's own `sqllogictest` corpus at `v2.0-cyanoptera`, every `.test` file under `test/sql`, run against rudb on every commit and published on the run summary. The M2 exit criterion is above 60 percent, so the distance between those two numbers is the work list for the milestone.
+
+Counting the 50188 failures one at a time says almost nothing, because a corpus file is a script and the first thing that breaks in it takes everything after it down with it. 24012 of them are a name the engine could not resolve and most of those names are tables the file created two lines earlier in a `CREATE TABLE` that was refused. So the useful count is per file: take the first failure in each of the 3287 files that have one, call that the root cause, and charge every later failure in the same file to it. Ranked that way, and grouped by what the root cause actually is, the corpus looks like this.
+
+```
+records  files  what the first failure in the file was
+   7123    190  ATTACH, DETACH and USE, and the qualified names that follow from them
+   7079    584  a setting or a pragma the engine does not have a name for
+   4999    265  a LIST, STRUCT or MAP written out in a query
+   4597    162  PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column
+   3776    265  a scalar or table function name the engine does not have
+   3224    356  COPY and the CSV and Parquet readers
+   1406     79  CREATE TYPE, an enum, or a type name the parser does not know
+   1373     53  CREATE SCHEMA and qualified schema names
+   1250    122  BEGIN, COMMIT and ROLLBACK
+    958     36  sequences and nextval
+    790     16  CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW
+    603     40  RECURSIVE and MATERIALIZED on a WITH
+    559     58  PREPARE, EXECUTE and DEALLOCATE
+    331     16  EXPORT_STATE on an aggregate
+    268     58  CREATE INDEX
+    122     17  a dependent join that reached execution
+  11593    948  everything else, no single cause above 412 records
+```
+
+Two of those are cheaper than their position suggests. The settings row is 129 distinct names and the pinned binary has 114 of them in `duckdb_settings()`, which rudb already ships as a table function, so most of that row is a registry that is short rather than a feature that is hard. The attach row is 190 files and 4200 of its records are one file, `parallelism/interquery/concurrent_checkpoint_insert.test`, which attaches a hundred databases in a loop, so the row is worth less than the number says and the schema resolution underneath it is worth more.
 
 The skips are printed underneath rather than folded into the percentage, and they are split by whose gap they are rather than totalled, because the four rows belong to four different people. Excused is nobody's problem. Engine is the rudb schedule and it is the row that goes down when rudb gets better. Harness is work in this repository and it is the row to watch, because it is the only one that can be removed without the engine improving at all, which makes it the easiest way to a pass rate that means nothing. Machine is the box the run happened on. A file skipped whole counts its records here too, which it did not until recently: several hundred files were in neither the skip count nor the denominator and no line of the report said so.
 
