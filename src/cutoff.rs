@@ -13,14 +13,20 @@
 //! difference to be noticed.
 //!
 //! It reports and does not fail the build, and that is a measurement rather than a preference. The
-//! set is not reproducible. Running the three files that have been seen here one at a time, alone,
-//! twice each on an idle machine: `optimizer/table_filters.test` was cut off at the two minute
-//! backstop every time, `overflow/expression_tree_depth.test` finished once and ran past two
+//! set is not reproducible. Running the files that have been seen here one at a time, alone, twice
+//! each on an idle machine: `overflow/expression_tree_depth.test` finished once and ran past two
 //! minutes once, and `catalog/table/create_table_as_abort.test` finished once and reached 2982 MB
 //! against a 2048 MB cap once. Same file, same binary, same machine, nothing else running. An exact
 //! comparison over a set that moves on its own would be red about half the time for no change at
 //! all, which is the check-nobody-reads failure again and worse, because this one would be red
 //! about something real.
+//!
+//! `optimizer/table_filters.test` was on this list and is the one name that has come off it. It was
+//! cut off at the two minute backstop every time it was run, alone or in the corpus, because its
+//! joins fell to a nested loop over a million driving rows. tamnd/rudb#866 taught the lookup to
+//! recognise an equality with a cast around an operand and tamnd/rudb#883 gave it a residual
+//! predicate, and the file now finishes in five seconds alone. That is the direction the printing
+//! below was written for, and it is what the name coming off the list looks like.
 //!
 //! The nondeterminism is the more interesting half of what this found and it is tamnd/rudb#736
 //! rather than something worked around here. A plausible shape: the engine is handed the statement

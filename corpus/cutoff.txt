@@ -5,22 +5,13 @@
 # reach one of those is named here with what it actually is. A whole upstream run compares what it
 # killed against this list and prints the difference both ways round.
 #
-# It prints and does not fail the build, because the set is not reproducible: two of the three names
-# below go both ways on their own, run to run, alone on an idle machine. See `src/cutoff.rs` for the
+# It prints and does not fail the build, because the set is not reproducible: both of the names below
+# go both ways on their own, run to run, alone on an idle machine. See `src/cutoff.rs` for the
 # measurement, and tamnd/rudb#736 for the nondeterminism, which is the more interesting half of what
 # this found.
 #
 # So one run disagreeing with this file is not a reason to edit it. A name that has settled down in
 # either direction is.
-
-# Cut off at the two minute backstop every time it has been run, alone or in the corpus. 88 records
-# of filter-statistics pruning reproducers, most of them joining a build side against
-# `range(0, 1000000)` with a predicate that wants pruning before the join rather than after it. The
-# file turns the join order and the build side heuristics off itself, so what is left is exactly the
-# work the statistics are supposed to remove, and rudb does not remove it yet. This is the shape
-# tamnd/rudb#102 describes: a scan that reads a million rows because nothing moved the predicate
-# below the join.
-optimizer/table_filters.test
 
 # Goes both ways. Finished once and ran past two minutes once, alone, on the same machine and the
 # same binary. One `SELECT x + x + x + ...` about three thousand terms long, expecting
