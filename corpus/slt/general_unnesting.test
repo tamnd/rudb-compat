@@ -225,3 +225,120 @@ SELECT o.k, v.w FROM unnest_outer AS o LEFT JOIN LATERAL (SELECT w FROM unnest_i
 2	300
 3	NULL
 NULL	NULL
+
+statement ok
+CREATE TABLE unnest_other(k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO unnest_other VALUES (1, 200), (1, 500), (2, 300), (3, 700);
+
+# A UNION ALL of two correlated sides. Nothing is removed, so the outer key with two matches on one
+# side and two on the other answers 4.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION ALL SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	4
+2	2
+3	1
+NULL	0
+
+# The same with a UNION, which is the record that says the deduplication happens inside one outer row.
+# The outer key 1 has 100 and 200 on one side and 200 and 500 on the other, so 200 is dropped once and
+# the answer is 3 rather than 4.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	3
+2	1
+3	1
+NULL	0
+
+# A right side that asks nothing about the outer row. The outer keys with no match still answer 1,
+# because the constant is there for every outer row.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION SELECT 100) AS x) AS c FROM unnest_outer;
+----
+1	2
+2	2
+3	1
+NULL	1
+
+# An EXCEPT. The outer key 1 keeps 100 and loses 200 to the other side, and the outer key 2 has its
+# only match subtracted, so it answers 0 rather than 1.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k EXCEPT SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	1
+2	0
+3	0
+NULL	0
+
+# An INTERSECT, which keeps the rows the EXCEPT above drops.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k INTERSECT SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# An EXCEPT ALL rather than an EXCEPT, which subtracts by count rather than by membership.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k EXCEPT ALL SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	1
+2	0
+3	0
+NULL	0
+
+# Reading the rows rather than counting them, so a wrong answer shows up as a wrong total and not
+# only as a wrong number of rows.
+query II rowsort
+SELECT k, (SELECT sum(w) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION SELECT 100) AS x) AS c FROM unnest_outer;
+----
+1	300
+2	400
+3	100
+NULL	100
+
+# A right side that reads the whole other table and asks nothing about the outer row. The four rows it
+# always contributes are on top of whatever the correlated side found.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION ALL SELECT w FROM unnest_other) AS x) AS c FROM unnest_outer;
+----
+1	6
+2	5
+3	4
+NULL	4
+
+# Two columns rather than one, which is the record that says the sides are lined up by position and
+# the domain column did not land in the middle of them.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT k, w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION ALL SELECT k, w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	4
+2	2
+3	1
+NULL	0
+
+# A UNION of two VARCHAR sides, one of which answers a single NULL for the outer key 3. A UNION treats
+# two NULLs as the same row, so that outer key answers 1 and not 0.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT s FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k UNION SELECT t FROM unnest_outer AS p WHERE p.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	3
+2	2
+3	1
+NULL	0
+
+# The same shape as a LATERAL entry, where the rows come out rather than being counted.
+query II rowsort
+SELECT o.k, v.w FROM unnest_outer AS o, LATERAL (SELECT w FROM unnest_inner WHERE unnest_inner.k = o.k UNION SELECT 999) AS v;
+----
+1	100
+1	200
+1	999
+2	300
+2	999
+3	999
+NULL	999
