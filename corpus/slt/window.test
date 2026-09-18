@@ -522,3 +522,56 @@ statement error
 SELECT row_number(DISTINCT) OVER (ORDER BY i) FROM u;
 ----
 DISTINCT is not implemented for the window function
+
+# A FILTER decides which rows of the frame the call reads. The frame is worked out first and the
+# predicate is applied to what is inside it, so a filter never moves the frame and never changes
+# which row is the current one. The third query is the one that says so: the running count climbs
+# only where the predicate holds, and the rows where it does not hold are still in the frame.
+
+query II
+SELECT i, sum(i) FILTER (WHERE i > 1) OVER () FROM t ORDER BY i, j;
+----
+1	11
+2	11
+2	11
+3	11
+4	11
+NULL	11
+
+query II
+SELECT i, sum(i) FILTER (WHERE i > 2) OVER (PARTITION BY j ORDER BY i) FROM t ORDER BY i, j;
+----
+1	NULL
+2	NULL
+2	NULL
+3	3
+4	7
+NULL	7
+
+query II
+SELECT i, count(*) FILTER (WHERE i > 2) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t ORDER BY i, j;
+----
+1	0
+2	0
+2	0
+3	1
+4	2
+NULL	2
+
+query II
+SELECT i, sum(i) FILTER (WHERE j = 'a') OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY i, j;
+----
+1	1
+2	3
+2	4
+3	2
+4	NULL
+NULL	NULL
+
+# A ranking window reads no values, so a predicate over the values has nothing to keep or drop, and
+# it is refused with the sentence DISTINCT on the same call is refused with.
+
+statement error
+SELECT row_number() FILTER (WHERE i > 1) OVER (ORDER BY i) FROM t;
+----
+FILTER is not implemented for the window function

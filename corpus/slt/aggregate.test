@@ -76,5 +76,57 @@ SELECT sum(amount) FROM sales WHERE amount > 1000;
 ----
 NULL
 
+# A FILTER picks which rows one aggregate reads. That is not the same as picking which rows the
+# query has, which is what the last query here says: the two counts sit side by side and disagree.
+# The word WHERE inside the brackets is optional and means the same either way.
+
+query I
+SELECT count(*) FILTER (WHERE amount > 10) FROM sales;
+----
+3
+
+query I
+SELECT sum(amount) FILTER (WHERE region = 'north') FROM sales;
+----
+30
+
+query I
+SELECT sum(amount) FILTER (amount > 1000) FROM sales;
+----
+NULL
+
+query I
+SELECT sum(DISTINCT amount) FILTER (WHERE amount > 10) FROM sales;
+----
+135
+
+query II
+SELECT count(*) FILTER (WHERE amount > 10), count(*) FROM sales;
+----
+3	5
+
+# A group where the predicate holds for nothing still has its row, with the answer each aggregate
+# gives over no rows at all, which is zero for a count and null for a sum.
+
+query TII
+SELECT region, count(*) FILTER (WHERE amount > 10), sum(amount) FILTER (WHERE amount > 10) FROM sales GROUP BY region ORDER BY region;
+----
+east	1	100
+north	1	20
+south	1	15
+
+# A scalar function is not a call that reads several rows, so none of the three modifiers mean
+# anything on one, and the one sentence names all three whichever of them was written.
+
+statement error
+SELECT abs(amount) FILTER (WHERE amount > 1) FROM sales;
+----
+Function "abs" is a Scalar Function. "DISTINCT", "FILTER", and "ORDER BY" are only applicable to window and aggregate functions.
+
+statement error
+SELECT sum(amount) FILTER (WHERE sum(amount) > 1) FROM sales;
+----
+aggregate functions are not allowed in FILTER
+
 statement ok
 DROP TABLE sales;
