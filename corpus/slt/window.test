@@ -1,0 +1,261 @@
+# name: corpus/slt/window.test
+# description: OVER, PARTITION BY, the frame units, the peer groups and the four exclusions
+# group: [smoke]
+
+# Every expected value below was read off the pinned DuckDB binary and not out of rudb. The table is
+# six rows on purpose. It has a tie in it, which is what separates RANGE from ROWS, a null in it,
+# which the frame has to carry without treating it as a value, and two partitions, which one pass
+# over the sorted rows has to keep apart.
+
+statement ok
+CREATE TABLE t (i INTEGER, j VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1,'a'),(2,'a'),(2,'a'),(3,'b'),(4,'b'),(NULL,'b');
+
+statement ok
+CREATE TABLE u (i INTEGER, j INTEGER);
+
+statement ok
+INSERT INTO u VALUES (1,1),(2,1),(3,2),(4,2),(5,2);
+
+# No ORDER BY inside the OVER means every row of the partition is a peer of every other, so the
+# default frame covers all of them and this is a total rather than a running total.
+
+query II
+SELECT i, sum(i) OVER () FROM t ORDER BY i, j;
+----
+1	12
+2	12
+2	12
+3	12
+4	12
+NULL	12
+
+query ITI
+SELECT i, j, sum(i) OVER (PARTITION BY j) FROM t ORDER BY j, i;
+----
+1	a	5
+2	a	5
+2	a	5
+3	b	7
+4	b	7
+NULL	b	7
+
+# The two rows that tie on 2 both answer 5 rather than 3 and 5, because the default frame is RANGE
+# and under RANGE the current row means the whole peer group. The ROWS form right below is the same
+# query with the one word changed and it answers differently on exactly those two rows.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i) FROM t ORDER BY i;
+----
+1	1
+2	5
+2	5
+3	8
+4	12
+NULL	12
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY i;
+----
+1	1
+2	3
+2	4
+3	5
+4	7
+NULL	4
+
+# A null key is a partition and a peer group like any other value. It sorts last under ASC so the
+# running count reaches it after everything else in its partition.
+
+query ITI
+SELECT i, j, count(*) OVER (PARTITION BY j ORDER BY i) FROM t ORDER BY j, i;
+----
+1	a	1
+2	a	3
+2	a	3
+3	b	1
+4	b	2
+NULL	b	3
+
+query II
+SELECT i, count(*) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY i;
+----
+1	6
+2	6
+2	6
+3	6
+4	6
+NULL	6
+
+# A GROUPS distance counts peer groups and not rows. One group back from the pair of twos is the
+# single one, so both twos see 1 and 2 and 2, and one group back from the three is that pair.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY i;
+----
+1	1
+2	5
+2	5
+3	7
+4	7
+NULL	4
+
+# The three exclusions differ only on the tied rows. Current row drops the row itself, group drops
+# its whole peer group, and ties drops the group but keeps the row, so on a row with no peers the
+# first and the third agree and the second does not.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM t ORDER BY i;
+----
+1	NULL
+2	3
+2	3
+3	5
+4	8
+NULL	12
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM t ORDER BY i;
+----
+1	NULL
+2	1
+2	1
+3	5
+4	8
+NULL	12
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM t ORDER BY i;
+----
+1	1
+2	3
+2	3
+3	8
+4	12
+NULL	12
+
+# A frame that covers nothing is null for a sum and zero for a count, which is what those two
+# functions do with no rows rather than anything to do with frames.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING) FROM t ORDER BY i;
+----
+1	NULL
+2	NULL
+2	1
+3	3
+4	4
+NULL	5
+
+query II
+SELECT i, count(*) OVER (ORDER BY i ROWS BETWEEN 3 PRECEDING AND 2 PRECEDING) FROM t ORDER BY i;
+----
+1	0
+2	0
+2	1
+3	2
+4	2
+NULL	2
+
+query II
+SELECT i, min(i) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t ORDER BY i;
+----
+1	1
+2	2
+2	2
+3	3
+4	4
+NULL	NULL
+
+query ITI
+SELECT i, j, count(DISTINCT i) OVER (PARTITION BY j) FROM t ORDER BY j, i;
+----
+1	a	2
+2	a	2
+2	a	2
+3	b	2
+4	b	2
+NULL	b	2
+
+# A distance can be a column, so every row gets a frame of its own size.
+
+query II
+SELECT i, sum(i) OVER (ORDER BY i ROWS BETWEEN j PRECEDING AND CURRENT ROW) FROM u ORDER BY i;
+----
+1	1
+2	3
+3	6
+4	9
+5	12
+
+# Two calls that disagree about the window are two operators stacked, and both answers are right.
+
+query III
+SELECT i, sum(i) OVER (PARTITION BY j ORDER BY i), count(*) OVER (ORDER BY i DESC) FROM u ORDER BY i;
+----
+1	1	5
+2	3	4
+3	3	3
+4	7	2
+5	12	1
+
+# A window over a grouped block reads the groups and not the rows, which is why this totals two
+# counts and not six.
+
+query TI
+SELECT j, sum(count(i)) OVER () FROM t GROUP BY j ORDER BY j;
+----
+a	5
+b	5
+
+# A window in the ORDER BY decides the order without appearing in the answer.
+
+query I
+SELECT i FROM u ORDER BY sum(i) OVER (PARTITION BY j) DESC, i;
+----
+3
+4
+5
+1
+2
+
+# The difference between a window and an ungrouped aggregate, which look alike everywhere else. The
+# aggregate answers one row holding null over no rows and the window answers no rows at all.
+
+query I
+SELECT sum(i) OVER () FROM t WHERE i > 100;
+----
+
+query IR
+SELECT i, avg(i) OVER (PARTITION BY j ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY j, i;
+----
+1	1.667
+2	1.667
+2	1.667
+3	3.500
+4	3.500
+NULL	3.500
+
+# A descending order inside the OVER and the same one outside it, so the frame walks the partition
+# backwards and the answer is still read top to bottom.
+
+query II
+SELECT i, max(i) OVER (ORDER BY i DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY i DESC;
+----
+4	4
+3	4
+2	3
+2	2
+1	2
+NULL	1
+
+# The one frame this does not answer yet. The distance is measured from the current row's order key
+# rather than from its position, so answering it is arithmetic over whatever type that key has, and
+# saying so is better than answering it as though it were a ROWS frame.
+
+statement error
+SELECT sum(i) OVER (ORDER BY i RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;
+----
+a RANGE frame with an offset
