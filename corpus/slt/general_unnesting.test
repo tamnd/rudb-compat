@@ -117,3 +117,111 @@ SELECT k FROM unnest_outer WHERE NOT EXISTS (SELECT 1 FROM unnest_inner WHERE un
 ----
 3
 NULL
+
+# A window inside the subquery, which is numbered per outer row and not across all of them at once.
+# The outer key with two matches answers 2 and the one with a single match answers 1.
+query II rowsort
+SELECT k, (SELECT max(r) FROM (SELECT row_number() OVER (ORDER BY w) AS r FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	NULL
+NULL	NULL
+
+# A window with an empty OVER, whose sum is over one outer row's matches rather than over the lot.
+query II rowsort
+SELECT k, (SELECT max(t) FROM (SELECT sum(w) OVER () AS t FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	300
+2	300
+3	NULL
+NULL	NULL
+
+# A window that already partitions by a column of its own, which still partitions by it.
+query II rowsort
+SELECT k, (SELECT max(r) FROM (SELECT rank() OVER (PARTITION BY s ORDER BY w) AS r FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	NULL
+NULL	NULL
+
+# A window with a frame written out, since the frame bounds are rewritten along with everything else.
+query II rowsort
+SELECT k, (SELECT max(t) FROM (SELECT sum(w) OVER (ORDER BY w ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS t FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	300
+2	300
+3	NULL
+NULL	NULL
+
+# The same window written as a LATERAL entry, which is the same rewrite reached the other way.
+query II rowsort
+SELECT o.k, v.r FROM unnest_outer AS o, LATERAL (SELECT row_number() OVER (ORDER BY w) AS r FROM unnest_inner WHERE unnest_inner.k = o.k) AS v;
+----
+1	1
+1	2
+2	1
+
+# A limit inside the subquery, which is one row per outer row and not one row out of all of them.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k LIMIT 1) AS x) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# A top N, which is the top thing per group and is the reason the rule is worth having.
+query II rowsort
+SELECT k, (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k ORDER BY w DESC LIMIT 1) AS c FROM unnest_outer;
+----
+1	200
+2	300
+3	NULL
+NULL	NULL
+
+# An offset with a count. Key 2 has one match, so skipping one leaves it nothing, which is what says
+# the offset was counted inside that outer row's matches rather than over the whole inner side.
+query II rowsort
+SELECT k, (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k ORDER BY w LIMIT 1 OFFSET 1) AS c FROM unnest_outer;
+----
+1	200
+2	NULL
+3	NULL
+NULL	NULL
+
+# An offset with no count, which keeps everything after it.
+query II rowsort
+SELECT k, (SELECT sum(w) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k ORDER BY w OFFSET 1) AS x) AS c FROM unnest_outer;
+----
+1	200
+2	NULL
+3	NULL
+NULL	NULL
+
+# An offset past the end of every outer row's matches.
+query II rowsort
+SELECT k, (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k ORDER BY w LIMIT 1 OFFSET 5) AS c FROM unnest_outer;
+----
+1	NULL
+2	NULL
+3	NULL
+NULL	NULL
+
+# A LATERAL entry with a limit of two, which is two rows for the left row that has two matches.
+query II rowsort
+SELECT o.k, v.w FROM unnest_outer AS o, LATERAL (SELECT w FROM unnest_inner WHERE unnest_inner.k = o.k ORDER BY w LIMIT 2) AS v;
+----
+1	100
+1	200
+2	300
+
+# The same as a LEFT JOIN LATERAL, where the left rows with no match are padded rather than dropped.
+query II rowsort
+SELECT o.k, v.w FROM unnest_outer AS o LEFT JOIN LATERAL (SELECT w FROM unnest_inner WHERE unnest_inner.k = o.k ORDER BY w LIMIT 1) AS v ON true;
+----
+1	100
+2	300
+3	NULL
+NULL	NULL
