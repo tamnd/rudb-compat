@@ -17,8 +17,17 @@ SELECT (1 + 2) * 3;
 ----
 9
 
-query I
+# Division is the floating point one and 7 / 2 is 3.5 rather than 3. This record used to say 3
+# because the harness rendered the column by its letter and an I truncated the value on the way in.
+# Integer division is // and it has its own record below.
+
+query R
 SELECT 7 / 2;
+----
+3.5
+
+query I
+SELECT 7 // 2;
 ----
 3
 

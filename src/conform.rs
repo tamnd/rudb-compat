@@ -1326,7 +1326,8 @@ fn check(
                     format!("expected {width} columns and got {}", table.width()),
                 )));
             }
-            let values = flatten(table, types, *sort);
+            let kinds: Vec<String> = table.columns.iter().map(|column| column.ty.clone()).collect();
+            let values = flatten(table, *sort);
 
             if !label.is_empty() {
                 if let Some(previous) = labels.get(label) {
@@ -1347,10 +1348,14 @@ fn check(
             Ok(Verdict::Ran(match expected {
                 QueryResult::Lines(raw) => match wanted(raw, width, table.height()) {
                     Ok(wanted) => {
-                        if values == wanted {
+                        if agrees(&wanted, &values, &kinds, width) {
                             Ok(())
                         } else {
-                            fail(sql, Reason::WrongAnswer, difference(&wanted, &values, width))
+                            fail(
+                                sql,
+                                Reason::WrongAnswer,
+                                difference(&wanted, &values, &kinds, width),
+                            )
                         }
                     }
                     Err(why) => fail(sql, Reason::WrongAnswer, why),
@@ -1438,18 +1443,19 @@ fn contains(error: &EngineError, wanted: &str) -> bool {
 
 /// Turn a result set into the flat list of values the format compares.
 ///
-/// Row by row, left to right, each value rendered by the letter its column was declared with, then
-/// sorted if the record asked for it.
+/// Row by row, left to right, each value written the way its own type says to, then sorted if the
+/// record asked for it.
 #[must_use]
-pub fn flatten(table: &Table, types: &str, sort: Sort) -> Vec<String> {
-    let letters: Vec<char> = types.chars().collect();
+pub fn flatten(table: &Table, sort: Sort) -> Vec<String> {
     let mut rows: Vec<Vec<String>> = table
         .rows
         .iter()
         .map(|row| {
             row.iter()
                 .enumerate()
-                .map(|(at, cell)| render(cell, letters.get(at).copied().unwrap_or('T')))
+                .map(|(at, cell)| {
+                    render(cell, table.columns.get(at).map_or("", |column| column.ty.as_str()))
+                })
                 .collect()
         })
         .collect();
@@ -1466,48 +1472,168 @@ pub fn flatten(table: &Table, types: &str, sort: Sort) -> Vec<String> {
     rows.into_iter().flatten().collect()
 }
 
-/// Render one value the way the format's column letter says to.
+/// Render one value the way the reference runner renders it.
 ///
-/// The letters are `T` for text, `I` for an integer and `R` for a real. They are a rendering
-/// instruction and not a type assertion: a column declared `I` that comes back as a string of
-/// digits is fine, and the same column coming back as `2.5` is rendered `2`, which is what
-/// sqllogictest has always done and what the expected values in the corpus were written against.
+/// `SQLLogicTestConvertValue` in `test/sqlite/result_helper.cpp` is four lines long and this is
+/// those four lines. A null is the word NULL, a boolean is 1 or 0, and everything else is the value
+/// cast to `VARCHAR`, with the empty string written out so a line of the file can hold it.
 ///
-/// A value the letter does not fit comes through as itself rather than as a zero. The point of a
-/// failure report is to say what the engine actually returned, and a lie in the rendering is a
-/// failure report that sends somebody looking in the wrong place.
+/// The column letter is deliberately not consulted, and that is the part worth saying out loud,
+/// because reading it as a rendering instruction is what this used to do. Upstream uses the letters
+/// for the column count and for nothing else. A `query I` whose column is a `DOUBLE` is not
+/// truncated to an integer there, and a `query R` is not rounded to three decimals, so doing either
+/// here produced values upstream never produces and then compared them against a file upstream
+/// wrote. What makes that safe to drop is the comparison below, which is where upstream puts the
+/// tolerance: `0.500` and `0.5` agree because both are cast to the column's type, not because one
+/// of them was rounded on the way in.
 #[must_use]
-pub fn render(cell: &Cell, letter: char) -> String {
+pub fn render(cell: &Cell, ty: &str) -> String {
     let text = match cell {
         Cell::Null => return "NULL".to_owned(),
         Cell::Text(text) => text.as_str(),
     };
-    match letter {
-        'I' => {
-            if let Ok(n) = text.parse::<i128>() {
-                return n.to_string();
-            }
-            if let Ok(n) = text.parse::<f64>() {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "the truncation is the rendering rule, not an accident"
-                )]
-                return (n.trunc() as i64).to_string();
-            }
-            match text {
-                "true" => "1".to_owned(),
-                "false" => "0".to_owned(),
-                other => other.to_owned(),
-            }
-        }
-        'R' => match text.parse::<f64>() {
-            Ok(n) => format!("{n:.3}"),
-            Err(_) => text.to_owned(),
+    if boolean(ty) {
+        return match text {
+            "true" | "TRUE" | "True" | "t" | "1" => "1".to_owned(),
+            "false" | "FALSE" | "False" | "f" | "0" => "0".to_owned(),
+            other => other.to_owned(),
+        };
+    }
+    // An empty string and a null are different values and the format has to be able to tell them
+    // apart on a line of their own, so the empty one is written out.
+    if text.is_empty() { "(empty)".to_owned() } else { text.to_owned() }
+}
+
+/// Whether every value agrees with what the file said, column type by column type.
+///
+/// Positional, because both sides are already in whatever order the record asked for. The column a
+/// value belongs to is its position modulo the width, which is how `CompareValues` finds it too,
+/// and after a value sort that is not the column the value came from. Upstream has the same hole
+/// and closing it here would mean two runners disagreeing about a record neither can read.
+fn agrees(wanted: &[String], got: &[String], types: &[String], width: usize) -> bool {
+    if wanted.len() != got.len() {
+        return false;
+    }
+    wanted
+        .iter()
+        .zip(got)
+        .enumerate()
+        .all(|(at, (wanted, got))| matched(wanted, got, kind_at(types, width, at)))
+}
+
+/// The type name of the column a flat value belongs to.
+///
+/// Empty when the width is zero, which cannot happen for a record that got this far but is cheaper
+/// to answer than to argue about.
+fn kind_at(types: &[String], width: usize, at: usize) -> &str {
+    if width == 0 {
+        return "";
+    }
+    types.get(at % width).map_or("", String::as_str)
+}
+
+/// Whether one value agrees with the one the file wrote, given the type of its column.
+///
+/// Three rules, and they are `CompareValues` in `result_helper.cpp` rather than a policy of ours.
+/// The text matching is the whole of it for most types. A boolean column compares true against 1
+/// and false against 0 in either spelling and either case, because the corpus writes all four and
+/// the engine prints one. A numeric column compares the two as numbers, which is what lets a file
+/// that wrote `2.000000` agree with an engine that printed `2.0` without anybody rounding anything.
+///
+/// The numeric rule splits in two where upstream's does not have to. Upstream casts both sides to
+/// the column's own type and compares the results, so a `HUGEINT` is compared as a 128 bit integer
+/// and never goes near a float. Doing the whole thing in `f64` here would make two hugeints that
+/// differ in their last digit read as equal, which is a wrong answer the harness would then call a
+/// pass, so the exact types compare digit by digit and only the float types compare as floats.
+///
+/// A value that does not parse where the type says it should is a disagreement rather than a fall
+/// back to the text, which is upstream's rule and the stricter of the two readings.
+fn matched(wanted: &str, got: &str, ty: &str) -> bool {
+    if wanted == got {
+        return true;
+    }
+    if boolean(ty) {
+        return truth(wanted).is_some() && truth(wanted) == truth(got);
+    }
+    if wanted == "NULL" || got == "NULL" {
+        return false;
+    }
+    match kind(ty) {
+        Some(Numeric::Float) => match (wanted.parse::<f64>(), got.parse::<f64>()) {
+            (Ok(wanted), Ok(got)) => wanted == got || (wanted.is_nan() && got.is_nan()),
+            _ => false,
         },
-        // An empty string and a null are different values and the format has to be able to tell
-        // them apart on a line of their own, so the empty one is written out.
-        _ if text.is_empty() => "(empty)".to_owned(),
-        _ => text.to_owned(),
+        Some(Numeric::Exact) => match (exact(wanted), exact(got)) {
+            (Some(wanted), Some(got)) => wanted == got,
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// A number written with no trailing zeros and no leading ones, so two spellings of it are one
+/// string.
+///
+/// Plain digits only, with an optional sign and an optional fraction. Exponents and the infinities
+/// are refused rather than guessed at, because the types that come through here are the ones that
+/// never print either.
+fn exact(value: &str) -> Option<String> {
+    let (sign, digits) = match value.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", value.strip_prefix('+').unwrap_or(value)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let whole = whole.trim_start_matches('0');
+    let fraction = fraction.trim_end_matches('0');
+    // A zero has one spelling and it is not the empty string, and it does not carry a sign either,
+    // so that -0.0 and 0 read as the same number the way casting them both would.
+    if whole.is_empty() && fraction.is_empty() {
+        return Some("0".to_owned());
+    }
+    Some(format!("{sign}{whole}.{fraction}"))
+}
+
+/// The 1 or the 0 a boolean value is written as, in any of the spellings the corpus uses.
+fn truth(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a type name is the boolean one.
+fn boolean(ty: &str) -> bool {
+    matches!(ty.to_ascii_uppercase().as_str(), "BOOLEAN" | "BOOL" | "LOGICAL")
+}
+
+/// The two ways a number can be compared, and nothing for a type that is not a number at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Numeric {
+    /// Integers and decimals, compared digit by digit with no width limit.
+    Exact,
+    /// Floats, compared as `f64` because that is what they are.
+    Float,
+}
+
+/// How values of a type compare, read off the type name.
+///
+/// The name rather than a parsed type, because that is all an engine hands back here, and the
+/// widths are spelled out rather than matched by prefix so that a `VARCHAR` never falls in.
+fn kind(ty: &str) -> Option<Numeric> {
+    let ty = ty.to_ascii_uppercase();
+    let head = ty.split_once('(').map_or(ty.as_str(), |(head, _)| head).trim();
+    match head {
+        "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" | "UTINYINT" | "USMALLINT"
+        | "UINTEGER" | "UBIGINT" | "UHUGEINT" | "DECIMAL" | "NUMERIC" => Some(Numeric::Exact),
+        "FLOAT" | "REAL" | "DOUBLE" => Some(Numeric::Float),
+        _ => None,
     }
 }
 
@@ -1567,7 +1693,7 @@ pub fn wanted(raw: &[String], columns: usize, rows: usize) -> Result<Vec<String>
 /// Printed as rows rather than as a flat list, because a result that is off by one column reads as
 /// every value being wrong when it is printed flat, and reads as one missing column when it is
 /// printed in rows.
-fn difference(wanted: &[String], got: &[String], width: usize) -> String {
+fn difference(wanted: &[String], got: &[String], types: &[String], width: usize) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "expected {} rows and got {}\n",
@@ -1580,7 +1706,16 @@ fn difference(wanted: &[String], got: &[String], width: usize) -> String {
     for at in 0..wanted_rows.len().max(got_rows.len()).min(20) {
         let left = wanted_rows.get(at).map_or_else(String::new, |r| r.join("  "));
         let right = got_rows.get(at).map_or_else(String::new, |r| r.join("  "));
-        let mark = if left == right { ' ' } else { '*' };
+        // Marked by the same rule that decided the record, so a row the comparison accepted is
+        // never starred here. Two spellings of the same number in a report that calls them a
+        // difference is how somebody ends up debugging a value that was fine.
+        let same = wanted_rows.get(at).zip(got_rows.get(at)).is_some_and(|(left, right)| {
+            left.len() == right.len()
+                && left.iter().zip(right).enumerate().all(|(column, (left, right))| {
+                    matched(left, right, kind_at(types, width, column))
+                })
+        });
+        let mark = if same { ' ' } else { '*' };
         out.push_str(&format!("{mark} {left:<28}  {right}\n"));
     }
     if wanted_rows.len().max(got_rows.len()) > 20 {
@@ -1642,8 +1777,8 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 #[cfg(test)]
 mod tests {
     use super::{
-        Gap, HashMap, NAMES, Reason, Settings, Skips, Summary, VECTOR_SIZE, Verdict, check,
-        flatten, render, run_text,
+        Gap, HashMap, NAMES, Reason, Settings, Skips, Summary, VECTOR_SIZE, Verdict, check, exact,
+        flatten, matched, render, run_text,
     };
     use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
     use crate::slt::{Condition, Directive, Record, Sort, StatementResult, TestFile};
@@ -2187,25 +2322,59 @@ mod tests {
     }
 
     #[test]
-    fn the_column_letter_decides_how_a_value_is_written_before_it_is_compared() {
-        assert_eq!(render(&Cell::Text("2.5".to_owned()), 'I'), "2");
-        assert_eq!(render(&Cell::Text("2.5".to_owned()), 'R'), "2.500");
-        assert_eq!(render(&Cell::Text("2.5".to_owned()), 'T'), "2.5");
-        assert_eq!(render(&Cell::Null, 'T'), "NULL");
-        assert_eq!(render(&Cell::Text(String::new()), 'T'), "(empty)");
+    fn the_column_type_decides_how_a_value_is_written_and_the_letter_never_does() {
+        assert_eq!(render(&Cell::Text("2.5".to_owned()), "DOUBLE"), "2.5");
+        assert_eq!(render(&Cell::Text("2.5".to_owned()), "INTEGER"), "2.5");
+        assert_eq!(render(&Cell::Text("2.5".to_owned()), "VARCHAR"), "2.5");
+        assert_eq!(render(&Cell::Null, "VARCHAR"), "NULL");
+        assert_eq!(render(&Cell::Text(String::new()), "VARCHAR"), "(empty)");
     }
 
     #[test]
-    fn a_value_the_letter_does_not_fit_comes_through_as_itself() {
-        assert_eq!(render(&Cell::Text("banana".to_owned()), 'I'), "banana");
-        assert_eq!(render(&Cell::Text("banana".to_owned()), 'R'), "banana");
+    fn a_boolean_is_written_as_one_or_zero_whichever_spelling_the_engine_used() {
+        assert_eq!(render(&Cell::Text("true".to_owned()), "BOOLEAN"), "1");
+        assert_eq!(render(&Cell::Text("FALSE".to_owned()), "BOOLEAN"), "0");
+        assert_eq!(render(&Cell::Text("1".to_owned()), "BOOLEAN"), "1");
+        assert_eq!(render(&Cell::Null, "BOOLEAN"), "NULL");
+    }
+
+    #[test]
+    fn a_numeric_column_compares_by_value_and_a_string_column_compares_by_text() {
+        assert!(matched("2.000000", "2.0", "DOUBLE"));
+        assert!(matched("0.500", "0.5", "DECIMAL(18,3)"));
+        assert!(!matched("2.5", "2.6", "DOUBLE"));
+        assert!(!matched("2.000000", "2.0", "VARCHAR"));
+        assert!(!matched("2.0", "NULL", "DOUBLE"));
+        assert!(matched("true", "1", "BOOLEAN"));
+        assert!(!matched("true", "0", "BOOLEAN"));
+    }
+
+    #[test]
+    fn two_hugeints_that_differ_in_their_last_digit_are_not_the_same_number() {
+        let left = "170141183460469231731687303715884105726";
+        let right = "170141183460469231731687303715884105727";
+        assert!(!matched(left, right, "HUGEINT"));
+        // The same pair through a double, which is the comparison this is here to rule out.
+        assert!(matched(left, right, "DOUBLE"));
+    }
+
+    #[test]
+    fn a_number_written_two_ways_normalizes_to_one_string() {
+        assert_eq!(exact("2.000000").as_deref(), exact("2").as_deref());
+        assert_eq!(exact("0100").as_deref(), exact("100").as_deref());
+        assert_eq!(exact("-0.0").as_deref(), Some("0"));
+        assert_eq!(exact("+1").as_deref(), exact("1").as_deref());
+        assert_ne!(exact("-1").as_deref(), exact("1").as_deref());
+        assert_eq!(exact("1e3"), None);
+        assert_eq!(exact("inf"), None);
+        assert_eq!(exact(""), None);
     }
 
     #[test]
     fn valuesort_loses_which_row_a_value_came_from_and_rowsort_does_not() {
         let table = table(2, &["2", "9", "1", "8"]);
-        assert_eq!(flatten(&table, "II", Sort::RowSort), ["1", "8", "2", "9"]);
-        assert_eq!(flatten(&table, "II", Sort::ValueSort), ["1", "2", "8", "9"]);
+        assert_eq!(flatten(&table, Sort::RowSort), ["1", "8", "2", "9"]);
+        assert_eq!(flatten(&table, Sort::ValueSort), ["1", "2", "8", "9"]);
     }
 
     fn errored(kind: &str, message: &str) -> Outcome {
