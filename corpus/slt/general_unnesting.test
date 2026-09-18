@@ -1,0 +1,119 @@
+# name: corpus/slt/general_unnesting.test
+# description: correlated subqueries with no recognised shape unnest through a domain
+# group: [smoke]
+
+statement ok
+CREATE TABLE unnest_outer(k INTEGER, t VARCHAR);
+
+statement ok
+INSERT INTO unnest_outer VALUES (1, 'a'), (2, 'b'), (3, NULL), (NULL, 'd');
+
+statement ok
+CREATE TABLE unnest_inner(k INTEGER, w INTEGER, s VARCHAR);
+
+statement ok
+INSERT INTO unnest_inner VALUES (1, 100, 'x'), (1, 200, 'y'), (2, 300, 'x'), (NULL, 400, 'z');
+
+# A DISTINCT between the correlated filter and the aggregate. The distinct is per outer row, so the
+# outer key that matched two inner rows with two different s values answers 2.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT DISTINCT s FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	0
+NULL	0
+
+# A projection between the filter and the aggregate.
+query II rowsort
+SELECT k, (SELECT max(w) FROM (SELECT w * 2 AS w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	400
+2	600
+3	NULL
+NULL	NULL
+
+# A join inside the subquery.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner JOIN unnest_outer AS p ON p.k = unnest_inner.k WHERE unnest_inner.k = unnest_outer.k) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	0
+NULL	0
+
+# A cross product inside the subquery, with only one of the two sides correlated.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner, unnest_outer AS p WHERE unnest_inner.k = unnest_outer.k AND p.k = 1) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	0
+NULL	0
+
+# A left join inside the subquery, whose padding rows still count.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner LEFT JOIN unnest_outer AS p ON p.k = unnest_inner.w WHERE unnest_inner.k = unnest_outer.k) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	0
+NULL	0
+
+# A sort inside the subquery, which changes nothing about what is aggregated over it.
+query II rowsort
+SELECT k, (SELECT sum(w) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k ORDER BY w) AS x) AS c FROM unnest_outer;
+----
+1	300
+2	300
+3	NULL
+NULL	NULL
+
+# A grouped aggregate inside the subquery, where the grouping is per outer row and not over the
+# whole inner side.
+query II rowsort
+SELECT k, (SELECT sum(n) FROM (SELECT s, count(*) AS n FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k GROUP BY s) AS x) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	NULL
+NULL	NULL
+
+# The count bug. Grouping the inner side by the domain drops an outer key whose share of the inner
+# side is empty, and a count over no rows is 0 and not a missing row.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	2
+2	1
+3	0
+NULL	0
+
+# The same shape with a sum, whose answer over no rows is null and needs no repair.
+query II rowsort
+SELECT k, (SELECT sum(w) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x) AS c FROM unnest_outer;
+----
+1	300
+2	300
+3	NULL
+NULL	NULL
+
+# An IN test against a subquery with a DISTINCT in it.
+query I rowsort
+SELECT k FROM unnest_outer WHERE k IN (SELECT DISTINCT k FROM unnest_inner WHERE unnest_inner.w > 150);
+----
+1
+2
+
+# An EXISTS and its negation over the same correlation.
+query I rowsort
+SELECT k FROM unnest_outer WHERE EXISTS (SELECT 1 FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k);
+----
+1
+2
+
+query I rowsort
+SELECT k FROM unnest_outer WHERE NOT EXISTS (SELECT 1 FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k);
+----
+3
+NULL
