@@ -1,0 +1,13 @@
+# name: corpus/bench/correlated-distinct-count.benchmark
+# description: A correlated subquery whose aggregate is a distinct count, so the domain carries a second grouping
+# group: [rudb-correlated]
+
+name Correlated distinct count
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT count(DISTINCT amount) FROM facts WHERE facts.bucket = parts.bucket) > 100

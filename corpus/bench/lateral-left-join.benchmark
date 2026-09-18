@@ -1,0 +1,13 @@
+# name: corpus/bench/lateral-left-join.benchmark
+# description: A left join lateral, which has to pad the left row the entry answered nothing for
+# group: [rudb-lateral]
+
+name Left join lateral
+group rudb-lateral
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(v.s) FROM parts LEFT JOIN LATERAL (SELECT sum(amount) AS s FROM facts WHERE facts.bucket = parts.bucket AND facts.amount % 3 = 0) v ON true

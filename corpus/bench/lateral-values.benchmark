@@ -1,0 +1,12 @@
+# name: corpus/bench/lateral-values.benchmark
+# description: A lateral VALUES of two rows, where the domain is the input rather than something crossed with one
+# group: [rudb-lateral]
+
+name Lateral VALUES reading the left row
+group rudb-lateral
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 200 AS bucket FROM range(10000) t(i);
+
+run
+SELECT sum(v.col0) FROM parts, LATERAL (VALUES (parts.id * 3), (parts.id + 100)) v

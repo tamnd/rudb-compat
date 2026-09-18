@@ -1406,8 +1406,14 @@ fn cost(
             "rudb-compat: no timeout on this machine, so a benchmark that hangs hangs the run"
         );
     }
-    let corpus = rudb_compat::vendor::checkout(Path::new(root()), refresh)
-        .and_then(|dir| rudb_compat::queries::read(&dir));
+    // Ours first, so a run somebody stopped early has measured the features this release was about
+    // rather than four hundred micro benchmarks and nothing else.
+    let corpus = rudb_compat::queries::ours(&Path::new(root()).join(rudb_compat::queries::OURS))
+        .and_then(|mut mine| {
+            let dir = rudb_compat::vendor::checkout(Path::new(root()), refresh)?;
+            mine.extend(rudb_compat::queries::read(&dir)?);
+            Ok(rudb_compat::queries::distinct(mine))
+        });
     let corpus = match corpus {
         Ok(corpus) => corpus,
         Err(e) => {
