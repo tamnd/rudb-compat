@@ -1,0 +1,14 @@
+# name: corpus/bench/correlated-right-join.benchmark
+# description: A correlated subquery over a right join, whose preserved side is the one that asks nothing about the outer row
+# group: [rudb-correlated]
+
+name Correlated right join
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+CREATE TABLE extra AS SELECT i % 500 AS bucket, i * 2 AS amount FROM range(2000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT count(e.amount) FROM facts f RIGHT JOIN extra e ON e.amount = f.amount AND f.bucket = parts.bucket) > 2

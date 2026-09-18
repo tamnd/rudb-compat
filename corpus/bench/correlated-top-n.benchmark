@@ -1,0 +1,13 @@
+# name: corpus/bench/correlated-top-n.benchmark
+# description: A correlated subquery with an ORDER BY and a LIMIT with an OFFSET, which has to be counted per outer row
+# group: [rudb-correlated]
+
+name Correlated top N
+group rudb-correlated
+
+load
+CREATE TABLE parts AS SELECT i AS id, i % 500 AS bucket FROM range(200000) t(i);
+CREATE TABLE facts AS SELECT i % 500 AS bucket, i AS amount FROM range(200000) t(i);
+
+run
+SELECT count(*) FROM parts WHERE (SELECT amount FROM facts WHERE facts.bucket = parts.bucket ORDER BY amount DESC LIMIT 1 OFFSET 2) > 100000

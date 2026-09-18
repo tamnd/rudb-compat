@@ -10,11 +10,17 @@ Directives at the left margin, each either taking the rest of its line or introd
 
 The `group` is what the per suite table in `cost` breaks the numbers down by, and a group with one benchmark in it is left out of that table, so write at least two of anything worth a group. Ours are named with a `rudb-` prefix so a row is obviously from this half of the corpus.
 
+## What is in here
+
+Twelve files, and each of them is one operator sitting inside a correlated subquery or a lateral entry. Six were written when the directory was, for a scalar subquery, an `EXISTS`, a distinct count, a left join lateral, a lateral aggregate and a lateral `VALUES`. Six more are the operators the general unnesting rule learned after that, which are a window, a top N, a limit inside a lateral entry, a set operation, a right join and a full join.
+
+The reason each of those is worth a file is the same reason the directory exists. Every one of them was refused by rudb until the release that added its rule, so there is no number for it anywhere in DuckDB's suite and no number for it in an older run of ours either. A benchmark written the day the rule lands is the only way the first measurement of it is not also the measurement somebody is comparing against.
+
 ## How to size one
 
 The load and the query are measured separately and the load's share is printed beside every row, so a benchmark that is nine tenths `CREATE TABLE` is visible as such rather than misleading. Even so, aim for a query that costs more than its load, and build the rows out of `range` rather than a file so the benchmark is self contained.
 
-That share reads 100% for everything here and it is not saying what it looks like it is saying. It is taken on the pin, which is the side that answers everything and so the side whose split is trustworthy, but the pin answers all six of these in less time than it takes to start a process. The load and the load with the query on the end of it are then the same number and the share pins at one. Anything DuckDB is fast on reads the same way, so this is not a property of our files, and the column starts meaning something again once there is a way to build a table once and time a query against it separately.
+That share reads 100% for everything here and it is not saying what it looks like it is saying. It is taken on the pin, which is the side that answers everything and so the side whose split is trustworthy, but the pin answers all twelve of these in less time than it takes to start a process. The load and the load with the query on the end of it are then the same number and the share pins at one. Anything DuckDB is fast on reads the same way, so this is not a property of our files, and the column starts meaning something again once there is a way to build a table once and time a query against it separately.
 
 Keep the whole thing near a second on rudb. The cost run measures four things per benchmark and takes the median of several runs of each, so a benchmark that takes a minute costs the run half an hour on its own and a benchmark that hangs is recorded as a refusal. Aggregate the final result down to one row, because the time to print a million rows to a pipe is not the time anybody is trying to measure.
 
