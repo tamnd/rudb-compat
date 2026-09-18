@@ -1,0 +1,141 @@
+# name: corpus/slt/lateral.test
+# description: a FROM entry that reads the entries written to its left
+# group: [smoke]
+
+statement ok
+CREATE TABLE lateral_outer(k INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO lateral_outer VALUES (1, 2), (2, 3), (3, NULL), (NULL, 1);
+
+statement ok
+CREATE TABLE lateral_inner(k INTEGER, w INTEGER);
+
+statement ok
+INSERT INTO lateral_inner VALUES (1, 100), (1, 200), (2, 300), (NULL, 400);
+
+# The subquery is evaluated against each row of the entry to its left. The outer rows whose key is 3
+# and NULL match nothing and an inner join drops them.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer, LATERAL (SELECT lateral_inner.w FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k) v;
+----
+1	100
+1	200
+2	300
+
+# The word changes nothing here, because a comma separated FROM already resolves the entries to its
+# left. Same query without it.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer, (SELECT lateral_inner.w FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k) v;
+----
+1	100
+1	200
+2	300
+
+# A left join keeps the outer row that the entry answered nothing for and pads it.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer LEFT JOIN LATERAL (SELECT lateral_inner.w FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k) v ON true;
+----
+1	100
+1	200
+2	300
+3	NULL
+NULL	NULL
+
+# CROSS JOIN LATERAL is the comma form written out.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer CROSS JOIN LATERAL (SELECT lateral_inner.w FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k) v;
+----
+1	100
+1	200
+2	300
+
+# A VALUES row reading the outer row. There is nothing underneath a VALUES for the domain to be
+# pushed into, so the domain becomes its input and one row is a projection over it.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer, LATERAL (VALUES (lateral_outer.k * 3)) v(w);
+----
+1	3
+2	6
+3	9
+NULL	NULL
+
+# Two VALUES rows, which each answer for every outer row.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer, LATERAL (VALUES (lateral_outer.k * 3), (lateral_outer.k + 100)) v(w);
+----
+1	101
+1	3
+2	102
+2	6
+3	103
+3	9
+NULL	NULL
+NULL	NULL
+
+# A VALUES in FROM without the parentheses reads the outer row too, and names its column col0.
+query II rowsort
+SELECT lateral_outer.k, col0 FROM lateral_outer, VALUES (lateral_outer.k * 3);
+----
+1	3
+2	6
+3	9
+NULL	NULL
+
+# An entry is visible to the entry after it, so a chain of them resolves left to right.
+query II rowsort
+SELECT lateral_outer.k, y.b FROM lateral_outer, LATERAL (SELECT lateral_outer.k + 1 AS a) x, LATERAL (SELECT x.a * 10 AS b) y;
+----
+1	20
+2	30
+3	40
+NULL	NULL
+
+# An entry may group by the outer column it read.
+query II rowsort
+SELECT lateral_outer.k, v.c FROM lateral_outer, LATERAL (SELECT count(*) AS c FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k GROUP BY lateral_outer.n) v;
+----
+1	2
+2	1
+
+# An entry may aggregate over the columns it brought in itself, which is not the same thing as
+# aggregating the outer column, and an ungrouped one answers for every outer row.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer, LATERAL (SELECT max(lateral_inner.w) AS w FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k) v;
+----
+1	200
+2	300
+3	NULL
+NULL	NULL
+
+# A filter above the entry sees its columns like any other.
+query II rowsort
+SELECT lateral_outer.k, v.w FROM lateral_outer, LATERAL (SELECT lateral_inner.w FROM lateral_inner WHERE lateral_inner.k = lateral_outer.k) v WHERE v.w > 150;
+----
+1	200
+2	300
+
+# There is one left row per evaluation of the entry, so a sum over it would be a sum of one value.
+statement error
+SELECT lateral_outer.k, v.w FROM lateral_outer, LATERAL (SELECT sum(lateral_outer.k) AS w) v;
+----
+LATERAL join cannot contain aggregates!
+
+# A row of the right side exists only for the left row it was evaluated against, so a kind that has
+# to produce right rows with no left row has nothing to produce them from.
+statement error
+SELECT lateral_outer.k, v.w FROM lateral_outer RIGHT JOIN LATERAL (SELECT lateral_outer.k AS w) v ON true;
+----
+The combining JOIN type must be INNER or LEFT for a LATERAL reference
+
+statement error
+SELECT lateral_outer.k, v.w FROM lateral_outer FULL JOIN LATERAL (SELECT lateral_outer.k AS w) v ON true;
+----
+The combining JOIN type must be INNER or LEFT for a LATERAL reference
+
+# Left to right and not both ways. The entry written first cannot read the one written after it.
+# The rest of the message is where rudb and the pinned build still differ, which rudb #824 is about.
+statement error
+SELECT lateral_outer.k, v.w FROM LATERAL (SELECT lateral_outer.k AS w) v, lateral_outer;
+----
+Referenced table "lateral_outer" not found
