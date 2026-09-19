@@ -1,0 +1,205 @@
+# name: corpus/slt/pair_dependent_join_condition.test
+# description: a subquery in an inner join's ON that reads rows from both sides of that join
+# group: [join]
+
+# A query written in an ON goes into whichever of the join's two inputs produces the rows it reads,
+# which is what corpus/slt/join_condition_subquery.test covers. This file is the case where there is
+# no such input, because the query reads rows from both sides and has to be evaluated once per pair.
+#
+# The join is what produces a pair, so the join becomes a product, the query is joined into the
+# product's rows the way a query in a WHERE is, and the condition becomes a filter above it. That is
+# the same query for an inner join and for no other kind, since every other kind does something with
+# the pairs its condition dropped and a filter above a product no longer knows which left row a
+# dropped pair came from.
+#
+# The product is not what runs. Filter pushdown turns a filter over an inner join back into a join
+# condition, so the part of the ON that reads one column from each side is still an equality the
+# join builds on, and only the part that reads the query's output stays above.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE pair_l(a INTEGER, x INTEGER);
+
+statement ok
+CREATE TABLE pair_r(b INTEGER, y INTEGER);
+
+statement ok
+CREATE TABLE pair_s(a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO pair_l VALUES (1, 10), (1, 11), (2, 20), (3, 30);
+
+statement ok
+INSERT INTO pair_r VALUES (10, 100), (20, 200), (30, 300), (40, 400);
+
+statement ok
+INSERT INTO pair_s VALUES (1, 10), (1, 20), (2, 20), (NULL, 30), (3, NULL);
+
+# An EXISTS whose body reads a column from each side. Five of the sixteen pairs have a matching row
+# in pair_s, and the two left rows that share a value of a each keep both of their matches.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	10
+1	20
+1	10
+1	20
+2	20
+
+# The same pairs through an IN, where the body reads the right side and the comparison reads the
+# left. The comparison belongs to the query rather than to the condition, so it is the pair that is
+# read and not just the body.
+
+query II
+SELECT l.a, r.b FROM pair_l l INNER JOIN pair_r r ON l.a IN (SELECT s.a FROM pair_s s WHERE s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	10
+1	20
+1	10
+1	20
+2	20
+
+# The negation, which is the eleven pairs the first record dropped. A query that reads both sides
+# cannot be a mark join over one input, so this is the case that would go wrong quietly if the
+# rewrite kept only the pairs it could see.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON NOT EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	30
+1	40
+1	30
+1	40
+2	10
+2	30
+2	40
+3	10
+3	20
+3	30
+3	40
+
+# An equality written beside the query. The equality is a join condition and the query is not, and
+# the answer is the two pairs that satisfy both.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON l.x = r.b AND EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	10
+2	20
+
+# A scalar query reading a column from each side, compared against a column of the right side. The
+# body has an inequality against the right side rather than an equality, so the value the query
+# returns really does change with the pair and not just with the left row.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON r.b = (SELECT max(s.b) FROM pair_s s WHERE s.a = l.a AND s.b <= r.b) ORDER BY l.a, l.x, r.b;
+----
+1	10
+1	20
+1	10
+1	20
+2	20
+
+# The same question as a count, which is the aggregate that has an answer for a group with no rows,
+# so the pairs that match nothing come back as zero rather than as NULL.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON (SELECT count(*) FROM pair_s s WHERE s.a = l.a AND s.b = r.b) > 0 ORDER BY l.a, l.x, r.b;
+----
+1	10
+1	20
+1	10
+1	20
+2	20
+
+# A count that has to be two, which no pair the other records keep satisfies, so this is a different
+# set of pairs rather than the same one written differently.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON (SELECT count(*) FROM pair_s s WHERE s.a = l.a AND s.b <= r.b) = 2 ORDER BY l.a, l.x, r.b;
+----
+1	20
+1	30
+1	40
+1	20
+1	30
+1	40
+
+# A NOT IN, where a NULL in the body is what decides the answer for the pairs whose right value is
+# 30, since pair_s has a row with a NULL a and b of 30.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON l.x NOT IN (SELECT s.b FROM pair_s s WHERE s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	20
+1	30
+1	40
+1	10
+1	20
+1	30
+1	40
+2	10
+2	30
+2	40
+3	10
+3	20
+3	40
+
+# One query per side beside one that reads both. The first two go into an input each and the third
+# is the one that cannot, so all three routes are taken in one condition.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a) AND EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	10
+1	20
+1	10
+1	20
+2	20
+
+# The same question written as a product and a WHERE, which is the rewrite said out loud. It has to
+# give what the first record gives, since that is the claim the rewrite rests on.
+
+query II
+SELECT l.a, r.b FROM pair_l l CROSS JOIN pair_r r WHERE EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) ORDER BY l.a, l.x, r.b;
+----
+1	10
+1	20
+1	10
+1	20
+2	20
+
+# Counted rather than listed, so a duplicated row is caught by the number as well as by the listing.
+
+query I
+SELECT count(*) FROM pair_l l JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b);
+----
+5
+
+# A third table joined on afterwards, so the rewritten join is an input to another join rather than
+# the top of the FROM. The columns the rewrite adds are not columns anything above it named, and a
+# join over it must not see them.
+
+query II
+SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) JOIN pair_s t ON t.a = l.a ORDER BY l.a, l.x, r.b, t.b;
+----
+1	10
+1	10
+1	20
+1	20
+1	10
+1	10
+1	20
+1	20
+2	20
+
+# A left join whose condition reads both sides has no plan yet. It is the pair dependent join
+# upstream builds, and the rewrite above is not it, because a left join pads the pairs its condition
+# dropped and a filter above a product cannot tell which left row a dropped pair came from.
+
+statement error
+SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b);
+----
+reads both sides of that join
