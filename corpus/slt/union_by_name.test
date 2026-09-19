@@ -1,0 +1,169 @@
+# name: corpus/slt/union_by_name.test
+# description: UNION BY NAME, which lines the two sides up by column name rather than by position
+# group: [setop]
+
+# The result has the left side's columns in the order the left side wrote them, then the right
+# side's columns the left side did not write, in the order the right side wrote them. A column only
+# one side wrote is filled with a null on the other side, which is why the two sides do not have to
+# be the same width here and do have to be everywhere else.
+#
+# What made this a file rather than one record is how many ways the two sides can fail to line up.
+# There is a record for the names crossing over, one for each side missing a column the other wrote,
+# one for no name in common at all, one for the matching being case insensitive, one for the widths
+# differing under a star, one for a third branch, and one each for the two shapes that are refused.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE named_left (x INTEGER, y INTEGER);
+
+statement ok
+CREATE TABLE named_right (y INTEGER, z INTEGER);
+
+statement ok
+INSERT INTO named_left VALUES (1, 2), (5, 6);
+
+statement ok
+INSERT INTO named_right VALUES (3, 4);
+
+# The smallest shape. Both sides wrote the same two names and the right side wrote them the other
+# way round, so a union that matched by position would answer 3 and 4 in the second row.
+
+query II
+SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT 3 AS b, 4 AS a ORDER BY a;
+----
+1	2
+4	3
+
+# A name the right side did not write, which it fills with a null.
+
+query II
+SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT 3 AS a ORDER BY a;
+----
+1	2
+3	NULL
+
+# A name the left side did not write, which goes on the end rather than being sorted into the
+# left side's names.
+
+query II
+SELECT 1 AS a UNION ALL BY NAME SELECT 3 AS a, 4 AS c ORDER BY a;
+----
+1	NULL
+3	4
+
+# Two sides with no name in common at all, which is the widest the result gets: every column of
+# every row is filled on one side or the other.
+
+query II
+SELECT 1 AS a UNION ALL BY NAME SELECT 4 AS c ORDER BY a NULLS LAST;
+----
+1	NULL
+NULL	4
+
+# Names match without regard to case, and the spelling that comes out is the left side's, which is
+# what the rest of the engine does with an identifier. The second record is the same with both
+# names written in quotes, so nothing can fold the case on the way in.
+
+query II
+SELECT 1 AS a, 2 AS b UNION ALL BY NAME SELECT 3 AS B, 4 AS A ORDER BY a;
+----
+1	2
+4	3
+
+query I
+SELECT 1 AS "Ab" UNION ALL BY NAME SELECT 2 AS "aB" ORDER BY 1;
+----
+1
+2
+
+# A star on each side, which is the shape somebody actually writes: two tables that share one
+# column and each have one of their own.
+
+query III
+SELECT * FROM named_left UNION ALL BY NAME SELECT * FROM named_right ORDER BY y;
+----
+1	2	NULL
+NULL	3	4
+5	6	NULL
+
+# Sorted and limited on a column only one side wrote, so most of what the sort key holds is the
+# nulls the other side was filled with.
+
+query III
+SELECT * FROM named_left UNION ALL BY NAME SELECT * FROM named_right ORDER BY y LIMIT 2;
+----
+1	2	NULL
+NULL	3	4
+
+# Three branches, which is two operations because the chain is left associative, so the third
+# branch is matched against what the first two came out with rather than against the first.
+
+query III
+SELECT 1 AS a UNION ALL BY NAME SELECT 2 AS b UNION ALL BY NAME SELECT 3 AS c ORDER BY a NULLS LAST, b NULLS LAST;
+----
+1	NULL	NULL
+NULL	2	NULL
+NULL	NULL	3
+
+# Without ALL the duplicates still go, and a row whose only difference is a column one side filled
+# with a null is a duplicate of a row that wrote the null itself.
+
+query II
+SELECT 1 AS a UNION BY NAME SELECT 1 AS a, NULL AS b;
+----
+1	NULL
+
+# Each side grouped, which is worth a record because the column a grouped side hands up is an
+# aggregate rather than a column of a table and the name it carries is the alias.
+
+query II
+SELECT sum(x) AS s FROM named_left UNION ALL BY NAME SELECT max(z) AS m FROM named_right ORDER BY s;
+----
+6	NULL
+NULL	4
+
+# A side that wrote one name twice is refused, because matching by name needs the name to say which
+# column and that side has no answer to give. The doubled quotes around the name are DuckDB's.
+
+statement error
+SELECT 1 AS a, 2 AS a UNION ALL BY NAME SELECT 3 AS a;
+----
+UNION (ALL) BY NAME operation doesn't support duplicate names in the SELECT list
+
+# The same through a star, which is how somebody runs into it without meaning to: a join of two
+# tables that share a column name puts that name in the select list twice.
+
+statement error
+SELECT * FROM named_left, named_right UNION ALL BY NAME SELECT * FROM named_right;
+----
+UNION (ALL) BY NAME operation doesn't support duplicate names in the SELECT list
+
+# BY NAME goes with UNION and with nothing else. The grammar takes it after EXCEPT because the two
+# share a clause, so that pairing is refused by name.
+
+statement error
+SELECT 1 AS a EXCEPT BY NAME SELECT 1 AS a;
+----
+Invalid combination of EXCEPT and BY NAME
+
+# INTERSECT has a clause of its own with no BY NAME in it, so this does not parse at all.
+
+statement error
+SELECT 1 AS a INTERSECT BY NAME SELECT 1 AS a;
+----
+syntax error
+
+# An ordinary union is still matched by position, still takes its names from the left side, and
+# still needs the two sides to be the same width. This is the control for the whole file.
+
+query II
+SELECT 1 AS a, 2 AS b UNION ALL SELECT 3 AS b, 4 AS a ORDER BY a;
+----
+1	2
+3	4
+
+statement error
+SELECT 1 AS a UNION ALL SELECT 2 AS a, 3 AS b;
+----
+Set operations can only apply to expressions with the same number of result columns
