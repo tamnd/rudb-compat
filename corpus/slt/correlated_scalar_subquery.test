@@ -115,3 +115,56 @@ SELECT k, (SELECT sum(value) FROM (VALUES (1, 10), (1, 20), (2, 5), (NULL, 40)) 
 2	NULL
 3	NULL
 NULL	NULL
+
+# A select list that reads the outer row, over a filter that reads it with an equality. The rule
+# that turns a correlated filter into an ordinary join cannot take these, because the projection it
+# would move to the right side of that join reads a column of the left side. It used to take them
+# anyway and they came back as an internal error about a column not being in a schema, which is
+# rudb#993. The general domain rule answers them.
+
+query II rowsort
+SELECT k, (SELECT o.k FROM (VALUES (1, 10), (2, 20)) i(k, v) WHERE i.k = o.k) FROM (VALUES (1), (2), (3), (NULL)) o(k);
+----
+1	1
+2	2
+3	NULL
+NULL	NULL
+
+query II rowsort
+SELECT k, (SELECT o.k + i.v FROM (VALUES (1, 10), (2, 20)) i(k, v) WHERE i.k = o.k) FROM (VALUES (1), (2), (3), (NULL)) o(k);
+----
+1	11
+2	22
+3	NULL
+NULL	NULL
+
+# A second outer column, which the correlation does not read, so the outer row is used twice over.
+
+query III rowsort
+SELECT k, t, (SELECT o.t FROM (VALUES (1, 10), (2, 20)) i(k, v) WHERE i.k = o.k) FROM (VALUES (1, 'a'), (2, 'b'), (3, NULL)) o(k, t);
+----
+1	a	a
+2	b	b
+3	NULL	NULL
+
+# A local predicate beside the correlated one, so the filter has a part that stays where it is.
+
+query II rowsort
+SELECT k, (SELECT o.k FROM (VALUES (1, 10), (1, 20), (2, 20)) i(k, v) WHERE i.k = o.k AND i.v = 20) FROM (VALUES (1), (2), (3), (NULL)) o(k);
+----
+1	1
+2	2
+3	NULL
+NULL	NULL
+
+# The same tables with an aggregate instead, where the projection reads nothing outer, so the rule
+# does still take it. This is the record that says the guard is about the projection and not about
+# the filter.
+
+query II rowsort
+SELECT k, (SELECT max(i.v) FROM (VALUES (1, 10), (1, 20), (2, 20)) i(k, v) WHERE i.k = o.k) FROM (VALUES (1), (2), (3), (NULL)) o(k);
+----
+1	20
+2	20
+3	NULL
+NULL	NULL
