@@ -36,7 +36,7 @@ fn every_file_in_the_committed_corpus_passes() {
     assert_eq!(summary.skipped.total(), 0, "nothing here should need a directive we do not have");
     // A corpus that silently stopped being read would pass every assertion above it, so the count
     // is pinned. Raise it when a file is added, which is the point at which somebody is looking.
-    assert_eq!(summary.files, 46, "the corpus gained or lost a file");
+    assert_eq!(summary.files, 47, "the corpus gained or lost a file");
     assert!(summary.passed > 100, "only {} records ran, which is too few", summary.passed);
 }
 
