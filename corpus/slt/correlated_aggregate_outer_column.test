@@ -152,6 +152,30 @@ SELECT k, (SELECT max(w) FROM agg_inner i WHERE i.k = o.k GROUP BY o.t) AS c FRO
 3	NULL
 NULL	NULL
 
+# The same with a count, which is the shape that has an answer either way and so needs saying out
+# loud. A scalar count over an empty input is zero, which is why the unnesting keeps a padded row
+# for an outer key nothing matched, but a count over no groups is no row and a scalar subquery that
+# returns no row is NULL. The group here is written on the outer column, so the padded row takes the
+# outer value and the invented group looks exactly like a real one.
+
+query II
+SELECT k, (SELECT count(*) FROM agg_inner i WHERE i.k = o.k GROUP BY o.t) AS c FROM agg_outer o ORDER BY k;
+----
+1	2
+2	1
+3	NULL
+NULL	NULL
+
+# The same count grouped on the inner column instead.
+
+query II
+SELECT k, (SELECT count(*) FROM agg_inner i WHERE i.k = o.k GROUP BY i.k) AS c FROM agg_outer o ORDER BY k;
+----
+1	2
+2	1
+3	NULL
+NULL	NULL
+
 # Beside an aggregate whose body filters on something other than the outer row, so the subquery is
 # correlated only through the projection and nowhere else.
 
