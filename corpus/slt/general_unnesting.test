@@ -475,3 +475,127 @@ NULL	NULL	200
 NULL	NULL	300
 NULL	NULL	500
 NULL	NULL	700
+
+# A semi join inside the subquery, with the correlated side on the left. A semi join keeps a left
+# row when the right side has a match for it, so the domain has to be on the left whatever else is
+# true, because the left rows are the only rows that come out and one of them has to say which outer
+# row it belongs to.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x SEMI JOIN unnest_other ON x.w = unnest_other.w) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# The same shape with the correlated side on the right, which is the one that says the matching was
+# done per outer row. The right side is now a different relation for each outer key and a left row
+# is kept or dropped according to the one belonging to its own key.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner SEMI JOIN (SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x ON unnest_inner.w = x.w) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# A semi join whose correlation is in the join condition and in neither side. Nothing in either
+# input reads the outer row, so the domain has nowhere to go except the left, and the condition is
+# what reads it.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner SEMI JOIN unnest_other ON unnest_inner.w = unnest_other.w AND unnest_inner.k = unnest_outer.k) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# The anti join of the first one. It keeps the left rows with no match, so the answers are the left
+# side's rows for that outer key less the ones the semi join kept.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x ANTI JOIN unnest_other ON x.w = unnest_other.w) AS c FROM unnest_outer;
+----
+1	1
+2	0
+3	0
+NULL	0
+
+# An anti join with the correlated side on the right. An outer key the right side has nothing for
+# keeps all four left rows, which is the answer that says the right side was cut down per outer row
+# rather than once.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner ANTI JOIN (SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS x ON unnest_inner.w = x.w) AS c FROM unnest_outer;
+----
+1	3
+2	3
+3	4
+NULL	4
+
+# An anti join whose correlation is in the condition alone.
+query II rowsort
+SELECT k, (SELECT count(*) FROM unnest_inner ANTI JOIN unnest_other ON unnest_inner.w = unnest_other.w AND unnest_inner.k = unnest_outer.k) AS c FROM unnest_outer;
+----
+1	3
+2	3
+3	4
+NULL	4
+
+# Both sides of a semi join correlated at once, which is the case that needs two copies of the
+# domain and an equality between them. One copy would be one column read twice and every domain
+# value on the left would meet every domain value on the right.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x SEMI JOIN (SELECT w FROM unnest_other WHERE unnest_other.k = unnest_outer.k) AS y ON x.w = y.w) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# An `IN` inside the subquery, which is a mark join. A mark join answers true, false or unknown for
+# each left row, and the row it answers for is a domain value and a left row together once the
+# domain is in there.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x WHERE x.w IN (SELECT w FROM unnest_other)) AS c FROM unnest_outer;
+----
+1	1
+2	1
+3	0
+NULL	0
+
+# The negated form, which is the one where the third answer matters. `NOT IN` is false for a row
+# that matched and unknown for a row that did not when the right side holds a NULL, and a filter
+# keeps neither.
+query II rowsort
+SELECT k, (SELECT count(*) FROM (SELECT w FROM unnest_inner WHERE unnest_inner.k = unnest_outer.k) AS x WHERE x.w NOT IN (SELECT w FROM unnest_other)) AS c FROM unnest_outer;
+----
+1	1
+2	0
+3	0
+NULL	0
+
+# A semi join as a LATERAL entry, reading the rows rather than counting them. This is the record
+# that says each surviving row went back to the outer row it was kept for, which a count would hide.
+query II rowsort
+SELECT o.k, v.w FROM unnest_outer AS o, LATERAL (SELECT unnest_inner.w FROM unnest_inner SEMI JOIN unnest_other ON unnest_inner.w = unnest_other.w AND unnest_inner.k = o.k) AS v(w);
+----
+1	200
+2	300
+
+# The anti join of that, where every outer key keeps something and the rows differ between them.
+query II rowsort
+SELECT o.k, v.w FROM unnest_outer AS o, LATERAL (SELECT unnest_inner.w FROM unnest_inner ANTI JOIN unnest_other ON unnest_inner.w = unnest_other.w AND unnest_inner.k = o.k) AS v(w);
+----
+1	100
+1	300
+1	400
+2	100
+2	200
+2	400
+3	100
+3	200
+3	300
+3	400
+NULL	100
+NULL	200
+NULL	300
+NULL	400
