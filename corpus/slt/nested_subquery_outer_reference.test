@@ -119,3 +119,14 @@ SELECT o1.k, (SELECT max(w) FROM nest_inner i WHERE i.k = o1.k AND EXISTS (SELEC
 1	200
 2	300
 3	NULL
+
+# The outer reference read from the select list of the query in the middle rather than from a
+# predicate of it, which puts it beside an aggregate. This was held back from this file until rudb
+# #1027, because a subquery anywhere in the select list of a grouped query was refused there.
+
+query II
+SELECT o1.k, (SELECT max(w) + (SELECT o2.k) FROM nest_inner i WHERE i.k = o1.k) AS c FROM nest_outer o1 JOIN nest_outer o2 ON (o1.k = o2.k) ORDER BY o1.k;
+----
+1	201
+2	302
+3	NULL
