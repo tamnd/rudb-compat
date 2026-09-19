@@ -1,0 +1,186 @@
+# name: corpus/slt/limit_percent.test
+# description: LIMIT written as a share of the input rather than as a row count
+# group: [smoke]
+
+# A LIMIT can name a percentage instead of a number of rows, and then the row count is worked out
+# from how many rows arrived rather than being known before the query starts. The count rounds down,
+# so three and a half rows is three and half a row is none. The share is taken from the whole input
+# and the offset is applied to the rows that share left, which is why LIMIT 30 PERCENT OFFSET 2 over
+# ten rows runs past where a share of the eight remaining rows would have stopped.
+#
+# There are two spellings and they do not go through the same cast. The PERCENT word takes a literal
+# and the % sign takes an expression, and the value ends up as a DOUBLE either way rather than as the
+# BIGINT a row count is cast to. That is the shortest explanation of LIMIT true% being no rows here
+# and LIMIT true being one row in limit_expression.test.
+#
+# The records are grouped as the arithmetic, the offset, the expression form, the range refusal, the
+# cast refusal and a run over enough rows to cross a chunk boundary. Every expectation was taken off
+# the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE ten (i INTEGER);
+
+statement ok
+INSERT INTO ten VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+
+# The count is a share of the input rounded down, so 30 and 35 percent of ten rows are both three.
+
+query I
+SELECT i FROM ten LIMIT 30 PERCENT;
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT 35 PERCENT;
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT 10 PERCENT;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT 9.99 PERCENT);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT 5 PERCENT);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT 0 PERCENT);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT 100 PERCENT);
+----
+10
+
+# The share is of the whole input and the offset comes after it, not before. Three rows starting at
+# the third is 2, 3 and 4, and a share that starts past the end is no rows at all.
+
+query I
+SELECT i FROM ten LIMIT 30 PERCENT OFFSET 2;
+----
+2
+3
+4
+
+query I
+SELECT i FROM ten LIMIT 50 PERCENT OFFSET 8;
+----
+8
+9
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT 30 PERCENT OFFSET 20);
+----
+0
+
+query I
+SELECT i FROM ten ORDER BY i DESC LIMIT 30 PERCENT;
+----
+9
+8
+7
+
+# The % sign takes an expression and the value is cast to DOUBLE, so true is one percent and not one
+# row, and a null share is no limit at all the same way a null row count is.
+
+query I
+SELECT i FROM ten LIMIT (10 + 20)%;
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT '30'%;
+----
+0
+1
+2
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT true%);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT NULL%);
+----
+10
+
+# A share outside nought to a hundred is refused while the query is planned, and NAN is outside the
+# range like anything else that is not between the two ends.
+
+statement error
+SELECT i FROM ten LIMIT 101 PERCENT;
+----
+Limit percent out of range, should be between 0% and 100%
+
+statement error
+SELECT i FROM ten LIMIT 100.5 PERCENT;
+----
+Limit percent out of range, should be between 0% and 100%
+
+statement error
+SELECT i FROM ten LIMIT -10%;
+----
+Limit percent out of range, should be between 0% and 100%
+
+statement error
+SELECT i FROM ten LIMIT ('nan'::DOUBLE)%;
+----
+Limit percent out of range, should be between 0% and 100%
+
+# A value the cast cannot take is the cast's own refusal, and it names DOUBLE here where the row
+# count form names BIGINT.
+
+statement error
+SELECT i FROM ten LIMIT DATE '2020-01-01'%;
+----
+Unimplemented type for cast (DATE -> DOUBLE)
+
+# Enough rows to cross a chunk boundary, so that the share is counted across the whole input rather
+# than within whatever chunk the rows turned up in. The filtered case is the one that says the share
+# is of what reaches the limit and not of what the table holds.
+
+statement ok
+CREATE TABLE big (i INTEGER);
+
+statement ok
+INSERT INTO big SELECT * FROM range(5000);
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big LIMIT 33 PERCENT);
+----
+1650	0	1649
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big LIMIT 33 PERCENT OFFSET 2500);
+----
+1650	2500	4149
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big WHERE i % 2 = 0 LIMIT 10 PERCENT);
+----
+250	0	498
+
+query I
+SELECT count(*) FROM (SELECT i FROM (SELECT i FROM big LIMIT 50 PERCENT) LIMIT 10 PERCENT);
+----
+250
+
+query I
+SELECT count(*) FROM (SELECT i FROM big WHERE i > 100000 LIMIT 50 PERCENT);
+----
+0
