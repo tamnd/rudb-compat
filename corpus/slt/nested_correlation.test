@@ -1,0 +1,109 @@
+# name: corpus/slt/nested_correlation.test
+# description: a correlated column read more than one level below the query it belongs to
+# group: [subquery]
+
+# The binder records a correlation into the frame of the query being bound. A name that resolved
+# past the query immediately enclosing belongs to one further out still, so the frame it lands in is
+# not the frame that has to carry it. If nobody hands it up, the query that should have been
+# correlated looks like an ordinary one, gets planned as one, and the column it was supposed to feed
+# down is asked for from an operator that was never given it.
+#
+# So the records below are the shapes where the distance between where a column is written and where
+# it belongs is more than one: an EXISTS inside an EXISTS, a scalar query inside a scalar query, a
+# mark join whose body holds the nesting, and one case three levels deep.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE deep_o(x INTEGER);
+
+statement ok
+CREATE TABLE deep_t(c INTEGER);
+
+statement ok
+CREATE TABLE deep_s(c INTEGER, d INTEGER);
+
+statement ok
+INSERT INTO deep_o VALUES (1), (2), (3);
+
+statement ok
+INSERT INTO deep_t VALUES (1), (2);
+
+statement ok
+INSERT INTO deep_s VALUES (2, 20), (3, 30), (2, 21);
+
+# The plain shape. The middle query reads nothing of the outer row itself, so it is the inner one
+# that carries the correlation and the outer one that has to answer for it.
+
+query I
+SELECT x FROM deep_o o WHERE EXISTS (SELECT 1 FROM deep_t t WHERE EXISTS (SELECT 1 FROM deep_s s WHERE s.c = o.x)) ORDER BY x;
+----
+2
+3
+
+# The same with the middle query read as well, so the inner one is correlated to both levels at once
+# and only part of what it read goes up.
+
+query I
+SELECT x FROM deep_o o WHERE EXISTS (SELECT 1 FROM deep_t t WHERE t.c = 1 AND EXISTS (SELECT 1 FROM deep_s s WHERE s.c = o.x AND s.c > t.c)) ORDER BY x;
+----
+2
+3
+
+query II
+SELECT o.x, (SELECT count(*) FROM deep_t t WHERE EXISTS (SELECT 1 FROM deep_s s WHERE s.c = o.x)) FROM deep_o o ORDER BY o.x;
+----
+1	0
+2	2
+3	2
+
+query I
+SELECT x FROM deep_o o WHERE NOT EXISTS (SELECT 1 FROM deep_t t WHERE EXISTS (SELECT 1 FROM deep_s s WHERE s.c = o.x)) ORDER BY x;
+----
+1
+
+# A mark join above, with the nesting in its body.
+
+query I
+SELECT x FROM deep_o o WHERE o.x IN (SELECT t.c FROM deep_t t WHERE EXISTS (SELECT 1 FROM deep_s s WHERE s.c = o.x)) ORDER BY x;
+----
+2
+
+# A single join underneath a dependent one, which is the shape the domain rule used to leave out.
+
+query II
+SELECT o.x, (SELECT max((SELECT max(s.d) FROM deep_s s WHERE s.c = o.x)) FROM deep_t t) FROM deep_o o ORDER BY o.x;
+----
+1	NULL
+2	21
+3	30
+
+# Three levels, so the column is handed up twice rather than once.
+
+query I
+SELECT x FROM deep_o o WHERE EXISTS (SELECT 1 FROM deep_t t WHERE EXISTS (SELECT 1 FROM deep_s s WHERE EXISTS (SELECT 1 FROM deep_s s2 WHERE s2.c = o.x AND s2.d = s.d))) ORDER BY x;
+----
+2
+3
+
+query II
+SELECT o.x, (SELECT sum(t.c) FROM deep_t t WHERE t.c < (SELECT max(s.c) FROM deep_s s WHERE s.c = o.x)) FROM deep_o o ORDER BY o.x;
+----
+1	NULL
+2	1
+3	3
+
+query I
+SELECT o.x FROM deep_o o WHERE (SELECT count(*) FROM deep_t t WHERE EXISTS (SELECT 1 FROM deep_s s WHERE s.c = o.x AND s.d > t.c)) > 1 ORDER BY o.x;
+----
+2
+3
+
+statement ok
+DROP TABLE deep_s;
+
+statement ok
+DROP TABLE deep_t;
+
+statement ok
+DROP TABLE deep_o;
