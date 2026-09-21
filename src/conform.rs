@@ -38,13 +38,12 @@ pub const NAMES: &[&str] = &["rudb", "duckdb"];
 
 /// rudb's vector size, which is what a `require vector_size` line is asking about.
 ///
-/// It mirrors `rudb_vector::VECTOR_SIZE`, which the `rudb` facade does not re-export, so this
-/// repeats the number rather than reading it. The direction of a drift is the thing to know. If
-/// rudb grows its vector and this stays where it is, the runner skips files it could have run,
-/// which shows up as a skip count that will not go down. If rudb shrinks its vector and this stays,
-/// the runner attempts files written for a larger one, which shows up as failures. Both are
-/// visible, and the first is the one that happens.
-const VECTOR_SIZE: usize = 1024;
+/// This used to repeat the number, because `rudb_vector::VECTOR_SIZE` was not re-exported by the
+/// facade and the harness depends on the facade and nothing else on purpose. It said what a drift
+/// would look like, which was a skip count that would not go down, and that is exactly what
+/// happened: rudb went from 1024 to 8192 in tamnd/rudb#480 and the 136 files that ask for 2048
+/// stayed skipped until the constant was read instead of repeated. rudb exports it now.
+const VECTOR_SIZE: usize = rudb::VECTOR_SIZE;
 
 /// The things the corpus requires that rudb has without loading anything.
 ///
@@ -2018,11 +2017,18 @@ mod tests {
 
     #[test]
     fn the_report_says_what_the_file_asked_for_and_how_many_records_went_with_it() {
-        let text =
-            "require vector_size 4096\n\nstatement ok\nSELECT 1\n\nquery I\nSELECT 2\n----\n2\n";
-        let summary = run(Vec::new(), text);
+        // A size rudb does not reach, worked out from the constant rather than written down. It was
+        // 4096 and that stopped being a skip at all the day rudb's vector went past it.
+        let wanted = VECTOR_SIZE * 2;
+        let text = format!(
+            "require vector_size {wanted}\n\nstatement ok\nSELECT 1\n\nquery I\nSELECT 2\n----\n2\n"
+        );
+        let summary = run(Vec::new(), &text);
         let (_, why) = &summary.skipped_files[0];
-        assert_eq!(why.to_string(), "requires vector_size 4096, and 2 records went with it");
+        assert_eq!(
+            why.to_string(),
+            format!("requires vector_size {wanted}, and 2 records went with it")
+        );
         assert_eq!(why.gap(), Gap::Engine);
         assert_eq!(summary.skipped.engine, 2);
         assert_eq!(
