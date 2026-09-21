@@ -1,0 +1,129 @@
+# name: corpus/slt/positional_join_correlated.test
+# description: a positional join written inside a correlated subquery
+# group: [join]
+
+# A positional join pairs the nth row of one side with the nth row of the other and pads the shorter
+# side with nulls, so which rows come out of it depends on the order the two sides deliver rows
+# rather than on any value in them. That is what makes it awkward inside a correlated subquery. A
+# correlated subquery is answered once per distinct value of the outer columns it reads, and the way
+# both engines do that is to put those values underneath the subquery as a relation so that one
+# evaluation covers all of them. Putting a relation underneath one side of a positional join changes
+# how many rows that side has, which changes which row is the nth one, which is a different query.
+#
+# So there is a line and these records are written on both sides of it. Above the line the
+# correlation is in a filter or a predicate over the whole pairing, the pairing itself asks nothing
+# about the outer row, and it is evaluated once and then filtered. Below the line the correlation
+# reaches inside one of the two sides, and both engines refuse the query rather than answer it.
+#
+# The two refusals do not read the same. The pin refuses in the binder and rudb refuses while it is
+# lowering the correlation away, so the wording differs and the answer does not, which is why those
+# records are a statement error with no text after them.
+#
+# The tables are deliberately of different lengths. There are four rows on the left of the pairing
+# and two on the right, so the third and fourth pairs carry a null the right table never held, and a
+# record that read the right column would go wrong quietly if the padding were dropped.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE pj_outer (k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO pj_outer VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CREATE TABLE pj_left (k INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO pj_left VALUES (1, 100), (1, 101), (2, 200), (3, 300);
+
+statement ok
+CREATE TABLE pj_right (y INTEGER);
+
+statement ok
+INSERT INTO pj_right VALUES (7), (8);
+
+# The correlation in a filter over the pairing. The pairing runs once, the filter picks the rows
+# belonging to each outer row, and the aggregate is over what is left.
+
+query II
+SELECT o.k, (SELECT sum(x) FROM pj_left POSITIONAL JOIN pj_right WHERE pj_left.k = o.k) FROM pj_outer o ORDER BY o.k;
+----
+1	201
+2	200
+3	300
+
+# The right column through the same shape, which is where the padding shows. Only the first two
+# pairs have a row from pj_right in them, so the sum is null for the outer rows that match the rest.
+
+query II
+SELECT o.k, (SELECT sum(y) FROM pj_left POSITIONAL JOIN pj_right WHERE pj_left.k = o.k) FROM pj_outer o ORDER BY o.k;
+----
+1	15
+2	NULL
+3	NULL
+
+query II
+SELECT o.k, (SELECT count(*) FROM pj_left POSITIONAL JOIN pj_right WHERE pj_left.k = o.k) FROM pj_outer o ORDER BY o.k;
+----
+1	2
+2	1
+3	1
+
+# The outer column compared against the right side rather than the left, which is the same shape
+# with the correlation on the padded column. A null pads two of the pairs and fails the comparison.
+
+query II
+SELECT o.k, (SELECT count(*) FROM pj_left POSITIONAL JOIN pj_right WHERE pj_right.y > o.k) FROM pj_outer o ORDER BY o.k;
+----
+1	2
+2	2
+3	2
+
+# The predicates, which read the pairing rather than aggregate over it.
+
+query IT
+SELECT o.k, EXISTS (SELECT 1 FROM pj_left POSITIONAL JOIN pj_right WHERE pj_left.k = o.k AND pj_right.y = 8) FROM pj_outer o ORDER BY o.k;
+----
+1	true
+2	false
+3	false
+
+query IT
+SELECT o.k, NOT EXISTS (SELECT 1 FROM pj_left POSITIONAL JOIN pj_right WHERE pj_left.k = o.k AND pj_right.y IS NULL) FROM pj_outer o ORDER BY o.k;
+----
+1	true
+2	false
+3	false
+
+query IT
+SELECT o.k, o.k IN (SELECT pj_left.k FROM pj_left POSITIONAL JOIN pj_right WHERE pj_right.y = 7) FROM pj_outer o ORDER BY o.k;
+----
+1	true
+2	false
+3	false
+
+# The pairing behind a subquery of its own with the correlation still above it, which is the same
+# query written so that the positional join is one more level down.
+
+query II
+SELECT o.k, (SELECT count(*) FROM (SELECT pj_left.k AS k, pj_right.y AS y FROM pj_left POSITIONAL JOIN pj_right) p WHERE p.k = o.k) FROM pj_outer o ORDER BY o.k;
+----
+1	2
+2	1
+3	1
+
+# Below the line. The correlation is inside one of the two sides in each of these, so answering it
+# would mean changing the number of rows that side has, and both engines refuse instead.
+
+statement error
+SELECT o.k, (SELECT count(*) FROM (SELECT * FROM pj_left WHERE pj_left.k = o.k) POSITIONAL JOIN pj_right) FROM pj_outer o ORDER BY o.k;
+
+statement error
+SELECT o.k, (SELECT count(*) FROM pj_left POSITIONAL JOIN (SELECT * FROM pj_right WHERE y > o.k)) FROM pj_outer o ORDER BY o.k;
+
+statement error
+SELECT o.k, (SELECT sum(y) FROM (SELECT * FROM pj_left WHERE pj_left.k = o.k) POSITIONAL JOIN pj_right) FROM pj_outer o ORDER BY o.k;
+
+statement error
+SELECT o.k, EXISTS (SELECT 1 FROM (SELECT * FROM pj_left WHERE pj_left.k = o.k) POSITIONAL JOIN pj_right) FROM pj_outer o ORDER BY o.k;
