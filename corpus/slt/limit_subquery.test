@@ -1,0 +1,202 @@
+# name: corpus/slt/limit_subquery.test
+# description: LIMIT and OFFSET holding a value that is not known until the query runs
+# group: [smoke]
+
+# Most of what a LIMIT is written as can be worked out before the query starts, and limit_expression
+# covers that. What is left is a subquery, which has to run before there is a value at all. The
+# engine answers it by joining the subquery in under the limit as a single row, which puts its one
+# value in a column of every row the limit sees, reading that column off the first chunk that
+# arrives and using the number for the rest of the query. The column is one the query did not ask
+# for, so a projection over the limit drops it again, which is what the star records below are
+# checking.
+#
+# The value is cast the way a written row count is, so a string that looks like a number is a row
+# count and a boolean is one row or none. A subquery that answers nothing and one that answers null
+# are both no limit at all, which is what leaving the clause off already means.
+#
+# The records are grouped as the row count, the offset, the shapes with no projection of their own
+# over the limit, the cast, the empty answer, and a run over enough rows to cross a chunk boundary.
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+#
+# One shape is left out. The pin refuses a subquery bound written straight onto a set operation, so
+# SELECT i FROM ten UNION ALL SELECT i FROM ten LIMIT (SELECT 3) is a binder error there while rudb
+# answers it. That is tamnd/duckdb#10 and the wrapped form a few records down covers the same
+# ground.
+
+statement ok
+CREATE TABLE ten (i INTEGER);
+
+statement ok
+INSERT INTO ten VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+
+# The row count, which reads the same as a row count written out.
+
+query I
+SELECT i FROM ten LIMIT (SELECT 3);
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT (SELECT count(*) FROM ten WHERE i < 4);
+----
+0
+1
+2
+3
+
+query I
+SELECT i FROM ten LIMIT (SELECT 3) + 1;
+----
+0
+1
+2
+3
+
+# The offset, and the two of them together. The offset is applied first and the count is of what is
+# left, the same as when both are written out.
+
+query I
+SELECT i FROM ten OFFSET (SELECT 8);
+----
+8
+9
+
+query I
+SELECT i FROM ten LIMIT (SELECT 3) OFFSET (SELECT 2);
+----
+2
+3
+4
+
+query I
+SELECT i FROM ten LIMIT 3 OFFSET (SELECT 5);
+----
+5
+6
+7
+
+query I
+SELECT i FROM ten LIMIT (SELECT 2) OFFSET 7;
+----
+7
+8
+
+# An ORDER BY under it, which is the case a plain row count fuses into a top n and this one does
+# not, because there is no count to keep a heap of until the query is already running. The rows are
+# the same either way.
+
+query I
+SELECT i FROM ten ORDER BY i DESC LIMIT (SELECT 3);
+----
+9
+8
+7
+
+query I
+SELECT i FROM ten WHERE i > 2 ORDER BY i LIMIT (SELECT 2) OFFSET (SELECT 1);
+----
+4
+5
+
+# The shapes with nothing of their own over the limit to drop the joined in column, which is a star
+# and a VALUES. A column the query did not ask for would show up here first.
+
+query I
+SELECT * FROM ten LIMIT (SELECT 2);
+----
+0
+1
+
+query I
+VALUES (7), (8), (9) LIMIT (SELECT 2);
+----
+7
+8
+
+query II
+SELECT * FROM (SELECT i, i * 2 AS d FROM ten) LIMIT (SELECT 2);
+----
+0	0
+1	2
+
+query I
+SELECT * FROM (SELECT i FROM ten UNION ALL SELECT i FROM ten) LIMIT (SELECT 3);
+----
+0
+1
+2
+
+query II
+SELECT i, i * 2 FROM ten LIMIT (SELECT 2) OFFSET (SELECT 3);
+----
+3	6
+4	8
+
+# The cast, which is the same cast a written row count goes through, so the type rules are the type
+# rules of that cast and not rules of this clause.
+
+query I
+SELECT i FROM ten LIMIT (SELECT '3');
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT (SELECT true);
+----
+0
+
+query I
+SELECT i FROM ten LIMIT (SELECT 2::BIGINT);
+----
+0
+1
+
+# A subquery that answers nothing and one that answers null are both no limit at all.
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT (SELECT NULL));
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT (SELECT i FROM ten WHERE false));
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten OFFSET (SELECT NULL));
+----
+10
+
+# Enough rows to cross a chunk boundary, since the number is read off the first chunk and used for
+# every chunk after it. The three columns are how many rows came back, the smallest and the largest.
+
+statement ok
+CREATE TABLE big (i INTEGER);
+
+statement ok
+INSERT INTO big SELECT * FROM range(5000);
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big LIMIT (SELECT 1500));
+----
+1500	0	1499
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big LIMIT (SELECT 1500) OFFSET (SELECT 2500));
+----
+1500	2500	3999
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big WHERE i % 2 = 0 LIMIT (SELECT 600));
+----
+600	0	1198
+
+query I
+SELECT count(*) FROM (SELECT i FROM big LIMIT (SELECT count(*) FROM big));
+----
+5000
