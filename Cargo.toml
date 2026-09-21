@@ -36,3 +36,20 @@ todo = "warn"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# The corpus is an engine running SQL, not a harness doing arithmetic, so almost all of the time a
+# run takes is spent inside rudb. rudb arrives here as a dependency rather than as a workspace
+# member, which is why this line reaches it at all and why it is worth so much: the corpus used to
+# run the whole engine unoptimized. Measured on an i9-13900K, the corpus stage of rudb's gate is
+# 16.0 seconds without these two lines and 5.5 seconds with them, over three interleaved runs each.
+#
+# `debug-assertions` is on either way, which is the part that matters for what this repository is
+# for. The plan verifier and the pin accounting are gated on that and not on the optimization
+# level, so the corpus still runs with every check rudb makes about itself turned on.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Our own code stays close to the source, the way rudb's own manifest puts it. There is not much of
+# it and none of it is in a loop.
+[profile.dev]
+opt-level = 1
