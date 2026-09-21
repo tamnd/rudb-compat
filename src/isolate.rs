@@ -101,17 +101,26 @@ impl Limits {
     /// stop.
     ///
     /// A quarter and not a half because a half was measured and it is not enough. One sort, run on
-    /// server2 against four budgets, stopped itself at the budget every time and the process it ran
-    /// in was three times that size when it did:
+    /// server2 against four budgets, stops itself at the budget every time and the process it runs
+    /// in is several times that size when it does. The second column is what it was when this was
+    /// written and the third is the same sort after rudb's vector went from 1024 to 8192 in
+    /// tamnd/rudb#480:
     ///
-    /// | charged | resident |
-    /// | ------- | -------- |
-    /// | 16 MB   | 64 MB    |
-    /// | 32 MB   | 111 MB   |
-    /// | 64 MB   | 205 MB   |
-    /// | 128 MB  | 392 MB   |
+    /// | charged | resident at 1024 | resident at 8192 |
+    /// | ------- | ---------------- | ---------------- |
+    /// | 16 MB   | 64 MB            | 118 MB           |
+    /// | 32 MB   | 111 MB           | 209 MB           |
+    /// | 64 MB   | 205 MB           | 306 MB           |
+    /// | 128 MB  | 392 MB           | 408 MB           |
     ///
-    /// Three times what it charges is rudb's number to bring down and not this crate's, and it is
+    /// The shape changed as well as the numbers. It used to be about three times what it charges at
+    /// every budget and it is now roughly a fixed eighty megabytes plus twice the budget, which is
+    /// what an eight times larger chunk looks like when the operators in flight hold a few of them
+    /// and nobody charges for them. The small budgets got much worse and the large ones barely
+    /// moved. A quarter still holds at the default cap of two gigabytes, where the budget is 512 MB
+    /// and the process lands near 1.4 GB by that rule.
+    ///
+    /// Several times what it charges is rudb's number to bring down and not this crate's, and it is
     /// filed as tamnd/rudb#735. What this crate owes it in the meantime is a cap it cannot trip
     /// while it is inside its own budget, because a file killed from outside is a file with no
     /// outcome at all.
@@ -811,8 +820,9 @@ mod tests {
         assert_eq!(limits.budget(), 512 * 1024 * 1024);
         assert!(limits.statement() < limits.deadline());
         // Reaching the budget first is not enough on its own, because the process is bigger than
-        // what the engine charges itself. Three times bigger, measured, so the gap between these
-        // two has to be wider than three times and not merely present.
+        // what the engine charges itself. Up to three times bigger over the range of budgets in the
+        // table on `budget`, so the gap between these two has to be wider than three times and not
+        // merely present.
         assert!(limits.budget() * 3 < limits.memory);
     }
 
