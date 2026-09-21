@@ -19,8 +19,41 @@ use rudb_compat::shard::Shard;
 use rudb_compat::shell::{Session, Shell};
 use rudb_compat::sweep;
 
+/// How much stack a test that binds the corpus in this process is given.
+///
+/// A main thread gets eight megabytes and a spawned one gets two, and libtest runs each test on a
+/// spawned one, so a test here starts with a quarter of what the same work gets from the shell. The
+/// corpus has correlated subqueries four levels deep and binding one is a recursion, with frames a
+/// debug build makes several times the size an optimized build does, and that lands the whole
+/// corpus just over the two megabyte line. What it looks like when it goes over is the process
+/// aborting with a stack overflow in whichever test got there first, which says nothing about which
+/// file or which record, so it is worth not being near the line at all.
+///
+/// Eight megabytes is what the shell already runs the same corpus on, and it is a bound rather than
+/// an allocation: a thread's stack is mapped lazily and the pages a run does not touch are never
+/// backed. The tests that run the corpus in a subprocess do not need this, because the runner they
+/// spawn does its binding on a main thread.
+const ROOM: usize = 8 * 1024 * 1024;
+
+/// Runs a test body on a thread with `ROOM` to recurse in, and fails the test the same way it
+/// would have failed in place.
+fn with_room(body: impl FnOnce() + Send + 'static) {
+    let thread = std::thread::Builder::new()
+        .name("corpus".to_owned())
+        .stack_size(ROOM)
+        .spawn(body)
+        .expect("a thread to run the corpus on");
+    if let Err(panic) = thread.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn every_file_in_the_committed_corpus_passes() {
+    with_room(every_file_in_the_committed_corpus_passes_body);
+}
+
+fn every_file_in_the_committed_corpus_passes_body() {
     let mut rudb = Rudb::new();
     let summary = run_path(&mut rudb, Path::new("corpus/slt"), false).expect("the corpus is there");
 
@@ -52,6 +85,10 @@ fn every_file_in_the_committed_corpus_passes() {
 /// record for record, which is what catches a pass changing an answer the corpus checks.
 #[test]
 fn the_corpus_answers_the_same_with_every_optimizer_pass_turned_off() {
+    with_room(the_corpus_answers_the_same_with_every_optimizer_pass_turned_off_body);
+}
+
+fn the_corpus_answers_the_same_with_every_optimizer_pass_turned_off_body() {
     let mut on = Rudb::new();
     let optimized = run_path(&mut on, Path::new("corpus/slt"), false).expect("the corpus is there");
 
@@ -87,6 +124,10 @@ fn the_corpus_answers_the_same_with_every_optimizer_pass_turned_off() {
 /// and a property that can be gated per commit should be.
 #[test]
 fn every_optimizer_pass_on_its_own_answers_the_corpus_the_same_way() {
+    with_room(every_optimizer_pass_on_its_own_answers_the_corpus_the_same_way_body);
+}
+
+fn every_optimizer_pass_on_its_own_answers_the_corpus_the_same_way_body() {
     let swept = sweep::run(Path::new("corpus/slt"), false).expect("the corpus is there");
 
     assert!(
@@ -144,6 +185,10 @@ fn the_list_of_files_that_do_not_stop_names_files_the_corpus_has() {
 /// shell from the commit under test and points this corpus at it.
 #[test]
 fn every_file_in_the_committed_corpus_passes_through_the_shell_too() {
+    with_room(every_file_in_the_committed_corpus_passes_through_the_shell_too_body);
+}
+
+fn every_file_in_the_committed_corpus_passes_through_the_shell_too_body() {
     let shell = match Shell::rudb() {
         Ok(shell) => shell,
         Err(e) => {
@@ -182,6 +227,10 @@ fn every_file_in_the_committed_corpus_passes_through_the_shell_too() {
 /// process.
 #[test]
 fn the_isolating_runner_gets_the_same_answer_as_the_one_in_this_process() {
+    with_room(the_isolating_runner_gets_the_same_answer_as_the_one_in_this_process_body);
+}
+
+fn the_isolating_runner_gets_the_same_answer_as_the_one_in_this_process_body() {
     let mut rudb = Rudb::new();
     let inline = run_path(&mut rudb, Path::new("corpus/slt"), false).expect("the corpus is there");
 
