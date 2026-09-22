@@ -1,0 +1,289 @@
+# name: corpus/slt/window_argument_order.test
+# description: an ORDER BY written inside a window function's own brackets
+# group: [window]
+
+# A window call can carry an ORDER BY of its own, written inside the brackets next to the arguments
+# rather than in the OVER. The two clauses look alike and are not the same question. The one in the
+# OVER lays the partition out and decides which rows are in the frame at all, and the one in here
+# decides what order the call reads those rows in once they are, which is why
+# first_value(amount ORDER BY amount DESC) is the largest amount in the frame rather than the first
+# row of it.
+#
+# The two interesting parts are that the frame is still the frame and that the inner order runs
+# after everything that drops rows. A frame narrower than the partition sorts what is in the frame
+# and nothing else, and EXCLUDE takes its row out before the sort rather than after it, so a row
+# excluded from its own frame does not come back as the answer.
+#
+# first_value, last_value and nth_value are the three window functions that read the frame and so
+# the three that this changes the answer of. An aggregate used as a window reads the frame as well,
+# and for a commutative one like sum the order is not observable, but it still has to be accepted
+# and still has to answer. lead, lag and fill read something other than the frame, and the pinned
+# binary refuses EXCLUDE on them once an inner order is present, which is the last three records
+# here.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE sales (id INTEGER, amount INTEGER, region INTEGER, who VARCHAR)
+
+statement ok
+INSERT INTO sales VALUES (1, 30, 1, 'ann'), (2, 10, 1, 'bob'), (3, 20, 1, 'cid'), (4, 50, 2, 'dee'), (5, 40, 2, 'eve')
+
+statement ok
+CREATE TABLE gaps (id INTEGER, amount INTEGER)
+
+statement ok
+INSERT INTO gaps VALUES (1, 30), (2, NULL), (3, 20), (4, NULL), (5, 40)
+
+# The frame is the whole partition, so every row reads the same five values and the inner order is
+# the only thing deciding which one comes back.
+
+query II
+SELECT id, first_value(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	50
+2	50
+3	50
+4	50
+5	50
+
+query II
+SELECT id, first_value(amount ORDER BY amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	10
+2	10
+3	10
+4	10
+5	10
+
+query II
+SELECT id, last_value(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	10
+2	10
+3	10
+4	10
+5	10
+
+query II
+SELECT id, nth_value(amount, 2 ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	40
+2	40
+3	40
+4	40
+5	40
+
+# The sort is within the frame and not within the partition. Row one sees only the first two rows,
+# so the largest amount it can answer with is 30 rather than 50.
+
+query II
+SELECT id, first_value(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM sales ORDER BY id;
+----
+1	30
+2	30
+3	50
+4	50
+5	50
+
+# EXCLUDE drops the row before the inner order runs, which row four shows: its own amount is the
+# largest in the partition and the answer is the next one down.
+
+query II
+SELECT id, first_value(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM sales ORDER BY id;
+----
+1	50
+2	50
+3	50
+4	40
+5	50
+
+# One partition at a time, so the inner order reaches no further than the partition does.
+
+query III
+SELECT id, region, first_value(amount ORDER BY amount DESC) OVER (PARTITION BY region ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	1	30
+2	1	30
+3	1	30
+4	2	50
+5	2	50
+
+# Two keys running in different directions, over a column the call does not return.
+
+query IT
+SELECT id, first_value(who ORDER BY region DESC, amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	eve
+2	eve
+3	eve
+4	eve
+5	eve
+
+query IT
+SELECT id, last_value(who ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM sales ORDER BY id;
+----
+1	ann
+2	bob
+3	bob
+4	bob
+5	bob
+
+# The key can be any expression and not just a column.
+
+query II
+SELECT id, first_value(amount ORDER BY -amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	50
+2	50
+3	50
+4	50
+5	50
+
+# Nulls go last by default and the clause moves them, the same as anywhere else an ORDER BY is
+# written. A null that sorts to the front is the answer, because these three count rows rather than
+# values.
+
+query II
+SELECT id, first_value(amount ORDER BY amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM gaps ORDER BY id;
+----
+1	20
+2	20
+3	20
+4	20
+5	20
+
+query II
+SELECT id, first_value(amount ORDER BY amount NULLS FIRST) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM gaps ORDER BY id;
+----
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+
+# IGNORE NULLS is written after the inner order and passes the nulls over again, so the same query
+# reaches the first value that is there.
+
+query II
+SELECT id, first_value(amount ORDER BY amount NULLS FIRST IGNORE NULLS) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM gaps ORDER BY id;
+----
+1	20
+2	20
+3	20
+4	20
+5	20
+
+query II
+SELECT id, nth_value(amount, 2 ORDER BY amount IGNORE NULLS) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM gaps ORDER BY id;
+----
+1	30
+2	30
+3	30
+4	30
+5	30
+
+query II
+SELECT id, last_value(amount ORDER BY amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM gaps ORDER BY id;
+----
+1	30
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+
+# A count that does not land on a row is null and not an error, which the inner order does not
+# change.
+
+query II
+SELECT id, nth_value(amount, 0 ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+
+query II
+SELECT id, nth_value(amount, 9 ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	NULL
+2	NULL
+3	NULL
+4	NULL
+5	NULL
+
+# An aggregate used as a window takes the clause as well. Addition does not care what order it is
+# done in, so nothing in the answer moves, but the query still has to be accepted.
+
+query II
+SELECT id, sum(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM sales ORDER BY id;
+----
+1	30
+2	40
+3	60
+4	110
+5	150
+
+# The OVER running backwards does not change which rows are in the frame here, so the inner order
+# answers the same as it did forwards.
+
+query II
+SELECT id, first_value(amount ORDER BY amount DESC) OVER (ORDER BY id DESC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	50
+2	50
+3	50
+4	50
+5	50
+
+# A GROUPS frame, where the frame is counted in peer groups and every row is its own group because
+# the ids are distinct.
+
+query II
+SELECT id, first_value(amount ORDER BY amount DESC) OVER (ORDER BY id GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM sales ORDER BY id;
+----
+1	30
+2	30
+3	20
+4	50
+5	50
+
+# Two calls over the same window, one with an inner order and one without, which have to stay told
+# apart rather than share an answer.
+
+query III
+SELECT id, first_value(amount) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), first_value(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM sales ORDER BY id;
+----
+1	30	50
+2	30	50
+3	30	50
+4	30	50
+5	30	50
+
+# IGNORE NULLS goes inside the brackets and after the inner order. Written before it, or written
+# outside the brackets, it is a parse error.
+
+statement error
+SELECT id, first_value(amount IGNORE NULLS ORDER BY amount NULLS FIRST) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM gaps ORDER BY id;
+----
+syntax error at or near "ORDER"
+
+# lead, lag and fill do not read the frame, and an inner order is what makes the question of which
+# rows are in it apply to them, so the pinned binary turns down EXCLUDE at that point and not
+# before.
+
+statement error
+SELECT id, lead(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM sales ORDER BY id;
+----
+EXCLUDE is not supported for the window function
+
+statement error
+SELECT id, lag(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM sales ORDER BY id;
+----
+EXCLUDE is not supported for the window function
+
+statement error
+SELECT id, fill(amount ORDER BY amount DESC) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM sales ORDER BY id;
+----
+EXCLUDE is not supported for the window function
