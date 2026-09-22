@@ -33,8 +33,9 @@
 //! result set, a `CREATE TABLE` or a `SET`, come back as an empty table rather than as the error
 //! that `DESCRIBE CREATE TABLE` would have produced.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::duckdb::on_path;
@@ -161,7 +162,7 @@ impl Shell {
 
     /// The binary being driven, for the report.
     #[must_use]
-    pub fn binary(&self) -> &std::path::Path {
+    pub fn binary(&self) -> &Path {
         &self.binary
     }
 
@@ -381,43 +382,152 @@ fn without_duckdb_warnings(mut output: &str) -> &str {
 /// questions and drops it, and none of that works if the process running the second statement never
 /// heard the first one.
 ///
-/// The way to keep state across processes is usually a database file, and that is not available
-/// here, because rudb has no persistence until E2. So the session is rebuilt in front of every
-/// statement instead, out of the statements that printed nothing. That set is exactly the one that
-/// leaves something behind and nothing on the screen: `CREATE`, `INSERT`, `DROP`, `SET`. A statement
-/// that printed rows is not replayed, both because replaying it would put its rows in front of the
-/// next answer where the reader expects one table, and because a query has nothing to leave behind.
+/// There are two ways to do that here. The old one, which is still the default, rebuilds the
+/// session in front of every statement out of the statements that printed nothing. That set is
+/// exactly the one that leaves something behind and nothing on the screen: `CREATE`, `INSERT`,
+/// `DROP`, `SET`. A statement that printed rows is not replayed, both because replaying it would put
+/// its rows in front of the next answer where the reader expects one table, and because a query has
+/// nothing to leave behind. It costs a process per statement plus a replay of the file so far, which
+/// is quadratic, and it is also why a measurement of one record means nothing under it.
 ///
-/// The cost is a process per statement in the file plus a replay of the file so far, which is
-/// quadratic and is fine at the size of a corpus written by hand. It would not be fine on the four
-/// thousand upstream files, and that is not what this is for: those run against the library, where
-/// a connection stays open and none of this is needed.
-#[derive(Debug, Clone)]
+/// The new one is [`Session::on_a_file`], and it is what the replay is meant to turn into. rudb
+/// writes its database file when the last handle on it goes away, tamnd/rudb#1226, and lets a table
+/// that is already in the file take an append, tamnd/rudb#1228, so a session can now be a file the
+/// way it is for anybody who uses either engine for real. The session gets a directory of its own
+/// with a database called `memory` in it, so `current_database()` answers the same word it answers
+/// with no file, and the file keeps the state, so nothing is replayed and what a record costs is
+/// what the record costs.
+///
+/// Two things a file does not keep, and they are handled differently because they cost differently.
+/// The first is the settings, which are per process, so `SET`, `RESET` and a `PRAGMA` that printed
+/// nothing are remembered and put in front of every later statement. There are a handful of those
+/// in a file and they are cheap. The second is everything else a process owns rather than a database
+/// does, which is a temporary table or view, an `ATTACH`, a transaction, a prepared statement and a
+/// loaded extension. Those cannot be put in front of one statement without putting the whole file in
+/// front of it, so the first one turns the file off, deletes it and goes back to the replay.
+///
+/// The file is not the default yet because rudb cannot write half the column types down.
+/// `CREATE TABLE t (x DOUBLE)` fails on a database with a file, and so does `FLOAT`, `HUGEINT`,
+/// `TIME`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `BLOB`, `BIT`, and every nested type, which is
+/// tamnd/rudb#1244, tamnd/rudb#1245 and tamnd/rudb#1246. Four files in the committed corpus create a
+/// table with one of those in it. When #1244 and #1245 land the default flips, this paragraph goes,
+/// and `on_a_file` goes with it.
+#[derive(Debug)]
 pub struct Session {
     /// The shell underneath, with no setup of its own.
     shell: Shell,
     /// What has been run and printed nothing, in the order it was run.
     history: Vec<String>,
+    /// The ones of those the file does not keep, which is the settings.
+    settings: Vec<String>,
+    /// The directory holding this session's database, made when the first statement needs it.
+    home: Option<PathBuf>,
+    /// Whether a file was asked for, which is what a reset goes back to.
+    wanted: bool,
+    /// Whether the file is still carrying the session, which a fallback turns off until the reset.
+    on_file: bool,
+    /// What the last statement cost, when nothing was replayed in front of it.
+    last: Option<Usage>,
 }
 
 impl Session {
     /// Wrap a shell so that what it is told sticks until the next reset.
     #[must_use]
     pub fn new(shell: Shell) -> Self {
-        Self { shell, history: Vec::new() }
+        Self {
+            shell,
+            history: Vec::new(),
+            settings: Vec::new(),
+            home: None,
+            wanted: false,
+            on_file: false,
+            last: None,
+        }
     }
 
-    /// The statements this session replays in front of the next one.
+    /// Keep the session in a database file rather than replaying it in front of every statement.
+    ///
+    /// Opt in for now, for the reason on the type. Call it before the first statement: a session
+    /// that has already run something has its state in the replay and moving it is not a thing this
+    /// does.
+    #[must_use]
+    pub fn on_a_file(mut self) -> Self {
+        self.wanted = true;
+        self.on_file = true;
+        self
+    }
+
+    /// Everything this session has been told that printed nothing, in the order it was told.
+    ///
+    /// Only the settings are replayed while the file is carrying the session. The rest is here
+    /// because the fallback needs it: a statement the file cannot keep turns the file off, and
+    /// what has to be rebuilt in memory at that point is the whole file so far.
     #[must_use]
     pub fn history(&self) -> &[String] {
         &self.history
     }
 
+    /// True while the file is carrying the session rather than the replay.
+    #[must_use]
+    pub const fn on_file(&self) -> bool {
+        self.on_file
+    }
+
+    /// The directory this session's database lives in, made the first time it is asked for.
+    ///
+    /// # Errors
+    ///
+    /// When the directory cannot be made.
+    fn home(&mut self) -> Result<&Path, HarnessError> {
+        if self.home.is_none() {
+            let n = SESSIONS.fetch_add(1, Ordering::Relaxed);
+            let at = std::env::temp_dir()
+                .join(format!("rudb-compat-session-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&at);
+            std::fs::create_dir_all(&at)
+                .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", at.display())))?;
+            self.home = Some(at);
+        }
+        Ok(self.home.as_deref().expect("the directory was just made"))
+    }
+
     /// The shell with the session in front of it, ready for one statement.
-    fn primed(&self) -> Shell {
-        self.shell.clone().with_setup(self.history.clone())
+    ///
+    /// # Errors
+    ///
+    /// When the session's directory cannot be made.
+    fn primed(&mut self) -> Result<Shell, HarnessError> {
+        if !self.on_file {
+            return Ok(self.shell.clone().with_setup(self.history.clone()));
+        }
+        let database = self.home()?.join("memory").to_string_lossy().into_owned();
+        Ok(self.shell.clone().on(database).with_setup(self.settings.clone()))
+    }
+
+    /// Give the file up and go back to replaying the whole session in memory.
+    ///
+    /// Everything that has run so far is in the history, so the replay rebuilds the same state the
+    /// file was holding. The file itself is deleted rather than left behind, because the statement
+    /// that caused this is about to run against a database with no file at all and a directory
+    /// nobody is going to open again is a directory nobody is going to delete either.
+    fn leave_the_file(&mut self) {
+        self.on_file = false;
+        if let Some(home) = self.home.take() {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    /// Remember a statement that printed nothing, under whichever of the two rules it falls.
+    fn remember(&mut self, statement: &str) {
+        if is_a_setting(statement) {
+            self.settings.push(statement.to_owned());
+        }
+        self.history.push(statement.to_owned());
     }
 }
+
+/// How many sessions this process has built, so that two of them never share a directory.
+static SESSIONS: AtomicUsize = AtomicUsize::new(0);
 
 impl Engine for Session {
     fn name(&self) -> &str {
@@ -430,10 +540,19 @@ impl Engine for Session {
 
     fn run(&mut self, sql: &str) -> Result<Outcome, HarnessError> {
         let statement = sql.trim().trim_end_matches(';');
-        let outcome = self.primed().run(statement)?;
+        if self.on_file && !the_file_keeps_it(statement) {
+            self.leave_the_file();
+        }
+        let mut shell = self.primed()?;
+        let outcome = shell.run(statement)?;
+        // The number is only worth keeping when nothing ran in front of the statement, because the
+        // meter is around the process and the process ran the setup too. That is every statement in
+        // a file with no settings in it, which is most of the corpus, and it is none of a file that
+        // gave the file up. A wrong number with a confident name is worse than no number.
+        self.last = if shell.setup.is_empty() { shell.usage() } else { None };
         if let Outcome::Rows(table) = &outcome {
             if table.width() == 0 {
-                self.history.push(statement.to_owned());
+                self.remember(statement);
             }
         }
         Ok(outcome)
@@ -442,22 +561,75 @@ impl Engine for Session {
     fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError> {
         // Nothing is remembered here on purpose. `accepts` answers whether the text is SQL, it
         // calls a catalog error accepted, and a session it built itself would not change one of
-        // its answers. Running the history in front of it still matters, because a statement that
-        // needs a table is a different statement to parse when the table is there.
-        self.primed().accepts(sql)
+        // its answers. Running it against the session's own database still matters, because a
+        // statement that needs a table is a different statement to parse when the table is there.
+        self.primed()?.accepts(sql)
     }
 
     fn reset(&mut self) -> Result<(), HarnessError> {
         self.history.clear();
+        self.settings.clear();
+        self.last = None;
+        self.on_file = self.wanted;
+        if let Some(home) = self.home.take() {
+            let _ = std::fs::remove_dir_all(home);
+        }
         Ok(())
     }
 
-    // `usage` is deliberately left at the default, which is nothing. A session replays every
-    // statement that left something behind in front of the next one, so what a measurement here
-    // would time is the statement plus the whole file so far, and that number goes up as the file
-    // goes on for reasons that have nothing to do with either engine. A wrong number with a
-    // confident name is worse than no number, which is the rule the rest of this crate is built
-    // on. The corpus timings come from `Shell`, where one process runs one statement.
+    fn usage(&self) -> Option<Usage> {
+        self.last
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+}
+
+/// Whether a statement that printed nothing is a setting, which a new process does not inherit.
+///
+/// A `PRAGMA` is on the list because the spelling is interchangeable with `SET` for a setting, and
+/// a `PRAGMA` that reads something prints rows and never reaches here.
+fn is_a_setting(statement: &str) -> bool {
+    matches!(opens_with(statement).as_str(), "SET" | "RESET" | "PRAGMA")
+}
+
+/// Whether the database file keeps what this statement leaves behind.
+///
+/// False for the things a process owns rather than a database. A temporary table lives in the
+/// `temp` catalog, which is per connection and is never written down. An `ATTACH` is a name this
+/// process has for another database. A transaction cannot span two processes at all. A prepared
+/// statement and a loaded extension are the same shape again. None of those can be put in front of
+/// one statement without putting the whole file in front of it, so meeting one is what sends the
+/// session back to the replay.
+fn the_file_keeps_it(statement: &str) -> bool {
+    let mut words = statement.split_whitespace().map(str::to_uppercase);
+    let Some(first) = words.next() else {
+        return true;
+    };
+    match first.as_str() {
+        "ATTACH" | "DETACH" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "ABORT" | "PREPARE"
+        | "DEALLOCATE" | "EXECUTE" | "LOAD" | "INSTALL" => false,
+        "CREATE" => {
+            // `CREATE TEMPORARY TABLE` and `CREATE OR REPLACE TEMPORARY TABLE` are the two ways to
+            // say it, so the word being looked for is the next one or the one three along and
+            // nowhere else. A table called `temp` is a table and lands between them.
+            let rest: Vec<String> = words.take(3).collect();
+            let temporary =
+                |at: usize| rest.get(at).is_some_and(|word| word == "TEMP" || word == "TEMPORARY");
+            !(temporary(0) || temporary(2))
+        }
+        _ => true,
+    }
+}
+
+/// The first word of a statement, upper cased, or the empty string when there is not one.
+fn opens_with(statement: &str) -> String {
+    statement.split_whitespace().next().unwrap_or_default().to_uppercase()
 }
 
 /// The query that asks a shell what a statement's columns are.
@@ -500,7 +672,7 @@ fn devnull() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Session, Shell, without_duckdb_warnings};
+    use super::{Session, Shell, the_file_keeps_it, without_duckdb_warnings};
     use crate::engine::{Cell, Engine, Outcome};
 
     #[test]
@@ -658,6 +830,160 @@ mod tests {
                 panic!("{name}: t was made before the reset and should be gone");
             };
             assert_eq!(e.kind, "Catalog Error", "{name}");
+        }
+    }
+
+    /// Whether this shell can be written to twice on one file, which is tamnd/rudb#1228.
+    ///
+    /// The binary these tests drive is whatever is on the machine, and the machine running the
+    /// gate does not build it from the commit under test. A rudb older than v0.3.83 refuses the
+    /// second insert into a table that is already in the file, so the test that writes twice says
+    /// which fix it is waiting for rather than failing as though the harness were wrong.
+    fn twice_writable(shell: &Shell) -> bool {
+        let mut session = Session::new(shell.clone()).on_a_file();
+        let _ = session.run("CREATE TABLE probe (a INTEGER)");
+        let _ = session.run("INSERT INTO probe VALUES (1)");
+        matches!(session.run("INSERT INTO probe VALUES (2)"), Ok(Outcome::Rows(_)))
+    }
+
+    #[test]
+    fn a_session_runs_on_a_file_and_replays_nothing_in_front_of_a_statement() {
+        // The point of the file. Three statements that all left something behind, and the fourth
+        // one still starts with an empty setup, so what it costs is what it costs.
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            if !twice_writable(&shell) {
+                eprintln!("skipping {name}, this shell predates tamnd/rudb#1228");
+                continue;
+            }
+            let mut session = Session::new(shell).on_a_file();
+            session.run("CREATE TABLE t (a INTEGER)").unwrap();
+            session.run("INSERT INTO t VALUES (1)").unwrap();
+            session.run("INSERT INTO t VALUES (2)").unwrap();
+            assert!(session.on_file(), "{name}");
+            assert_eq!(session.history().len(), 3, "{name}");
+            assert!(session.settings.is_empty(), "{name}");
+            let Outcome::Rows(table) = session.run("SELECT sum(a) FROM t").unwrap() else {
+                panic!("{name}: the file should still have both rows in it");
+            };
+            assert_eq!(table.rows, vec![vec![Cell::Text("3".into())]], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_session_on_a_file_is_still_called_memory() {
+        // Four files in the corpus read the database's name out of the catalog, and every one of
+        // them was written against a session with no file. The file is called `memory` so that
+        // they go on saying what they said.
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            let mut session = Session::new(shell).on_a_file();
+            let Outcome::Rows(table) = session.run("SELECT current_database()").unwrap() else {
+                panic!("{name}: that query works on both engines");
+            };
+            assert_eq!(table.rows, vec![vec![Cell::Text("memory".into())]], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_temporary_table_turns_the_file_off_and_the_session_goes_on_working() {
+        // A temporary table lives in the connection rather than in the database, so a file cannot
+        // carry one. The session gives the file up at that point and rebuilds itself out of the
+        // history instead, which is what it used to do for every statement of every file.
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            if !twice_writable(&shell) {
+                eprintln!("skipping {name}, this shell predates tamnd/rudb#1228");
+                continue;
+            }
+            let mut session = Session::new(shell).on_a_file();
+            session.run("CREATE TABLE kept (a INTEGER)").unwrap();
+            session.run("INSERT INTO kept VALUES (4)").unwrap();
+            assert!(session.on_file(), "{name}");
+            let made = session.run("CREATE TEMPORARY TABLE gone (b INTEGER)").unwrap();
+            let Outcome::Rows(_) = made else {
+                panic!("{name}: both engines take a temporary table: {made:?}");
+            };
+            assert!(!session.on_file(), "{name}: a temporary table should have given the file up");
+            session.run("INSERT INTO gone VALUES (5)").unwrap();
+            let Outcome::Rows(table) = session.run("SELECT a, b FROM kept, gone").unwrap() else {
+                panic!("{name}: the table from before the fallback should still be there");
+            };
+            assert_eq!(
+                table.rows,
+                vec![vec![Cell::Text("4".into()), Cell::Text("5".into())]],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_setting_is_put_back_in_front_of_every_later_statement() {
+        // The other half of what a file does not keep. A setting belongs to the process, so it has
+        // to be replayed, and there are few enough of them per file that replaying them is cheap.
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            let mut session = Session::new(shell).on_a_file();
+            session.run("SET disabled_optimizers = 'filter_pushdown'").unwrap();
+            assert_eq!(session.settings.len(), 1, "{name}");
+            assert!(session.on_file(), "{name}: a setting does not give the file up");
+            let Outcome::Rows(table) =
+                session.run("SELECT current_setting('disabled_optimizers')").unwrap()
+            else {
+                panic!("{name}: both engines can read a setting back");
+            };
+            assert_eq!(table.rows, vec![vec![Cell::Text("filter_pushdown".into())]], "{name}");
+        }
+    }
+
+    #[test]
+    fn a_session_reports_what_a_statement_cost_when_nothing_ran_in_front_of_it() {
+        // The whole reason for the file. This used to answer nothing, because the number would
+        // have been the statement plus the file so far.
+        for shell in shells() {
+            let name = Engine::name(&shell).to_owned();
+            if !shell.meter.measures() {
+                eprintln!("skipping {name}, nothing on this machine measures a child");
+                continue;
+            }
+            let mut session = Session::new(shell).on_a_file();
+            session.run("CREATE TABLE t AS SELECT range AS a FROM range(1000)").unwrap();
+            session.run("SELECT sum(a) FROM t").unwrap();
+            assert!(session.usage().is_some(), "{name}: a plain statement should be measured");
+            session.run("SET disabled_optimizers = 'filter_pushdown'").unwrap();
+            session.run("SELECT sum(a) FROM t").unwrap();
+            assert!(
+                session.usage().is_none(),
+                "{name}: a statement with a setting in front of it is not measured on its own"
+            );
+        }
+    }
+
+    #[test]
+    fn what_the_file_keeps_is_read_off_the_first_words() {
+        for kept in [
+            "CREATE TABLE t (a INTEGER)",
+            "CREATE OR REPLACE TABLE t (a INTEGER)",
+            "CREATE VIEW v AS SELECT 1",
+            "CREATE TABLE temp (a INTEGER)",
+            "INSERT INTO t VALUES (1)",
+            "DROP TABLE t",
+            "SET memory_limit = '1GiB'",
+            "",
+        ] {
+            assert!(the_file_keeps_it(kept), "{kept}");
+        }
+        for lost in [
+            "CREATE TEMPORARY TABLE t (a INTEGER)",
+            "CREATE TEMP TABLE t (a INTEGER)",
+            "CREATE OR REPLACE TEMPORARY VIEW v AS SELECT 1",
+            "create temporary table t (a integer)",
+            "ATTACH ':memory:' AS other",
+            "BEGIN TRANSACTION",
+            "PREPARE p AS SELECT 1",
+            "LOAD json",
+        ] {
+            assert!(!the_file_keeps_it(lost), "{lost}");
         }
     }
 
