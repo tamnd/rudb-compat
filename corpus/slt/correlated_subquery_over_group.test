@@ -1,0 +1,170 @@
+# name: corpus/slt/correlated_subquery_over_group.test
+# description: a subquery in a grouped query that correlates to the column the query groups by
+# group: [subquery]
+
+# A subquery written in the select list, the HAVING or the ORDER BY of a grouped query is one row per
+# group, so it belongs over the grouping rather than under it. When it correlates to a column the
+# block groups by it can still go over, because above the aggregate that column is the group's own
+# column and it holds the value every row of the group agreed on. The query is then joined against
+# the groups and answers once per group, which is once per output row.
+#
+# A correlation on a column the block neither groups by nor aggregates is a different question. There
+# is nothing over the grouping that holds it, so those two records are errors and the message names
+# the column the subquery reads.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE grp (k INTEGER, g VARCHAR, w INTEGER);
+
+statement ok
+CREATE TABLE lk (k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO grp VALUES (1, 'a', 100), (1, 'a', 200), (2, 'b', 300), (3, 'c', 400), (NULL, 'd', 500);
+
+statement ok
+INSERT INTO lk VALUES (1, 10), (2, 20), (2, 40), (NULL, 70);
+
+# The smallest shape. The two groups with no matching row get NULL, because an aggregate over no rows
+# is NULL, and the group whose key is NULL matches nothing either since NULL is not equal to NULL.
+
+query II
+SELECT k, (SELECT max(v) FROM lk r WHERE r.k = grp.k) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	10
+2	40
+3	NULL
+NULL	NULL
+
+# The same with a count, which answers zero rather than NULL for a group that matched nothing. A
+# scalar count over an empty input is a row holding zero and not an absent row.
+
+query II
+SELECT k, (SELECT count(*) FROM lk r WHERE r.k = grp.k) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	1
+2	2
+3	0
+NULL	0
+
+# Beside an aggregate of the outer block, so the projection reads the group, the aggregate and the
+# query's column at once.
+
+query III
+SELECT k, sum(w), (SELECT max(v) FROM lk r WHERE r.k = grp.k) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	300	10
+2	300	40
+3	400	NULL
+NULL	500	NULL
+
+# The group key read in the subquery's own select list rather than only in its WHERE, so the rewrite
+# has to reach every expression of the subquery's subtree and not just the one that correlates it.
+
+query II
+SELECT k, (SELECT max(v) + grp.k FROM lk r WHERE r.k = grp.k) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	11
+2	42
+3	NULL
+NULL	NULL
+
+# The group key inside an expression, which moves every answer, since the group with key 1 now reads
+# the rows of key 2.
+
+query II
+SELECT k, (SELECT max(v) FROM lk r WHERE r.k = grp.k + 1) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	40
+2	NULL
+3	NULL
+NULL	NULL
+
+# In a HAVING, which reads the query's answer through a filter over the groups rather than through a
+# projection. The two groups whose query answered NULL do not pass, because a comparison against NULL
+# is not true.
+
+query II
+SELECT k, sum(w) FROM grp GROUP BY k HAVING sum(w) > (SELECT max(v) FROM lk r WHERE r.k = grp.k) ORDER BY k;
+----
+1	300
+2	300
+
+# In an ORDER BY, where the query is what the groups are sorted on and is not selected at all.
+
+query I
+SELECT k FROM grp GROUP BY k ORDER BY (SELECT max(v) FROM lk r WHERE r.k = grp.k) DESC NULLS LAST, k;
+----
+2
+1
+3
+NULL
+
+# An EXISTS in a HAVING, which is a mark join rather than a single join, so its comparison is carried
+# by the join and has to be rewritten over the groups as well.
+
+query I
+SELECT k FROM grp GROUP BY k HAVING EXISTS (SELECT 1 FROM lk r WHERE r.k = grp.k AND r.v > 30) ORDER BY k;
+----
+2
+
+# An IN whose left hand side is the group key and whose body reads it too.
+
+query I
+SELECT k FROM grp GROUP BY k HAVING k IN (SELECT r.k FROM lk r WHERE r.v > grp.k * 10) ORDER BY k;
+----
+2
+
+# Two group keys with the correlation on the second of them, because the reference has to be pointed
+# at the group's position in the aggregate's output and not at the column's position in the table.
+# With one group key those two are the same number and a mistake there would not show.
+
+query III
+SELECT g, k, (SELECT max(v) FROM lk r WHERE r.k = grp.k) AS c FROM grp GROUP BY g, k ORDER BY g, k;
+----
+a	1	10
+b	2	40
+c	3	NULL
+d	NULL	NULL
+
+# The subquery grouping on the correlated column itself, so there is an aggregate on both sides of
+# the join and the outer column is a domain key on the inner one.
+
+query II
+SELECT k, (SELECT max(v) FROM lk r WHERE r.k = grp.k GROUP BY r.k) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	10
+2	40
+3	NULL
+NULL	NULL
+
+# The correlation two levels down, inside a second subquery. The query in the middle reads nothing of
+# the outer row itself and is correlated only because the query inside it is, which is the case that
+# needs the rewrite to walk the whole subtree rather than the one node that reads the column.
+
+query II
+SELECT k, (SELECT max(v) FROM lk r WHERE r.v > (SELECT min(v) FROM lk s WHERE s.k = grp.k)) AS c FROM grp GROUP BY k ORDER BY k;
+----
+1	70
+2	70
+3	NULL
+NULL	NULL
+
+# A correlation on a column that is grouped by an expression rather than on its own. The group holds
+# k + 0 and not k, so there is nothing over the grouping that answers for k and this is the missing
+# GROUP BY it looks like.
+
+statement error
+SELECT k + 0 AS e, (SELECT max(v) FROM lk r WHERE r.k = grp.k) AS c FROM grp GROUP BY k + 0 ORDER BY e;
+----
+column "k" must appear in the GROUP BY clause
+
+# A correlation on a column the block neither groups by nor aggregates, which is the line between
+# what a grouping makes available over itself and what it does not. The message names the column the
+# subquery reads and not the column the subquery produces.
+
+statement error
+SELECT k, (SELECT max(v) FROM lk r WHERE r.k = grp.w) AS c FROM grp GROUP BY k ORDER BY k;
+----
+column "w" must appear in the GROUP BY clause

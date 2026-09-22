@@ -143,13 +143,14 @@ SELECT k, max((SELECT 42)) FROM lift_inner GROUP BY k ORDER BY k;
 2	42
 NULL	42
 
-# A correlated one is refused rather than answered, which is rudb #1032 and not what DuckDB does.
-# DuckDB answers 1 a, 2 b and NULL NULL. It is here as the line this sits on: the correlation is on
-# the group key, so the value is one per group and there is an answer, and the reason there is no
-# plan for it is that the reference inside the subquery points at the table rather than at the
-# group. When that is fixed this record turns into the three rows above.
+# A correlated one is lifted too, as of rudb #1032. The correlation is on the group key, so the value
+# is one per group and there is an answer, and what used to be missing was a rewrite of the reference
+# inside the subquery from the table underneath the grouping to the group itself. This record was a
+# refusal until that landed.
 
-statement error
+query II
 SELECT k, (SELECT max(t) FROM lift_outer WHERE lift_outer.k = lift_inner.k) FROM lift_inner GROUP BY k ORDER BY k;
 ----
-a correlated subquery over a grouped query
+1	a
+2	b
+NULL	NULL
