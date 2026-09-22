@@ -594,15 +594,21 @@ fn engines(through_shells: bool) -> Result<Pair, HarnessError> {
 /// to do with the record. `crate::shell::Session` is the only thing here that does not forget, and
 /// it is the only driver a whole file can be run through and mean anything.
 ///
-/// It has two ways of not forgetting and this picks the slow one. The fast one keeps a database
-/// file between statements and lets the engine remember; the slow one replays every statement that
-/// left something behind in front of the next one. The file is the honest way to drive a shell and
-/// it is also the one rudb cannot carry yet, because native storage has no tag for a float, a time
-/// or a blob, so a corpus file that makes a column of one of those fails at the `CREATE TABLE`.
-/// That is tamnd/rudb#1244, #1245 and #1246. When they land this asks for the file instead, which
-/// is `Session::on_a_file()` and nothing else.
+/// It has two ways of not forgetting and this picks the file. A file lets the engine remember,
+/// which is what a database is for and what the corpus is trying to find out about. The other way
+/// replays every statement that left something behind in front of the next one, so a file of a
+/// thousand records answers its last question by running a thousand and one statements and never
+/// once asks the engine to remember anything.
+///
+/// The replay is still here and a session falls back to it on its own for the statements a file
+/// cannot carry, which are the ones in `shell::the_file_keeps_it`. What changed is which one is
+/// asked for first. It used to be the replay because rudb could not open a file holding a float, a
+/// time or a blob, and native storage has tags for all of those since tamnd/rudb#1255.
 fn sessions() -> Result<Pair, HarnessError> {
-    Ok((Box::new(Session::new(Shell::duckdb()?)), Box::new(Session::new(Shell::rudb()?))))
+    Ok((
+        Box::new(Session::new(Shell::duckdb()?).on_a_file()),
+        Box::new(Session::new(Shell::rudb()?).on_a_file()),
+    ))
 }
 
 /// Compare every statement in a file.

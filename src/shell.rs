@@ -382,21 +382,23 @@ fn without_duckdb_warnings(mut output: &str) -> &str {
 /// questions and drops it, and none of that works if the process running the second statement never
 /// heard the first one.
 ///
-/// There are two ways to do that here. The old one, which is still the default, rebuilds the
-/// session in front of every statement out of the statements that printed nothing. That set is
-/// exactly the one that leaves something behind and nothing on the screen: `CREATE`, `INSERT`,
-/// `DROP`, `SET`. A statement that printed rows is not replayed, both because replaying it would put
-/// its rows in front of the next answer where the reader expects one table, and because a query has
-/// nothing to leave behind. It costs a process per statement plus a replay of the file so far, which
-/// is quadratic, and it is also why a measurement of one record means nothing under it.
+/// There are two ways to do that here. The one the corpus asks for is [`Session::on_a_file`]. rudb
+/// writes its database file when the last handle on it goes away, tamnd/rudb#1226, lets a table
+/// that is already in the file take an append, tamnd/rudb#1228, and has a tag in native storage for
+/// every flat column type since tamnd/rudb#1255, so a session can be a file the way it is for
+/// anybody who uses either engine for real. The session gets a directory of its own with a database
+/// called `memory` in it, so `current_database()` answers the same word it answers with no file,
+/// and the file keeps the state, so nothing is replayed and what a record costs is what the record
+/// costs.
 ///
-/// The new one is [`Session::on_a_file`], and it is what the replay is meant to turn into. rudb
-/// writes its database file when the last handle on it goes away, tamnd/rudb#1226, and lets a table
-/// that is already in the file take an append, tamnd/rudb#1228, so a session can now be a file the
-/// way it is for anybody who uses either engine for real. The session gets a directory of its own
-/// with a database called `memory` in it, so `current_database()` answers the same word it answers
-/// with no file, and the file keeps the state, so nothing is replayed and what a record costs is
-/// what the record costs.
+/// The other one rebuilds the session in front of every statement out of the statements that
+/// printed nothing. That set is exactly the one that leaves something behind and nothing on the
+/// screen: `CREATE`, `INSERT`, `DROP`, `SET`. A statement that printed rows is not replayed, both
+/// because replaying it would put its rows in front of the next answer where the reader expects one
+/// table, and because a query has nothing to leave behind. It costs a process per statement plus a
+/// replay of the file so far, which is quadratic, and it is also why a measurement of one record
+/// means nothing under it. It is still here because it is the only way to carry the statements
+/// below that a file cannot.
 ///
 /// Two things a file does not keep, and they are handled differently because they cost differently.
 /// The first is the settings, which are per process, so `SET`, `RESET` and a `PRAGMA` that printed
@@ -406,12 +408,10 @@ fn without_duckdb_warnings(mut output: &str) -> &str {
 /// loaded extension. Those cannot be put in front of one statement without putting the whole file in
 /// front of it, so the first one turns the file off, deletes it and goes back to the replay.
 ///
-/// The file is not the default yet because rudb cannot write half the column types down.
-/// `CREATE TABLE t (x DOUBLE)` fails on a database with a file, and so does `FLOAT`, `HUGEINT`,
-/// `TIME`, `TIMESTAMPTZ`, `INTERVAL`, `UUID`, `BLOB`, `BIT`, and every nested type, which is
-/// tamnd/rudb#1244, tamnd/rudb#1245 and tamnd/rudb#1246. Four files in the committed corpus create a
-/// table with one of those in it. When #1244 and #1245 land the default flips, this paragraph goes,
-/// and `on_a_file` goes with it.
+/// One column type still cannot go in a file, which is a nested one, tamnd/rudb#1246. No committed
+/// corpus file makes a `LIST`, a `STRUCT` or a `MAP` column today, so nothing falls back over it
+/// yet, and a record that adds one will fail at its `CREATE TABLE` until that lands rather than
+/// quietly going slow.
 #[derive(Debug)]
 pub struct Session {
     /// The shell underneath, with no setup of its own.
@@ -447,9 +447,10 @@ impl Session {
 
     /// Keep the session in a database file rather than replaying it in front of every statement.
     ///
-    /// Opt in for now, for the reason on the type. Call it before the first statement: a session
-    /// that has already run something has its state in the replay and moving it is not a thing this
-    /// does.
+    /// What the corpus asks for. Call it before the first statement: a session that has already run
+    /// something has its state in the replay and moving it is not a thing this does. A session left
+    /// without it replays instead, which is what the tests below that are about the replay use and
+    /// what a caller driving statements a file cannot keep would want.
     #[must_use]
     pub fn on_a_file(mut self) -> Self {
         self.wanted = true;
