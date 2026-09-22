@@ -14,47 +14,49 @@ Early, and running. rudb executes queries now, so there is a conformance number,
 
 ```
 $ rudb-compat slt
-4106 files, 24237 passed, 48445 failed, which is 33.3 percent of what was attempted
+4163 files, 25837 passed, 48620 failed, which is 34.7 percent of what was attempted
 
-40843 records not attempted, by whose gap it is
+40961 records not attempted, by whose gap it is
       21358  excused   the file turned the record off itself
-      19419  engine    something rudb does not have, which is the real gap
-          0  harness   something this runner does not do, which is work here
+      19146  engine    something rudb does not have, which is the real gap
+        391  harness   something this runner does not do, which is work here
          66  machine   something the machine this ran on does not have
 ```
 
 That is DuckDB's own `sqllogictest` corpus at `v2.0-cyanoptera`, every `.test` file under `test/sql`, run against rudb on every commit and published on the run summary. The M2 exit criterion is above 60 percent, so the distance between those two numbers is the work list for the milestone.
 
-Counting the 48445 failures one at a time says almost nothing, because a corpus file is a script and the first thing that breaks in it takes everything after it down with it. 21991 of them are a name the engine could not resolve and most of those names are tables the file created two lines earlier in a `CREATE TABLE` that was refused. So the useful count is per file: take the first failure in each of the 3221 files that have one, call that the root cause, and charge every later failure in the same file to it. `scripts/rootcause` does that counting over the TSV that `rudb-compat slt --out` writes, and it exists so that the buckets are the same buckets twice: a table hand sorted once is not a table two runs can be compared through. Ranked that way, the corpus looks like this.
+Counting the 48620 failures one at a time says almost nothing, because a corpus file is a script and the first thing that breaks in it takes everything after it down with it. 22307 of them are a name the engine could not resolve and most of those names are tables the file created two lines earlier in a `CREATE TABLE` that was refused. So the useful count is per file: take the first failure in each of the 3267 files that have one, call that the root cause, and charge every later failure in the same file to it. `scripts/rootcause` does that counting over the TSV that `rudb-compat slt --out` writes, and it exists so that the buckets are the same buckets twice: a table hand sorted once is not a table two runs can be compared through. The rows come out in a fixed order for the same reason, so that two runs line up line by line, which means the order was the ranking on the day it was set and is not the ranking now. Counted that way, the corpus looks like this.
 
 ```
 records  files  what the first failure in the file was
-   7509    219  ATTACH, DETACH and USE, and the qualified names that follow from them
-   7307    445  a scalar or table function name the engine does not have
-   6123    292  PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column
-   3379    364  COPY and the CSV and Parquet readers
-   3335    234  a LIST, STRUCT or MAP written out in a query
-   2227    167  a setting or a pragma the engine does not have a name for
-   1513    152  BEGIN, COMMIT and ROLLBACK
-   1468     93  CREATE TYPE, an enum, or a type name the parser does not know
-   1468     61  CREATE SCHEMA and qualified schema names
-    999     46  sequences and nextval
-    804     17  CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW
-    763     20  CREATE TRIGGER
+   7564    223  ATTACH, DETACH and USE, and the qualified names that follow from them
+   7718    446  a scalar or table function name the engine does not have
+   6132    294  PRIMARY KEY, UNIQUE, CHECK, DEFAULT or a generated column
+   3621    376  COPY and the CSV and Parquet readers
+   3502    249  a LIST, STRUCT or MAP written out in a query
+   2527    184  a setting or a pragma the engine does not have a name for
+   1515    154  BEGIN, COMMIT and ROLLBACK
+   1492     98  CREATE TYPE, an enum, or a type name the parser does not know
+   1507     65  CREATE SCHEMA and qualified schema names
+   1008     46  sequences and nextval
+      0      0  CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW
+    770     21  CREATE TRIGGER
     635     42  CREATE MACRO
-    627     63  PREPARE, EXECUTE and DEALLOCATE
-    559     38  RECURSIVE and MATERIALIZED on a WITH
-    357     77  CREATE INDEX
+    649     66  PREPARE, EXECUTE and DEALLOCATE
+    295     30  RECURSIVE and MATERIALIZED on a WITH
     336     17  EXPORT_STATE on an aggregate
-    336     56  ALTER
+    327     56  ALTER
+    398     84  CREATE INDEX
     199     16  a script of more than one statement
-    128     19  a dependent join that reached execution
-   8373    783  everything else, no single cause above 289 records
+      6      2  a dependent join that reached execution
+   8419    798  everything else
 ```
 
-The function row is what moved this run. It was 8527 records over 588 files and it is 7307 over 445 now, so 143 files got past the first wall they hit. Two things did that. The nineteen pragmas that are a statement, which is every name beginning with `enable_` or `disable_` plus `force_checkpoint` and `verify_parallelism`, now run and write the setting each one stands for. And `PRAGMA show_tables`, `PRAGMA show_databases` and `PRAGMA show_tables_expanded` answer, along with the `SHOW` and `DESCRIBE` statements that spell them.
+Three rows moved this run and two of them went to nearly nothing. `CREATE TEMPORARY TABLE` and `CREATE TEMPORARY VIEW` were 804 records over 17 files and are zero over zero, because both statements work now. The dependent join that reached execution was 128 over 19 and is 6 over 2, which is the subquery unnesting in D3 arriving: a correlated subquery that no rule could take used to come out the other side of the optimizer still a dependent join and fail there, and almost none of them do now. `RECURSIVE` and `MATERIALIZED` on a `WITH` went from 559 over 38 to 295 over 30.
 
-The settings row went up rather than down, from 1999 to 2227, and that is what progress looks like in a corpus of scripts. A file that used to stop on line 3 now runs to line 40 and stops on the next thing it needs, so records move from the row that was blocking them to the row behind it. Every row below the top two went up for the same reason while the total went down by 281.
+Most of the other rows went up while the total came down, and that is what progress looks like in a corpus of scripts. A file that used to stop on line 3 now runs to line 40 and stops on the next thing it needs, so records move from the row that was blocking them to the row behind it. The function row going from 7307 to 7718 and `CREATE INDEX` going from 357 to 398 are both that, not a regression.
+
+What the table says about where the pass rate lives is the same thing it said last time. The top rows are statements rather than queries, and the four largest are `ATTACH` and friends, the missing function names, the table constraints, and `COPY`. None of those is query planning, so the corpus number moves when the statements at the top of the files start working and not before.
 
 What is left in the settings row is the pragma only names that the pin answers as a pragma and does not list in `duckdb_settings()`, plus the values a setting will not take. The four pragmas upstream deprecated need to print a warning rather than only succeeding, and `PRAGMA enable_logging` needs the message the pin gives, which sends the caller to `CALL`.
 
