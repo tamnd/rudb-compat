@@ -1,0 +1,282 @@
+# name: corpus/slt/window_range_interval.test
+# description: a RANGE frame whose distance is an interval, over each of the date and time types
+# group: [window]
+
+# A RANGE frame measures its distance in the values of the order key rather than in rows, so the
+# engine works out where the key would have to be and then finds that place among the rows. When the
+# key is a date or a time the distance is an interval, and that brings in two things that do not
+# come up when the key is a number.
+#
+# The first is that the arithmetic can answer in a wider type than the key it was handed. DATE plus
+# INTERVAL is a timestamp in both engines, so the place being looked for is a timestamp while every
+# key in the partition is still a date, and the two have to be compared in the wider of the two. The
+# alternative of reading the place back as a date throws away the part of the distance smaller than a
+# day, which is what INTERVAL '36' HOUR PRECEDING is made of.
+#
+# The second is that a time is a clock and not a point in history. Subtracting past the start of the
+# day comes round to the end of it, so TIME '00:30:00' minus INTERVAL '2' HOUR is 22:30:00 in both
+# engines and that is the right answer for the subtraction written on its own. A frame bound is not
+# that question. A bound written PRECEDING that reaches back past the start of the day covers from
+# the first row of the partition, and one written FOLLOWING that reaches past the last moment of the
+# day covers to the last row. The records below hold both readings against each other, including the
+# ones where the distance is more than a whole day and the wrapped answer comes back round onto a
+# believable side again.
+#
+# EXCLUDE is in here as well, on the same frames, because the two are usually skipped together and a
+# frame that is right in the first place can still drop the wrong rows out of it.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE ev (d DATE, t TIMESTAMP, g INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO ev VALUES (DATE '2024-01-01', TIMESTAMP '2024-01-01 00:00:00', 1, 10), (DATE '2024-01-02', TIMESTAMP '2024-01-02 06:00:00', 1, 20), (DATE '2024-01-04', TIMESTAMP '2024-01-04 12:00:00', 1, 30), (DATE '2024-01-05', TIMESTAMP '2024-01-05 18:00:00', 2, 40), (DATE '2024-01-09', TIMESTAMP '2024-01-09 00:00:00', 2, 50);
+
+statement ok
+CREATE TABLE tt (tm TIME, v INTEGER);
+
+statement ok
+INSERT INTO tt VALUES (TIME '00:30:00', 1), (TIME '01:00:00', 2), (TIME '23:00:00', 4);
+
+statement ok
+CREATE TABLE zz (z TIMESTAMPTZ, v INTEGER);
+
+statement ok
+INSERT INTO zz VALUES (TIMESTAMPTZ '2024-01-01 00:00:00+00', 10), (TIMESTAMPTZ '2024-01-02 06:00:00+00', 20), (TIMESTAMPTZ '2024-01-04 12:00:00+00', 30);
+
+# A day of distance over a date key. The gap from the second row to the third is two days, so the
+# third row sees only itself.
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) FROM ev ORDER BY d;
+----
+2024-01-01	10
+2024-01-02	30
+2024-01-04	30
+2024-01-05	70
+2024-01-09	50
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '2' DAY PRECEDING AND INTERVAL '1' DAY FOLLOWING) FROM ev ORDER BY d;
+----
+2024-01-01	30
+2024-01-02	30
+2024-01-04	90
+2024-01-05	70
+2024-01-09	50
+
+# Thirty six hours is a day and a half, which no whole number of days can stand in for. The same
+# distance over the timestamp column, where the time of day is part of every key as well.
+
+query TI
+SELECT t, sum(v) OVER (ORDER BY t RANGE BETWEEN INTERVAL '36' HOUR PRECEDING AND CURRENT ROW) FROM ev ORDER BY t;
+----
+2024-01-01 00:00:00	10
+2024-01-02 06:00:00	30
+2024-01-04 12:00:00	30
+2024-01-05 18:00:00	70
+2024-01-09 00:00:00	50
+
+# The distance does not reach across a partition even when the keys are close enough for it.
+
+query ITI
+SELECT g, d, sum(v) OVER (PARTITION BY g ORDER BY d RANGE BETWEEN INTERVAL '3' DAY PRECEDING AND CURRENT ROW) FROM ev ORDER BY g, d;
+----
+1	2024-01-01	10
+1	2024-01-02	30
+1	2024-01-04	60
+2	2024-01-05	40
+2	2024-01-09	50
+
+# Preceding means earlier in the order that was asked for and not smaller, so under DESC the same
+# words reach towards the later dates.
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d DESC RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) FROM ev ORDER BY d;
+----
+2024-01-01	30
+2024-01-02	20
+2024-01-04	70
+2024-01-05	40
+2024-01-09	50
+
+# EXCLUDE on the same frame. No two rows here are peers, so CURRENT ROW and GROUP drop the same row
+# and TIES drops nothing, and a frame left with no rows in it sums to null rather than to zero.
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '2' DAY PRECEDING AND CURRENT ROW EXCLUDE CURRENT ROW) FROM ev ORDER BY d;
+----
+2024-01-01	NULL
+2024-01-02	10
+2024-01-04	20
+2024-01-05	30
+2024-01-09	NULL
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '2' DAY PRECEDING AND CURRENT ROW EXCLUDE GROUP) FROM ev ORDER BY d;
+----
+2024-01-01	NULL
+2024-01-02	10
+2024-01-04	20
+2024-01-05	30
+2024-01-09	NULL
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d RANGE BETWEEN INTERVAL '2' DAY PRECEDING AND CURRENT ROW EXCLUDE TIES) FROM ev ORDER BY d;
+----
+2024-01-01	10
+2024-01-02	30
+2024-01-04	50
+2024-01-05	70
+2024-01-09	50
+
+# A month is longer than the whole table, so every row sees everything before it.
+
+query TI
+SELECT d, count(*) OVER (ORDER BY d RANGE BETWEEN INTERVAL '1' MONTH PRECEDING AND CURRENT ROW) FROM ev ORDER BY d;
+----
+2024-01-01	1
+2024-01-02	2
+2024-01-04	3
+2024-01-05	4
+2024-01-09	5
+
+query TI
+SELECT d, sum(v) OVER (ORDER BY d RANGE BETWEEN UNBOUNDED PRECEDING AND INTERVAL '1' DAY FOLLOWING) FROM ev ORDER BY d;
+----
+2024-01-01	30
+2024-01-02	30
+2024-01-04	100
+2024-01-05	100
+2024-01-09	150
+
+# The clock. Two hours back from half past midnight reaches out of the day, so that row sees only
+# itself, and two hours back from one o'clock reaches out as well and sees the row before it. The
+# last row is far enough into the day that the distance stays inside it.
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '2' HOUR PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	4
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN CURRENT ROW AND INTERVAL '2' HOUR FOLLOWING) FROM tt ORDER BY tm;
+----
+00:30:00	3
+01:00:00	2
+23:00:00	4
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '2' HOUR PRECEDING AND INTERVAL '2' HOUR FOLLOWING) FROM tt ORDER BY tm;
+----
+00:30:00	3
+01:00:00	3
+23:00:00	4
+
+# Twenty five hours back from eleven at night comes round to ten at night, which is earlier in the
+# day than the row it came from and so looks like an ordinary bound. The distance it asks for still
+# reaches back past the start of the day, so the row sees the whole table.
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '25' HOUR PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	7
+
+# A whole day, written three ways. The subtraction on its own throws all three away and leaves the
+# time where it was, so a frame that took the answer at face value would cover only the peer group.
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	7
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN CURRENT ROW AND INTERVAL '1' DAY FOLLOWING) FROM tt ORDER BY tm;
+----
+00:30:00	7
+01:00:00	6
+23:00:00	4
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '24' HOUR PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	7
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '1' MONTH PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	7
+
+# Half an hour stays inside the day from every row here, which is the case the rest of these are
+# being told apart from.
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '30' MINUTE PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	4
+
+# The clock under DESC, where the word and the direction of the arithmetic come apart. A bound
+# written PRECEDING adds rather than subtracts here, so it is the last row that reaches out of the
+# day and not the first two.
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm DESC RANGE BETWEEN INTERVAL '2' HOUR PRECEDING AND CURRENT ROW) FROM tt ORDER BY tm;
+----
+00:30:00	3
+01:00:00	2
+23:00:00	4
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm DESC RANGE BETWEEN CURRENT ROW AND INTERVAL '2' HOUR FOLLOWING) FROM tt ORDER BY tm;
+----
+00:30:00	1
+01:00:00	3
+23:00:00	4
+
+# Both ends of the frame on the same side of the row, which covers nothing on this table however the
+# ends are worked out. A bound held at the end of the day has to leave these empty rather than turn
+# them into the whole partition.
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '2' HOUR PRECEDING AND INTERVAL '1' HOUR PRECEDING) FROM tt ORDER BY tm;
+----
+00:30:00	NULL
+01:00:00	NULL
+23:00:00	NULL
+
+query TI
+SELECT tm, sum(v) OVER (ORDER BY tm RANGE BETWEEN INTERVAL '1' HOUR FOLLOWING AND INTERVAL '2' HOUR FOLLOWING) FROM tt ORDER BY tm;
+----
+00:30:00	NULL
+01:00:00	NULL
+23:00:00	NULL
+
+# A zoned key. The key itself is left out of the result because printing one depends on the session
+# time zone, and the distance is the thing under test rather than the printing.
+
+query II
+SELECT v, sum(v) OVER (ORDER BY z RANGE BETWEEN INTERVAL '36' HOUR PRECEDING AND CURRENT ROW) FROM zz ORDER BY z;
+----
+10	10
+20	30
+30	30
+
+query II
+SELECT v, sum(v) OVER (ORDER BY z RANGE BETWEEN INTERVAL '1' DAY PRECEDING AND INTERVAL '2' DAY FOLLOWING) FROM zz ORDER BY z;
+----
+10	30
+20	20
+30	30
