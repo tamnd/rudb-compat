@@ -38,22 +38,18 @@ SELECT character_set_name, character_repertoire, form_of_use, default_collate_na
 ----
 UTF8	UCS	UTF8	ucs_basic
 
-# The read that the record below leans on is written as a CREATE TABLE AS rather than as the plain
-# select above it, and the reason is the shell runner rather than either engine. It keeps a file's
-# session by replaying the statements that printed nothing in front of the next one, because there
-# is no database file to keep state in yet, so a select is run and then forgotten. A statement that
-# leaves a table behind is replayed, and reading the view is what binds it either way.
+# The read that fills those two columns in and the question about them are one statement, and they
+# have to be, because whether a view is bound is state a process owns rather than state a database
+# holds. A runner that keeps a session in a file runs each statement in a process of its own, so a
+# read in one statement and a question in the next would answer false on both engines and say
+# nothing about either of them. Written this way it is the same answer whatever the runner does,
+# and the reason it works is the same on both: the whole statement is bound before any of it runs,
+# so the subquery has bound the view by the time duckdb_views() is scanned.
 
-statement ok
-CREATE TABLE read_once AS SELECT * FROM information_schema.character_sets;
-
-query IT
-SELECT column_count, is_bound FROM duckdb_views() WHERE view_name = 'character_sets';
+query IIT
+SELECT (SELECT count(*) FROM information_schema.character_sets), column_count, is_bound FROM duckdb_views() WHERE view_name = 'character_sets';
 ----
-8	true
-
-statement ok
-DROP TABLE read_once;
+1	8	true
 
 statement ok
 CREATE TABLE t (a INTEGER NOT NULL, b VARCHAR, c DECIMAL(9,2));

@@ -600,13 +600,14 @@ fn engines(through_shells: bool) -> Result<Pair, HarnessError> {
 /// of a thousand statements answers its last question by running a thousand and one and never once
 /// asks the engine to remember anything.
 ///
-/// This is `oracles` and `sqlsmith` and not the committed corpus, which drives its own session in
-/// `tests/corpus.rs` and is still on the replay. Two things stop it. A view is not written to a
-/// native file, tamnd/rudb#1264, and a nullable `VARCHAR` read back from one raises an internal
-/// error when it becomes a domain key, tamnd/rudb#1265. Between them that is sixteen of the 1121
-/// records. The seventeenth is `is_bound` in `duckdb_views()`, which is per process state that a
-/// driver spawning a process per statement cannot carry on either engine, so that record belongs
-/// to the replay for good rather than to a list of things to fix.
+/// This is `oracles` and `sqlsmith`. The committed corpus drives its own session in
+/// `tests/corpus.rs` and it is on a file too now. It was not for a while, because a view was not
+/// written to a native file, tamnd/rudb#1264, and a nullable `VARCHAR` read back from one raised an
+/// internal error when it became a domain key, tamnd/rudb#1265, which was sixteen of the 1121
+/// records between them. Both are fixed. The seventeenth was `is_bound` in `duckdb_views()`, which
+/// is per process state that a driver spawning a process per statement cannot carry on either
+/// engine, and that record is now written as one statement which reads the view and asks about it
+/// at once, because the whole statement is bound before any of it runs on both engines.
 ///
 /// The replay is still here either way, and a session falls back to it on its own for the
 /// statements a file cannot carry, which are the ones in `shell::the_file_keeps_it`.

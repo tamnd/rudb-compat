@@ -200,7 +200,7 @@ fn every_file_in_the_committed_corpus_passes_through_the_shell_too_body() {
     let through_library =
         run_path(&mut library, Path::new("corpus/slt"), false).expect("the corpus is there");
 
-    let mut session = Session::new(shell);
+    let mut session = Session::new(shell).on_a_file();
     let summary = run_path(&mut session, Path::new("corpus/slt"), false).expect("the corpus is on");
 
     assert!(
