@@ -1,0 +1,260 @@
+# name: corpus/slt/temporary_table.test
+# description: CREATE TEMPORARY TABLE and CREATE TEMPORARY VIEW, where they live and what the catalog says about them
+# group: [ddl]
+
+# A temporary entry goes into the temp database and its main schema, and nowhere else. Every way of
+# writing the name that is accepted lands in the same place, whether that is a bare name, temp.t,
+# main.t or temp.main.t, so the four spellings are four ways of saying one thing rather than four
+# different destinations.
+#
+# The part worth pinning is that reads and creates do not use the same search path. A read puts
+# temp.main at the front, so a temporary table hides a stored one of the same name and every later
+# select finds the temporary one. A create leaves temp.main out, so CREATE TABLE t after a
+# temporary t makes a second t in the default database rather than failing. That means the two
+# tables exist at once under one name, which is the whole reason temp is a separate database and
+# not a flag on the table.
+#
+# The catalog tables have one rule that holds nowhere else. The temp database is internal and so is
+# its schema, but a table somebody put in it is not internal, so duckdb_databases and duckdb_schemas
+# say true for the same object that duckdb_tables, duckdb_views and duckdb_columns say false for.
+# Everywhere else in the catalog those two questions have the same answer.
+#
+# Every expectation was taken off the pinned DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE t (a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (99)
+
+statement ok
+CREATE TEMPORARY TABLE t (a INTEGER)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+# A bare name finds the temporary one, and so does every spelling that does not say which database
+# it means. Only naming memory out loud reaches the stored one.
+
+query I
+SELECT a FROM t
+----
+1
+
+query I
+SELECT a FROM temp.t
+----
+1
+
+query I
+SELECT a FROM temp.main.t
+----
+1
+
+query I
+SELECT a FROM main.t
+----
+1
+
+query I
+SELECT a FROM memory.main.t
+----
+99
+
+# Both tables are there at once under the one name, and only one of them is temporary.
+
+query TTTTT
+SELECT database_name, schema_name, table_name, internal, temporary FROM duckdb_tables() ORDER BY database_name
+----
+memory	main	t	false	false
+temp	main	t	false	true
+
+# The database and the schema holding it are internal all the same, which is the pair that comes
+# apart only here.
+
+query TT
+SELECT database_name, internal FROM duckdb_databases() ORDER BY database_name
+----
+memory	false
+system	true
+temp	true
+
+query TTT
+SELECT database_name, schema_name, internal FROM duckdb_schemas() WHERE database_name IN ('memory', 'temp') ORDER BY database_name
+----
+memory	main	true
+temp	main	true
+
+query TTTT
+SELECT database_name, table_name, column_name, internal FROM duckdb_columns() WHERE database_name IN ('memory', 'temp') ORDER BY database_name
+----
+memory	t	a	false
+temp	t	a	false
+
+# information_schema calls a temporary table a LOCAL TEMPORARY and a stored one a BASE TABLE.
+
+query TTTT
+SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables ORDER BY table_catalog
+----
+memory	main	t	BASE TABLE
+temp	main	t	LOCAL TEMPORARY
+
+# The listings that say what is there to read show both, while the listing of databases a name can
+# be written into leaves temp out. Two different questions and two different answers.
+
+query T
+PRAGMA show_tables
+----
+t
+t
+
+query TTTTTT
+PRAGMA show_tables_expanded
+----
+memory	main	t	[a]	[INTEGER]	false
+temp	main	t	[a]	[INTEGER]	true
+
+query T
+PRAGMA show_databases
+----
+memory
+
+# A drop takes the one a bare name finds, so dropping twice leaves neither.
+
+statement ok
+DROP TABLE t
+
+query T
+SELECT database_name FROM duckdb_tables() WHERE table_name = 't'
+----
+memory
+
+statement ok
+DROP TABLE t
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 't'
+----
+0
+
+# Four accepted spellings for a table and two for a view, all landing in temp.main.
+
+statement ok
+CREATE TEMPORARY TABLE one (a INTEGER)
+
+statement ok
+CREATE TEMPORARY TABLE temp.two (a INTEGER)
+
+statement ok
+CREATE TEMPORARY TABLE main.three (a INTEGER)
+
+statement ok
+CREATE TEMPORARY TABLE temp.main.four (a INTEGER)
+
+statement ok
+CREATE TEMPORARY VIEW five AS SELECT 1 AS a
+
+statement ok
+CREATE TEMPORARY VIEW main.six AS SELECT 1 AS a
+
+query TTT
+SELECT schema_name, table_name, temporary FROM duckdb_tables() WHERE database_name = 'temp' ORDER BY table_name
+----
+main	four	true
+main	one	true
+main	three	true
+main	two	true
+
+query TTTT
+SELECT schema_name, view_name, internal, temporary FROM duckdb_views() WHERE database_name = 'temp' ORDER BY view_name
+----
+main	five	false	true
+main	six	false	true
+
+# A temporary view is a plain VIEW to information_schema, not a LOCAL TEMPORARY. Only the tables
+# get the temporary word there.
+
+query TTT
+SELECT table_catalog, table_name, table_type FROM information_schema.tables WHERE table_catalog = 'temp' ORDER BY table_name
+----
+temp	five	VIEW
+temp	four	LOCAL TEMPORARY
+temp	one	LOCAL TEMPORARY
+temp	six	VIEW
+temp	three	LOCAL TEMPORARY
+temp	two	LOCAL TEMPORARY
+
+# Naming a database that is actually attached is the writer saying where they meant, and it is
+# refused rather than quietly redirected.
+
+statement error
+CREATE TEMPORARY TABLE memory.seven (a INTEGER)
+----
+TEMPORARY table names can *only* use the "temp" catalog
+
+statement error
+CREATE TEMPORARY TABLE memory.main.seven (a INTEGER)
+----
+TEMPORARY table names can *only* use the "temp" catalog
+
+statement error
+CREATE TEMPORARY TABLE system.main.seven (a INTEGER)
+----
+TEMPORARY table names can *only* use the "temp" catalog
+
+statement error
+CREATE TEMPORARY VIEW memory.seven AS SELECT 1 AS a
+----
+TEMPORARY table names can *only* use the "temp" catalog
+
+# A first part that is no database at all reads as a schema instead, and temp holds only main, so
+# this is a missing schema rather than a wrong database.
+
+statement error
+CREATE TEMPORARY TABLE nowhere.eight (a INTEGER)
+----
+Schema with name nowhere does not exist!
+
+# The other half of the same rule is a different sentence. A create that is not temporary cannot
+# name temp.
+
+statement error
+CREATE TABLE temp.nine (i INTEGER)
+----
+Only TEMPORARY table names can use the "temp" catalog
+
+statement error
+CREATE VIEW temp.ten AS SELECT 1
+----
+Only TEMPORARY table names can use the "temp" catalog
+
+# A temporary table takes the clauses a stored one takes, and a stored table of the same name is
+# left alone by all of them.
+
+statement ok
+CREATE TABLE t (a INTEGER)
+
+statement ok
+CREATE TEMPORARY TABLE t AS SELECT 7 AS a, 8 AS b
+
+query II
+SELECT a, b FROM t
+----
+7	8
+
+statement ok
+CREATE OR REPLACE TEMPORARY TABLE t (a INTEGER, b INTEGER, c INTEGER)
+
+query TI
+SELECT database_name, column_count FROM duckdb_tables() WHERE table_name = 't' ORDER BY database_name
+----
+memory	1
+temp	3
+
+statement ok
+CREATE TEMPORARY TABLE IF NOT EXISTS t (a INTEGER)
+
+statement error
+CREATE TEMPORARY TABLE t (a INTEGER)
+----
+Table with name "t" already exists!
