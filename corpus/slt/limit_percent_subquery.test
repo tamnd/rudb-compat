@@ -1,0 +1,249 @@
+# name: corpus/slt/limit_percent_subquery.test
+# description: a LIMIT written as a percentage whose share or offset is a subquery, read off the rows while the query runs
+# group: [smoke]
+
+# A percentage limit has two ends and neither of them has to be a number the query wrote out. A
+# subquery has to run before there is a value, so the value is joined in under the limit as a column
+# of every row the limit sees, read off the first chunk that reaches it, and kept for the rest of the
+# query. The column is one the query never asked for, so a projection over the limit drops it again,
+# which is what the star records here are for.
+#
+# Only the % sign can hold a subquery. LIMIT (SELECT 30) PERCENT is a syntax error in both engines,
+# because the grammar will not put the word after a closing bracket, so every share written as a
+# subquery below uses the sign. The offset takes either spelling, since it is written after the share
+# rather than in front of it.
+#
+# The share goes through the same cast a written share goes through, which is to DOUBLE and not to
+# the BIGINT a row count is cast to, so (SELECT true)% is one percent and not one row. A null share
+# or a subquery that answers no row is no limit at all, the same as a written NULL.
+#
+# The range check is the part worth pinning. A share the binder can work out is refused while the
+# query is planned, and a share nobody has until the query runs is checked where the value turns up,
+# where there are two different sentences for the two ends of the range. Above a hundred is the same
+# out of range sentence a written share gets. Below nought names the value and says a percentage
+# cannot be negative, which is a sentence nothing else says and is not what LIMIT -1% answers. An
+# input with no rows in it reads neither end, so a share of minus one over an empty input answers
+# nothing rather than raising.
+#
+# The records are grouped as the share, the offset, both ends at once, the column that is not in the
+# answer, the cast, the nulls, the two range sentences, the empty input, the spelling that is refused
+# and a run over enough rows to cross a chunk boundary. Every expectation was taken off the pinned
+# DuckDB and not out of rudb.
+
+statement ok
+CREATE TABLE ten (i INTEGER);
+
+statement ok
+INSERT INTO ten VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9);
+
+# The share is a subquery and the answer is the same three rows LIMIT 30 PERCENT gives.
+
+query I
+SELECT i FROM ten LIMIT (SELECT 30)%;
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT (SELECT count(*) * 10 FROM ten WHERE i < 3)%;
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten ORDER BY i DESC LIMIT (SELECT 30)%;
+----
+9
+8
+7
+
+# The offset is a subquery and the share is written out. The share is still of the whole input and
+# the offset still comes after it, so this is three rows starting at the third.
+
+query I
+SELECT i FROM ten LIMIT 30 PERCENT OFFSET (SELECT 2);
+----
+2
+3
+4
+
+query I
+SELECT i FROM ten LIMIT 30 PERCENT OFFSET (SELECT count(*) FROM ten WHERE i < 3);
+----
+3
+4
+5
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT 100 PERCENT OFFSET (SELECT 20));
+----
+0
+
+# Both ends at once, which is two values joined in and two columns dropped again.
+
+query I
+SELECT i FROM ten LIMIT (SELECT 30)% OFFSET 1;
+----
+1
+2
+3
+
+query I
+SELECT i FROM ten LIMIT (SELECT 30)% OFFSET (SELECT 1);
+----
+1
+2
+3
+
+# A star is what says the joined in column is not a column of the answer. Three rows of one column
+# each, and not three rows of two.
+
+query I
+SELECT * FROM ten LIMIT (SELECT 30)%;
+----
+0
+1
+2
+
+query I
+SELECT * FROM ten LIMIT (SELECT 30)% OFFSET (SELECT 0);
+----
+0
+1
+2
+
+# The cast is to DOUBLE, so a string of digits is a share, a share with a fraction in it is kept as
+# one until the rounding at the end, and true is one percent rather than one row.
+
+query I
+SELECT i FROM ten LIMIT (SELECT '30')%;
+----
+0
+1
+2
+
+query I
+SELECT i FROM ten LIMIT (SELECT 35.5)%;
+----
+0
+1
+2
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT (SELECT true)%);
+----
+0
+
+# A null share and a subquery that answers no row are both no limit at all. A null offset is nought
+# rows skipped, which is the other half of the same rule.
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT (SELECT NULL)%);
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten LIMIT (SELECT i FROM ten WHERE false)%);
+----
+10
+
+query I
+SELECT i FROM ten LIMIT 30 PERCENT OFFSET (SELECT NULL);
+----
+0
+1
+2
+
+# A share above a hundred is the out of range sentence, the same one a written share gets.
+
+statement error
+SELECT i FROM ten LIMIT (SELECT 101)%;
+----
+Limit percent out of range, should be between 0% and 100%
+
+statement error
+SELECT i FROM ten LIMIT (SELECT 100.5)%;
+----
+Limit percent out of range, should be between 0% and 100%
+
+statement error
+SELECT i FROM ten LIMIT (SELECT 'nan'::DOUBLE)%;
+----
+Limit percent out of range, should be between 0% and 100%
+
+# A share below nought is the other sentence, which names the value and appears nowhere else. It is
+# not the sentence LIMIT -10% answers, and that difference is the pin's and not ours.
+
+statement error
+SELECT i FROM ten LIMIT (SELECT -1)%;
+----
+Percentage value(-1.000000) can't be negative
+
+statement error
+SELECT i FROM ten LIMIT (SELECT -0.5)%;
+----
+Percentage value(-0.500000) can't be negative
+
+# A value the cast cannot take is the cast's own refusal, and it names DOUBLE here.
+
+statement error
+SELECT i FROM ten LIMIT (SELECT 'abc')%;
+----
+Could not convert string 'abc' to DOUBLE
+
+# An input with no rows reads neither end, because there is nothing to read the value off and no
+# rows to take a share of, so the answer does not depend on the value at all.
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten WHERE false LIMIT (SELECT -1)%);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten WHERE false LIMIT (SELECT 101)%);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT i FROM ten WHERE false LIMIT 30 PERCENT OFFSET (SELECT -1));
+----
+0
+
+# The word form will not take a subquery in front of it, which is a rule of the grammar rather than
+# of the limit.
+
+statement error
+SELECT i FROM ten LIMIT (SELECT 30) PERCENT;
+----
+syntax error at or near "PERCENT"
+
+# Enough rows to cross a chunk boundary, so the share is counted across the whole input rather than
+# within whatever chunk the rows turned up in, and the value is read once rather than once a chunk.
+
+statement ok
+CREATE TABLE big (i INTEGER);
+
+statement ok
+INSERT INTO big SELECT * FROM range(5000);
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big LIMIT (SELECT 33)%);
+----
+1650	0	1649
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big LIMIT (SELECT 33)% OFFSET (SELECT 2500));
+----
+1650	2500	4149
+
+query III
+SELECT count(*), min(i), max(i) FROM (SELECT i FROM big WHERE i % 2 = 0 LIMIT (SELECT 10)%);
+----
+250	0	498
+
+query I
+SELECT count(*) FROM (SELECT i FROM big WHERE i > 100000 LIMIT (SELECT 50)%);
+----
+0
