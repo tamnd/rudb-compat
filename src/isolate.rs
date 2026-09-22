@@ -717,6 +717,7 @@ mod tests {
                 detail: "wanted 1\tgot 2".to_owned(),
             }],
             kinds: kinds(),
+            timings: Vec::new(),
         };
         let back = decode("b.test", &encode(&summary));
         assert_eq!(back.files, 1);

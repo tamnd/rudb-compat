@@ -58,6 +58,7 @@ pub mod rudb;
 pub mod shard;
 pub mod shell;
 pub mod slt;
+pub mod spend;
 pub mod sqlsmith;
 pub mod suite;
 pub mod sweep;

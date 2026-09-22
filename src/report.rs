@@ -41,6 +41,7 @@ use crate::engine::{Engine, HarnessError};
 use crate::isolate::Isolated;
 use crate::kinds::Kinds;
 use crate::resource::{Ratios, Spread};
+use crate::spend::Spends;
 use crate::vendor;
 
 /// Where the pages go when nobody says otherwise, relative to the crate root.
@@ -148,6 +149,45 @@ pub const COST_COLUMNS: [&str; 22] = [
     "refused",
 ];
 
+/// The file every corpus cost run appends its rows to, beside the pages.
+///
+/// A fourth file, and not a fourth set of columns in [`COSTS`], because the two measure different
+/// things and half the columns of either would be empty in the other. A benchmark row carries a
+/// load share and a corpus record has no load to take a share of, and a corpus row carries the two
+/// one sided counts that say whether the ratios are over a set of records nobody chose, which a
+/// benchmark run has no equivalent of.
+pub const RECORDS: &str = "record.tsv";
+
+/// The columns of that file, in order.
+///
+/// One run writes several rows: one for the whole corpus, one per file, and one per record in the
+/// worst [`WORST`]. The rows of a run share the `when` and `machine` fields, which is how they are
+/// read back as one measurement, the same arrangement [`COST_COLUMNS`] uses and for the same
+/// reason, which is that one row of this file should say what it is a measurement of on its own.
+pub const RECORD_COLUMNS: [&str; 21] = [
+    "when",
+    "machine",
+    "rudb",
+    "rudb_commit",
+    "compat_commit",
+    "duckdb",
+    "scope",
+    "what",
+    "records",
+    "time",
+    "time_low",
+    "time_high",
+    "cpu",
+    "cpu_low",
+    "cpu_high",
+    "memory",
+    "memory_low",
+    "memory_high",
+    "measured",
+    "one_sided",
+    "unmeasured",
+];
+
 /// How many of the worst benchmarks a cost run prints and records.
 ///
 /// Section 11.2 says twenty and says why: an engine that is even on average and two hundred times
@@ -163,6 +203,12 @@ const SUITE: &str = "suite";
 
 /// A row that is one benchmark on its own.
 const BENCHMARK: &str = "benchmark";
+
+/// A row that is one file of the sqllogictest corpus.
+const FILE: &str = "file";
+
+/// A row that is one record of the sqllogictest corpus on its own.
+const RECORD: &str = "record";
 
 /// Everything about the run that is not a number out of it.
 ///
@@ -548,6 +594,162 @@ impl Cost {
     }
 }
 
+/// One record of the corpus that rudb is worst on, as it is written down and read back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorstRecord {
+    /// The file and the line, which is what names a record.
+    pub name: String,
+    /// Wall clock, rudb over the pin.
+    pub time: f64,
+    /// Processor time, rudb over the pin.
+    pub cpu: f64,
+    /// Peak resident set, rudb over the pin.
+    pub memory: f64,
+}
+
+/// One corpus cost run, as it is written down and read back.
+///
+/// The same three granularities [`Cost`] carries, over the sqllogictest corpus rather than over the
+/// benchmark corpus: the whole corpus, then per file, then the records rudb is worst on. The two
+/// belong on one page together and neither replaces the other, because a benchmark suite measures
+/// the shapes somebody chose and a corpus measures the shapes nobody chose.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Spent {
+    /// When the run happened, in UTC.
+    pub stamp: String,
+    /// The machine it ran on.
+    pub host: String,
+    /// The rudb version on one side of every ratio.
+    pub rudb: String,
+    /// The commit that rudb was built from.
+    pub rudb_commit: String,
+    /// The commit of this harness, with a note when the tree was dirty.
+    pub compat_commit: String,
+    /// What the DuckDB on the other side of every ratio called itself.
+    pub duckdb_version: String,
+    /// How many records both engines put a number on.
+    pub measured: usize,
+    /// How many one engine put a number on and the other did not.
+    pub one_sided: usize,
+    /// How many ran and neither engine could measure.
+    pub unmeasured: usize,
+    /// The three ratios over everything measured, when anything was.
+    pub overall: Option<Ratios>,
+    /// The three ratios per file, worst median wall clock first.
+    pub files: Vec<(String, Ratios)>,
+    /// The records rudb is worst on, slowest first.
+    pub worst: Vec<WorstRecord>,
+}
+
+impl Spent {
+    /// The most recent corpus cost run recorded beside the pages in a directory, if there is one.
+    ///
+    /// Read back the same way [`Cost::latest`] is: the rows of one run share a stamp and a machine,
+    /// so the last row that parses names the run and every row with that pair belongs to it.
+    #[must_use]
+    pub fn latest(dir: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(dir.join(RECORDS)).ok()?;
+        let rows: Vec<RecordRow> = text.lines().filter_map(RecordRow::parse).collect();
+        let last = rows.last()?;
+        let (stamp, host) = (last.stamp.clone(), last.host.clone());
+        Self::assembled(rows.iter().filter(|row| row.stamp == stamp && row.host == host))
+    }
+
+    /// The rows of one run, back into the run they were written from.
+    fn assembled<'a>(rows: impl Iterator<Item = &'a RecordRow>) -> Option<Self> {
+        let mut spent: Option<Self> = None;
+        for row in rows {
+            let into = spent.get_or_insert_with(|| Self {
+                stamp: row.stamp.clone(),
+                host: row.host.clone(),
+                rudb: row.rudb.clone(),
+                rudb_commit: row.rudb_commit.clone(),
+                compat_commit: row.compat_commit.clone(),
+                duckdb_version: row.duckdb_version.clone(),
+                measured: row.measured,
+                one_sided: row.one_sided,
+                unmeasured: row.unmeasured,
+                overall: None,
+                files: Vec::new(),
+                worst: Vec::new(),
+            });
+            match row.scope.as_str() {
+                CORPUS => into.overall = Some(row.ratios),
+                FILE => into.files.push((row.what.clone(), row.ratios)),
+                RECORD => into.worst.push(WorstRecord {
+                    name: row.what.clone(),
+                    time: row.ratios.time.median,
+                    cpu: row.ratios.cpu.median,
+                    memory: row.ratios.memory.median,
+                }),
+                _ => {}
+            }
+        }
+        spent
+    }
+
+    /// Whether this run measured the same engine on the same machine as the run beside it.
+    #[must_use]
+    pub fn matches(&self, p: &Provenance) -> bool {
+        self.rudb_commit == p.rudb_commit && self.host == p.host
+    }
+}
+
+/// One line of the corpus cost file, before the rows of a run are put back together.
+#[derive(Debug, Clone, PartialEq)]
+struct RecordRow {
+    stamp: String,
+    host: String,
+    rudb: String,
+    rudb_commit: String,
+    compat_commit: String,
+    duckdb_version: String,
+    scope: String,
+    what: String,
+    ratios: Ratios,
+    measured: usize,
+    one_sided: usize,
+    unmeasured: usize,
+}
+
+impl RecordRow {
+    /// One line of the file, or nothing when it is the header or half written.
+    fn parse(line: &str) -> Option<Self> {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() != RECORD_COLUMNS.len() {
+            return None;
+        }
+        let columns = &RECORD_COLUMNS[..];
+        let count = number(columns, &fields, "records")?;
+        let spread = |what: &str| {
+            Some(Spread {
+                median: real(columns, &fields, what)?,
+                low: real(columns, &fields, &format!("{what}_low"))?,
+                high: real(columns, &fields, &format!("{what}_high"))?,
+                count,
+            })
+        };
+        Some(Self {
+            stamp: word(columns, &fields, "when")?.to_owned(),
+            host: word(columns, &fields, "machine")?.to_owned(),
+            rudb: word(columns, &fields, "rudb")?.to_owned(),
+            rudb_commit: word(columns, &fields, "rudb_commit")?.to_owned(),
+            compat_commit: word(columns, &fields, "compat_commit")?.to_owned(),
+            duckdb_version: word(columns, &fields, "duckdb")?.to_owned(),
+            scope: word(columns, &fields, "scope")?.to_owned(),
+            what: word(columns, &fields, "what")?.to_owned(),
+            ratios: Ratios {
+                time: spread("time")?,
+                cpu: spread("cpu")?,
+                memory: spread("memory")?,
+            },
+            measured: number(columns, &fields, "measured")?,
+            one_sided: number(columns, &fields, "one_sided")?,
+            unmeasured: number(columns, &fields, "unmeasured")?,
+        })
+    }
+}
+
 /// One line of the cost file, before the rows of a run are put back together.
 #[derive(Debug, Clone, PartialEq)]
 struct Row {
@@ -615,13 +817,14 @@ pub struct Page<'a> {
     provenance: &'a Provenance,
     sweep: Option<&'a Sweep>,
     cost: Option<&'a Cost>,
+    spent: Option<&'a Spent>,
 }
 
 impl<'a> Page<'a> {
     /// The page for one corpus run.
     #[must_use]
     pub const fn of(run: &'a Isolated, provenance: &'a Provenance) -> Self {
-        Self { run, provenance, sweep: None, cost: None }
+        Self { run, provenance, sweep: None, cost: None, spent: None }
     }
 
     /// The same page with the most recent function sweep carried onto it.
@@ -642,6 +845,17 @@ impl<'a> Page<'a> {
     #[must_use]
     pub const fn with_cost(mut self, cost: Option<&'a Cost>) -> Self {
         self.cost = cost;
+        self
+    }
+
+    /// The same page with the most recent corpus cost run carried onto it.
+    ///
+    /// Beside the benchmark one rather than instead of it. The two measure different things and the
+    /// page says which is which, because a reader who saw one set of ratios and assumed it was the
+    /// other would draw the wrong conclusion from a true number.
+    #[must_use]
+    pub const fn with_records(mut self, spent: Option<&'a Spent>) -> Self {
+        self.spent = spent;
         self
     }
 }
@@ -879,7 +1093,7 @@ impl fmt::Display for Page<'_> {
             writeln!(f)?;
             writeln!(
                 f,
-                "Not measured by this run either. The sqllogictest corpus above cannot produce a ratio, because a record there only means anything under a session that replayed every statement before it, so timing one record would time the replay. These come off the benchmark corpus, where every file carries its own load and one query, and they are carried here from the most recent `rudb-compat cost` run written down beside these pages."
+                "Not measured by this run either. These come off the benchmark corpus, where every file carries its own load and one query, and they are carried here from the most recent `rudb-compat cost` run written down beside these pages. The sqllogictest corpus above is measured separately and the section under this one has it, because a benchmark suite measures the shapes somebody chose and a corpus measures the shapes nobody chose, and an engine can be quick on the first and quadratic on the second."
             )?;
             writeln!(f)?;
             writeln!(
@@ -999,6 +1213,140 @@ impl fmt::Display for Page<'_> {
                 writeln!(
                     f,
                     "That is not the engine build and machine the corpus numbers above came from. Section 11.2 says the resource numbers need their provenance more than the correctness numbers do, and this is the case it was written for: a ratio whose two sides came off different hardware is not a ratio."
+                )?;
+            }
+            writeln!(f)?;
+        }
+
+        if let Some(spent) = self.spent {
+            writeln!(f, "## Resources per corpus record")?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "The same three ratios over the sqllogictest corpus above rather than over the benchmark corpus, carried here from the most recent `rudb-compat records` run written down beside these pages. A benchmark suite measures the shapes somebody chose to measure and a corpus measures the shapes nobody chose, because a test file is written to pin an answer rather than to be fast, so a feature that is quick on the benchmark and quadratic on the long tail shows up here and nowhere else."
+            )?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "A record is in the denominator when both engines answered it and both put a number on it. A record that failed on either side is never timed, because timing an error path measures the error path, and one under the floor on both sides is dropped because the two numbers being divided are then mostly the cost of starting a shell. Both engines are driven as sessions on a database file, which is what makes the number the cost of the record rather than the cost of everything above it in the file."
+            )?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "The processor time reads 0.00 on nearly every record here and that is the meter running out of digits rather than a result. GNU time reports user and system time in hundredths of a second and rudb answers a corpus record in less than one of them, so the numerator is zero wherever the pin spent long enough to give the division a denominator. The column earns its place at benchmark sizes, where it is the one that catches an engine buying its wall clock with cores. At this size the two numbers to read are the clock and the peak."
+            )?;
+            writeln!(f)?;
+            writeln!(
+                f,
+                "Read the wall clock here as the cost of answering a small question from cold, because that is what it is. A corpus record is a handful of rows and the query itself is under a millisecond on both engines, so most of what the clock sees is the shell starting, opening the file, reading the catalog and printing. The tight quartiles say the same thing: a spread that narrow over hundreds of records of very different shapes is a fixed cost rather than a query cost. The number for a query that does real work is the benchmark section above, and the two are on this page together for that reason."
+            )?;
+            writeln!(f)?;
+            writeln!(f, "    records     {:>7}  measured on both engines", spent.measured)?;
+            writeln!(
+                f,
+                "    one sided   {:>7}  one engine put a number on it and the other did not",
+                spent.one_sided
+            )?;
+            writeln!(
+                f,
+                "    unmeasured  {:>7}  ran and neither engine could be measured",
+                spent.unmeasured
+            )?;
+            writeln!(f)?;
+            match spent.overall {
+                None => {
+                    writeln!(
+                        f,
+                        "No record was measured on both engines in that run, so there is no ratio over the whole corpus. The counts above say why."
+                    )?;
+                    writeln!(f)?;
+                }
+                Some(ratios) => {
+                    writeln!(f, "### The whole corpus")?;
+                    writeln!(f)?;
+                    for (what, spread) in
+                        [("time", ratios.time), ("cpu", ratios.cpu), ("memory", ratios.memory)]
+                    {
+                        writeln!(
+                            f,
+                            "    {what:<8}{:>8.2}   quartiles {:.2} to {:.2} over {} records",
+                            spread.median, spread.low, spread.high, spread.count
+                        )?;
+                    }
+                    writeln!(f)?;
+                    if ratios.at_goal() {
+                        writeln!(f, "All three medians are at or below the goal of a tenth.")?;
+                    } else {
+                        writeln!(
+                            f,
+                            "The goal is {:.1} on all three and this is not at it yet.",
+                            Ratios::GOAL
+                        )?;
+                    }
+                    writeln!(f)?;
+                }
+            }
+            if !spent.files.is_empty() {
+                writeln!(f, "### Per file")?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "Worst median wall clock first. A file with one measured record in it is left out, because one record is an anecdote and putting it in a table beside a file of two hundred invites somebody to read it as a trend."
+                )?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "    {:<40}{:>9}{:>9}{:>9}{:>7}",
+                    "file", "time", "cpu", "memory", "n"
+                )?;
+                for (file, ratios) in &spent.files {
+                    writeln!(
+                        f,
+                        "    {:<40}{:>9.2}{:>9.2}{:>9.2}{:>7}",
+                        fitted(file, 39),
+                        ratios.time.median,
+                        ratios.cpu.median,
+                        ratios.memory.median,
+                        ratios.time.count
+                    )?;
+                }
+                writeln!(f)?;
+            }
+            if !spent.worst.is_empty() {
+                writeln!(f, "### The worst {}", spent.worst.len())?;
+                writeln!(f)?;
+                writeln!(
+                    f,
+                    "This is the column that gets read. An engine that is even on the median and two hundred times slower on one record has a bug rather than a distribution, and a median hides that by construction. Each row is the file and the line the record starts on, which is enough to open it."
+                )?;
+                writeln!(f)?;
+                writeln!(f, "    {:<44}{:>9}{:>9}{:>9}", "record", "time", "cpu", "memory")?;
+                for one in &spent.worst {
+                    writeln!(
+                        f,
+                        "    {:<44}{:>9.2}{:>9.2}{:>9.2}",
+                        fitted(&one.name, 43),
+                        one.time,
+                        one.cpu,
+                        one.memory
+                    )?;
+                }
+                writeln!(f)?;
+            }
+            writeln!(f, "    measured    {} on {}", spent.stamp, spent.host)?;
+            writeln!(f, "    engine      {} at {}", spent.rudb, spent.rudb_commit)?;
+            writeln!(f, "    rudb-compat {}", spent.compat_commit)?;
+            writeln!(f, "    duckdb      {}", spent.duckdb_version)?;
+            writeln!(f)?;
+            if spent.matches(p) {
+                writeln!(
+                    f,
+                    "That is the same engine build on the same machine as the corpus numbers above."
+                )?;
+            } else {
+                writeln!(
+                    f,
+                    "That is not the engine build and machine the corpus numbers above came from, and a ratio whose two sides came off different hardware is not a ratio."
                 )?;
             }
             writeln!(f)?;
@@ -1159,6 +1507,61 @@ pub fn cost_rows(costs: &Costs, p: &Provenance) -> Vec<String> {
     rows
 }
 
+/// The header line of the corpus cost file.
+#[must_use]
+pub fn record_header() -> String {
+    RECORD_COLUMNS.join("\t")
+}
+
+/// One corpus cost run as the rows of that file, the whole corpus first.
+///
+/// The same arrangement [`cost_rows`] uses, and a record row repeats its median in the quartile
+/// columns for the same reason a benchmark row does: one record is one number on each axis and
+/// there is nothing else those columns could truthfully hold. [`WorstRecord`] does not carry them,
+/// so that nobody reads a spread into a repeat.
+#[must_use]
+pub fn record_rows(spends: &Spends, p: &Provenance) -> Vec<String> {
+    let mut rows = Vec::with_capacity(1 + spends.records.len());
+    let totals = [
+        spends.records.len().to_string(),
+        (spends.ours_only + spends.theirs_only).to_string(),
+        spends.unmeasured.to_string(),
+    ];
+    let mut push = |scope: &str, what: &str, ratios: &Ratios| {
+        let mut fields = vec![
+            p.stamp.clone(),
+            p.host.clone(),
+            p.rudb.clone(),
+            p.rudb_commit.clone(),
+            p.compat_commit.clone(),
+            p.duckdb_version.clone(),
+            scope.to_owned(),
+            what.to_owned(),
+            ratios.time.count.to_string(),
+        ];
+        for spread in [&ratios.time, &ratios.cpu, &ratios.memory] {
+            fields.push(format!("{:.4}", spread.median));
+            fields.push(format!("{:.4}", spread.low));
+            fields.push(format!("{:.4}", spread.high));
+        }
+        fields.extend(totals.iter().cloned());
+        rows.push(fields.join("\t"));
+    };
+    if let Some(ratios) = spends.overall() {
+        push(CORPUS, "everything measured", &ratios);
+    }
+    for (file, ratios) in spends.per_file() {
+        push(FILE, &file, &ratios);
+    }
+    for one in spends.worst(WORST) {
+        let flat = |value: f64| Spread { median: value, low: value, high: value, count: 1 };
+        let ratios =
+            Ratios { time: flat(one.time()), cpu: flat(one.cpu()), memory: flat(one.memory()) };
+        push(RECORD, &one.name(), &ratios);
+    }
+    rows
+}
+
 /// The median load share over some of what a run measured.
 ///
 /// Printed beside every ratio because a page that said rudb was three times slower and did not say
@@ -1258,11 +1661,13 @@ pub fn write(
     p: &Provenance,
     sweep: Option<&Sweep>,
     cost: Option<&Cost>,
+    spent: Option<&Spent>,
 ) -> Result<PathBuf, HarnessError> {
     std::fs::create_dir_all(dir)
         .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
     let page = dir.join(p.filename());
-    std::fs::write(&page, Page::of(run, p).with(sweep).with_cost(cost).to_string())
+    let rendered = Page::of(run, p).with(sweep).with_cost(cost).with_records(spent).to_string();
+    std::fs::write(&page, rendered)
         .map_err(|e| HarnessError::new(format!("cannot write {}: {e}", page.display())))?;
     append(&dir.join(SERIES), &header(), &row(run, p))?;
     Ok(page)
@@ -1305,6 +1710,29 @@ pub fn measured(dir: &Path, costs: &Costs, p: &Provenance) -> Result<PathBuf, Ha
         ));
     }
     append(&file, &cost_header(), &rows.join("\n"))?;
+    Ok(file)
+}
+
+/// Write one corpus cost run down beside the pages, and say which file it went in.
+///
+/// No page of its own, the same as a sweep and a cost run. The rows of the run go in together, so a
+/// file that was read while this was writing has either none of a run in it or all of it rather
+/// than the corpus row without the files under it.
+///
+/// # Errors
+///
+/// When the directory cannot be made or the file cannot be appended to.
+pub fn spent(dir: &Path, spends: &Spends, p: &Provenance) -> Result<PathBuf, HarnessError> {
+    std::fs::create_dir_all(dir)
+        .map_err(|e| HarnessError::new(format!("cannot make {}: {e}", dir.display())))?;
+    let file = dir.join(RECORDS);
+    let rows = record_rows(spends, p);
+    if rows.is_empty() {
+        return Err(HarnessError::new(
+            "no record was measured on both engines, so there is no row to write".to_owned(),
+        ));
+    }
+    append(&file, &record_header(), &rows.join("\n"))?;
     Ok(file)
 }
 
@@ -1450,8 +1878,9 @@ fn parts(unix: u64) -> (i64, u32, u32, u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        COLUMNS, COST_COLUMNS, Cost, Page, Provenance, Row, SWEEP_COLUMNS, Sweep, cost_header,
-        cost_rows, header, parts, pinned, row, short, stamp, sweep_header, sweep_row,
+        COLUMNS, COST_COLUMNS, Cost, Page, Provenance, RECORD_COLUMNS, RecordRow, Row,
+        SWEEP_COLUMNS, Spent, Sweep, cost_header, cost_rows, header, parts, pinned, record_header,
+        record_rows, row, short, stamp, sweep_header, sweep_row,
     };
     use std::path::Path;
 
@@ -1460,6 +1889,7 @@ mod tests {
     use crate::coverage::{Coverage, Tally, Untested};
     use crate::isolate::Isolated;
     use crate::kinds::Kinds;
+    use crate::spend::Spends;
 
     fn provenance() -> Provenance {
         Provenance {
@@ -1821,6 +2251,109 @@ mod tests {
             cost_rows(&costs(), &provenance()).iter().filter_map(|row| Row::parse(row)).collect();
         assert_eq!(rows.len(), 8, "one corpus row, two suites and five benchmarks");
         Cost::assembled(rows.iter()).expect("the rows it just wrote")
+    }
+
+    /// One record that took `ms` on rudb and a hundred milliseconds on the pin.
+    fn record(file: &str, line: usize, ms: u64) -> crate::spend::Spend {
+        let usage = |ms: u64| crate::resource::Usage {
+            wall: std::time::Duration::from_millis(ms),
+            cpu: std::time::Duration::from_millis(ms),
+            peak: ms * 1024,
+        };
+        crate::spend::Spend { file: file.to_owned(), line, ours: usage(ms), theirs: usage(100) }
+    }
+
+    fn spends() -> Spends {
+        Spends {
+            records: vec![
+                record("micro.test", 1, 300),
+                record("micro.test", 9, 200),
+                record("micro.test", 17, 100),
+                record("join.test", 1, 900),
+                record("join.test", 9, 800),
+            ],
+            ours_only: 3,
+            theirs_only: 1,
+            unmeasured: 12,
+            outcome: None,
+        }
+    }
+
+    fn spent() -> Spent {
+        let rows: Vec<RecordRow> = record_rows(&spends(), &provenance())
+            .iter()
+            .filter_map(|row| RecordRow::parse(row))
+            .collect();
+        assert_eq!(rows.len(), 8, "one corpus row, two files and five records");
+        Spent::assembled(rows.iter()).expect("the rows it just wrote")
+    }
+
+    #[test]
+    fn a_record_row_has_exactly_the_fields_its_header_says_it_has() {
+        assert_eq!(record_header().split('\t').count(), RECORD_COLUMNS.len());
+        for row in record_rows(&spends(), &provenance()) {
+            assert_eq!(row.split('\t').count(), RECORD_COLUMNS.len(), "{row}");
+            assert!(!row.contains('\n'), "a row that is two rows\n{row}");
+        }
+    }
+
+    #[test]
+    fn a_corpus_cost_run_reads_back_as_the_three_granularities_it_was_written_from() {
+        let spent = spent();
+        let overall = spent.overall.expect("five records were measured");
+        assert!((overall.time.median - 3.0).abs() < 1e-9, "{overall:?}");
+        assert!((overall.memory.median - 3.0).abs() < 1e-9, "{overall:?}");
+        assert_eq!(overall.time.count, 5);
+        assert_eq!(spent.files.len(), 2);
+        assert_eq!(spent.files[0].0, "join.test");
+        assert_eq!(spent.worst.len(), 5);
+        assert_eq!(spent.worst[0].name, "join.test:1");
+        assert!((spent.worst[0].time - 9.0).abs() < 1e-9, "{:?}", spent.worst[0]);
+        assert_eq!(spent.measured, 5);
+        // One number and not two, because what a reader needs off this row is whether the ratios
+        // are over a set of records both engines answered, and which side was missing does not
+        // change the answer to that.
+        assert_eq!(spent.one_sided, 4);
+        assert_eq!(spent.unmeasured, 12);
+        assert_eq!(spent.host, "server2");
+    }
+
+    #[test]
+    fn a_corpus_cost_run_beside_the_pages_puts_its_three_granularities_on_one() {
+        let page = Page::of(&run(), &provenance()).with_records(Some(&spent())).to_string();
+        let section = page.split("## Resources per corpus record").nth(1).expect("the heading");
+        assert!(section.contains("### The whole corpus"), "{section}");
+        assert!(section.contains("### Per file"), "{section}");
+        assert!(section.contains("### The worst 5"), "{section}");
+        let files = section.split("### Per file").nth(1).expect("the heading");
+        let slow = files.find("join.test").expect("the slower file");
+        let quick = files.find("micro.test").expect("the quicker file");
+        assert!(slow < quick, "the files are not worst first\n{files}");
+        let worst = section.split("### The worst 5").nth(1).expect("the heading");
+        let first = worst.find("join.test:1").expect("the slowest record");
+        let last = worst.find("micro.test:17").expect("the quickest record");
+        assert!(first < last, "the records are not slowest first\n{worst}");
+    }
+
+    #[test]
+    fn the_two_kinds_of_resource_number_are_on_the_page_as_two_sections() {
+        // A benchmark suite measures the shapes somebody chose and a corpus measures the shapes
+        // nobody chose, and a reader who took one for the other would draw the wrong conclusion
+        // from a true number. So they are two headings and the first one says the second exists.
+        let page = Page::of(&run(), &provenance())
+            .with_cost(Some(&cost()))
+            .with_records(Some(&spent()))
+            .to_string();
+        assert!(page.contains("## Resources\n"), "{page}");
+        assert!(page.contains("## Resources per corpus record"), "{page}");
+        let benchmarks = page.split("## Resources").nth(1).expect("the heading");
+        assert!(benchmarks.contains("the section under this one has it"), "{benchmarks}");
+    }
+
+    #[test]
+    fn a_page_with_no_corpus_cost_run_beside_it_has_no_section_for_one() {
+        let page = Page::of(&run(), &provenance()).with_cost(Some(&cost())).to_string();
+        assert!(!page.contains("## Resources per corpus record"), "{page}");
     }
 
     #[test]

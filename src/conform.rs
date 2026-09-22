@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::engine::{Cell, Engine, EngineError, HarnessError, Outcome, Table};
 use crate::hash::hash_values;
 use crate::kinds::Kinds;
+use crate::resource::Usage;
 use crate::slt::{
     Directive, ParseError, QueryResult, Record, Setting, Sort, StatementResult, TestFile,
 };
@@ -554,6 +555,29 @@ pub struct Summary {
     /// failures are the only records whose SQL survives the run and a kind every record of which
     /// passed would be invisible in them.
     pub kinds: Kinds,
+    /// What each record that passed cost, for the engines that can say.
+    ///
+    /// Empty for every engine but a shell, and empty for a shell on a machine with no GNU time,
+    /// which is what [`crate::resource`] says an engine that cannot measure should answer. It is
+    /// also empty for a record the engine replayed its history in front of, because that number is
+    /// the cost of the history. A failing record is left out on purpose, since timing an error path
+    /// measures the error path rather than the engine.
+    pub timings: Vec<Timing>,
+}
+
+/// What one record cost on one engine.
+///
+/// The file and the line rather than the SQL, because this is carried for every record of a run
+/// rather than only for the failures, and the two engines are lined up on it afterwards. Two
+/// records of a file cannot start on the same line, so the pair names one record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timing {
+    /// The file the record is in, named the way a failure names it.
+    pub file: String,
+    /// The line the record's directive was on.
+    pub line: usize,
+    /// What it cost.
+    pub usage: Usage,
 }
 
 impl Summary {
@@ -601,6 +625,7 @@ impl Summary {
         self.skipped.absorb(other.skipped);
         self.failures.extend(other.failures);
         self.kinds.absorb(&other.kinds);
+        self.timings.extend(other.timings);
     }
 }
 
@@ -869,6 +894,13 @@ pub fn run_file_telling(
                 summary.passed += 1;
                 charge(&mut summary.kinds, record, true);
                 told.insert(at, Said::Passed);
+                if let Some(usage) = engine.usage() {
+                    summary.timings.push(Timing {
+                        file: file.name.clone(),
+                        line: record.line,
+                        usage,
+                    });
+                }
             }
             Verdict::Ran(Err(failure)) => {
                 summary.failed += 1;
