@@ -382,7 +382,7 @@ fn without_duckdb_warnings(mut output: &str) -> &str {
 /// questions and drops it, and none of that works if the process running the second statement never
 /// heard the first one.
 ///
-/// There are two ways to do that here. The one `oracles` and `sqlsmith` ask for is
+/// There are two ways to do that here. The one every driver in this harness asks for is
 /// [`Session::on_a_file`]. rudb
 /// writes its database file when the last handle on it goes away, tamnd/rudb#1226, lets a table
 /// that is already in the file take an append, tamnd/rudb#1228, and has a tag in native storage for
@@ -409,13 +409,14 @@ fn without_duckdb_warnings(mut output: &str) -> &str {
 /// loaded extension. Those cannot be put in front of one statement without putting the whole file in
 /// front of it, so the first one turns the file off, deletes it and goes back to the replay.
 ///
-/// Three things rudb does not do on a file yet, and none of them is something a session can work
-/// around. A nested column type cannot be written down at all, tamnd/rudb#1246, so a `LIST`, a
-/// `STRUCT` or a `MAP` column fails at its `CREATE TABLE`. A view is not written to the file,
-/// tamnd/rudb#1264, so it is gone the next statement. And a nullable `VARCHAR` read back from a
-/// file raises an internal error when a correlated subquery turns it into a domain key,
-/// tamnd/rudb#1265. The last two are why the committed corpus in `tests/corpus.rs` is still on the
-/// replay while `oracles` and `sqlsmith` are on the file.
+/// One thing rudb does not do on a file yet, and it is not something a session can work around. A
+/// nested column type cannot be written down at all, tamnd/rudb#1246, so a `LIST`, a `STRUCT` or a
+/// `MAP` column fails at its `CREATE TABLE`. There were two others. A view was not written to the
+/// file, tamnd/rudb#1264, so it was gone the next statement, and a nullable `VARCHAR` read back
+/// from a file raised an internal error when a correlated subquery turned it into a domain key,
+/// tamnd/rudb#1265. Those two are why the committed corpus in `tests/corpus.rs` stayed on the
+/// replay after `oracles` and `sqlsmith` moved off it, and now that both are fixed it is on a file
+/// as well.
 #[derive(Debug)]
 pub struct Session {
     /// The shell underneath, with no setup of its own.
