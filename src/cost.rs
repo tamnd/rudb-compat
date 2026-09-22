@@ -2,10 +2,15 @@
 //!
 //! The project's claim is a tenth of DuckDB's time and a tenth of its memory, and `crate::resource`
 //! has been able to measure a pair of processes for a while. What was missing was something to
-//! measure. The sqllogictest corpus cannot supply it, because a record there only means anything
-//! under a session that replays every statement before it, so timing a record would time the
-//! replay. The benchmark corpus in `crate::queries` is independent by construction: each file
+//! measure. The benchmark corpus in `crate::queries` is independent by construction: each file
 //! carries its own `load` and one query, and nothing in it depends on the file before it.
+//!
+//! The sqllogictest corpus is measured too, in `crate::spend`, and the two are not competing. A
+//! benchmark suite measures the shapes somebody chose to measure and a corpus measures the shapes
+//! nobody chose, so a feature that is quick here and quadratic on the long tail shows up there. The
+//! corpus could not supply a measurement for a long time, because a record there only meant
+//! anything under a session that replayed every statement before it and timing a record would have
+//! timed the replay, and what changed is that a session keeps a database file now.
 //!
 //! ## What a number here is
 //!

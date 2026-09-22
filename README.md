@@ -568,6 +568,39 @@ A run narrowed with `--count` or `--group` is not recorded. A ratio over eleven 
 
 Until a machine has run one, the three ratios stay in the list of numbers the page does not say yet, with the command that would produce them beside them. That list is the point of the page as much as the numbers are.
 
+## What every record of the committed corpus costs
+
+The benchmark corpus above measures the shapes somebody chose to measure. The committed sqllogictest corpus measures the shapes nobody chose, because a test file is written to pin an answer rather than to be fast, and a feature that is quick on the benchmark and quadratic on the long tail shows up there and nowhere else. That was not measurable until the corpus ran on a database file, because a record under a session that replays everything above it costs the replay rather than costing the record. It does now, so `records` measures it.
+
+```
+RUDB_COMPAT_RUDB=/path/to/rudb rudb-compat records --runs 5
+```
+
+```
+records    867, measured on both engines
+one sided  14, one engine put a number on it and the other did not
+unmeasured 0, ran and neither engine could be measured
+passed     1119 on rudb and 1098 on the pin
+failed     0 on rudb and 21 on the pin
+
+whole corpus
+  time        0.14   quartiles 0.11 to 0.22 over 867 records
+  cpu         0.00   quartiles 0.00 to 0.00 over 867 records
+  memory      0.26   quartiles 0.24 to 0.27 over 867 records
+```
+
+The processor time reads 0.00 on nearly every record and that is a resolution artifact rather than a result. GNU time reports user and system time in hundredths of a second, rudb answers a corpus record in less than one of those, so the numerator is zero wherever the pin spent long enough to have a denominator. The column is doing its job at benchmark sizes and says nothing here, and the two numbers to read on this table are the clock and the peak.
+
+Read the wall clock there as the cost of answering a small question from cold, because that is what it is. A corpus record is a handful of rows and the query itself is under a millisecond on both engines, so most of what the clock is seeing is a shell starting, opening the file, reading the catalog and printing. The quartiles say the same thing from the other direction: a spread of 0.11 to 0.22 over eight hundred and sixty seven records of very different shapes is a fixed cost and not a query cost. It is still a real number and it matters to anything that runs a shell per statement, but the number for a query that does work is the benchmark corpus, and the two are on the page together so nobody has to take one for the other.
+
+The whole corpus is run through one engine and then through the other, five times each, and the runs are lined up afterwards on the file and the line each record started at. Pairing at the end rather than re-running each record in place is the same set of measurements at the same cost, and it keeps the running of a file in one piece, which matters because a record only makes sense after the records above it. The median of the five is the answer and never the minimum, which is a number about how quiet the machine got.
+
+The exclusions are the ones the rest of the harness already uses rather than new ones. A record that failed on either engine is never timed, so the twenty one the pinned binary fails are absent from both sides rather than counted against it. A record the session had to replay its history in front of has no number, because that number is the cost of the history. A record under ten milliseconds on both engines drops out. What is left is a record both engines answered, on its own, above the noise.
+
+The three granularities are the whole corpus, then per file, then the worst twenty records, which is what section 11.2 of `spec/sql/duckdb/11-the-number.md` asks of any resource number this project publishes, and the last of them is the one to read. An engine that is even on the median and two hundred times slower on one record has a bug rather than a distribution, and a median hides that by construction. Right now the worst twenty run from 0.50 down to 0.38, so there is no such record in the corpus today.
+
+It writes its rows to `target/report/record.tsv` beside the pages and `rudb-compat report` prints them as their own section, under the same rules the benchmark costs are recorded under. A run pointed at another corpus is not recorded and neither is a run against a DuckDB that is not the pin. A full run is the corpus ten times over with every statement in a process of its own, which is half an hour on server2, so `RUDB_COMPAT_PROGRESS` says which pass of which engine it is on.
+
 ## Getting a generated run back
 
 Four modes here write their own input and every one of them can find something nobody has time to look at the day it turns up. So each of them ends by printing what it was measured against and appending one row to `target/report/generated.tsv`.

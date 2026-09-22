@@ -23,11 +23,12 @@ use rudb_compat::oracles::{Split, Verdict};
 use rudb_compat::queries::{Histogram, Query, histogram};
 use rudb_compat::reduce::{Alive, BUDGET, Distinct, Reduced, shrink};
 use rudb_compat::replay::{self, Note};
-use rudb_compat::report::{Cost, Page, Provenance, Sweep};
+use rudb_compat::report::{Cost, Page, Provenance, Spent, Sweep};
 use rudb_compat::resource::{RUNS, Ratios, Spread};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shard::Shard;
 use rudb_compat::shell::{Session, Shell};
+use rudb_compat::spend::Spends;
 use rudb_compat::sqlsmith::QUERIES;
 use rudb_compat::suite::{Measure, Report, run, run_parse, statements};
 use rudb_compat::tlp::{CASES, Form};
@@ -164,6 +165,11 @@ fn main() -> ExitCode {
             valued(&args, "--runs").map_or(RUNS, |n| usize::try_from(n).unwrap_or(RUNS)),
             text(&args, "--group"),
             valued(&args, "--seconds").unwrap_or(SECONDS),
+            text(&args, "--out"),
+        ),
+        Some("records") => records(
+            rest.get(1).copied(),
+            valued(&args, "--runs").map_or(RUNS, |n| usize::try_from(n).unwrap_or(RUNS)),
             text(&args, "--out"),
         ),
         Some("vendor") => fetch(refresh),
@@ -1235,13 +1241,27 @@ fn report(
     // off the most recent sweep recorded here rather than measured again. No sweep on this machine
     // leaves the page saying so, which is what it said before any of them existed.
     let sweep = Sweep::latest(&into);
-    // The three resource ratios come off the benchmark corpus and not this one, because a
-    // sqllogictest record only means anything under a session that replayed every record before it,
-    // so timing one would time the replay. Read back the same way the sweep is, off the most recent
-    // cost run recorded here.
+    // The three resource ratios are measured twice over, once on the benchmark corpus and once on
+    // this one, and both are read back the same way the sweep is rather than measured again here. A
+    // benchmark suite measures the shapes somebody chose and a corpus measures the shapes nobody
+    // chose, and the page carries both so that neither gets read as the other.
     let cost = Cost::latest(&into);
-    println!("{}", Page::of(&total, &provenance).with(sweep.as_ref()).with_cost(cost.as_ref()));
-    match rudb_compat::report::write(&into, &total, &provenance, sweep.as_ref(), cost.as_ref()) {
+    let spent = Spent::latest(&into);
+    println!(
+        "{}",
+        Page::of(&total, &provenance)
+            .with(sweep.as_ref())
+            .with_cost(cost.as_ref())
+            .with_records(spent.as_ref())
+    );
+    match rudb_compat::report::write(
+        &into,
+        &total,
+        &provenance,
+        sweep.as_ref(),
+        cost.as_ref(),
+        spent.as_ref(),
+    ) {
         Ok(page) => {
             println!("written to {}", page.display());
             println!("appended to {}", into.join(rudb_compat::report::SERIES).display());
@@ -1470,6 +1490,152 @@ fn cost(
     record_costs(&costs, out, count.is_some() || group.is_some())
 }
 
+/// Measure the sqllogictest corpus on both engines record by record and print the three ratios.
+///
+/// The other half of `cost`, and the two are not competing. A benchmark suite measures the shapes
+/// somebody chose to measure, and a corpus measures the shapes nobody chose, because a test file is
+/// written to pin an answer rather than to be fast. A feature that is quick on the benchmark and
+/// quadratic on the long tail shows up here and in nothing else this harness runs.
+///
+/// Both engines are driven as sessions on a database file, which is what makes a record's number
+/// the cost of that record rather than the cost of everything above it in its file. That was not
+/// possible until tamnd/rudb#1264 and tamnd/rudb#1265 were fixed, and the module doc of
+/// `crate::spend` has the rest of it.
+///
+/// It defaults to the committed corpus rather than to upstream, the same way `passes` does, because
+/// the committed corpus is the one every record of which passes on both engines and a record that
+/// fails has no ratio. A path points it somewhere else.
+///
+/// This is a run of the whole corpus five times on each engine with every statement in a process of
+/// its own, so it takes half an hour rather than a minute. `RUDB_COMPAT_PROGRESS` says which pass of
+/// which engine it is on, the same variable the ClickBench run uses for the same reason.
+fn records(path: Option<&str>, runs: usize, out: Option<&str>) -> ExitCode {
+    let (ours, theirs) = match (Shell::rudb(), Shell::duckdb()) {
+        (Ok(ours), Ok(theirs)) => (ours, theirs),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let dir = path.map_or_else(|| Path::new(root()).join(CORPUS), PathBuf::from);
+    let spends = match rudb_compat::spend::measure(&ours, &theirs, &dir, runs) {
+        Ok(spends) => spends,
+        Err(e) => {
+            eprintln!("rudb-compat: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    print_records(&spends, runs);
+    println!();
+    record_records(&spends, out, path.is_some())
+}
+
+/// Write a corpus cost run down beside the pages, or say why it was not written.
+///
+/// The same rules a benchmark cost run is recorded under. A run somebody pointed at another corpus
+/// is not the run the page is about, and neither is a run against a DuckDB that is not the pin,
+/// because the divisor came from another database.
+fn record_records(spends: &Spends, out: Option<&str>, narrowed: bool) -> ExitCode {
+    let into = out.map_or_else(|| Path::new(root()).join(rudb_compat::report::DEST), PathBuf::from);
+    if narrowed {
+        println!(
+            "not recorded, this was a run over a corpus somebody named and not the committed one"
+        );
+        return ExitCode::SUCCESS;
+    }
+    if !Duckdb::discover().is_ok_and(|db| db.is_pinned()) {
+        println!("not recorded, this DuckDB is not the pinned one");
+        return ExitCode::SUCCESS;
+    }
+    let provenance = Provenance::of_machine(Path::new(root()), Rudb::new().version());
+    match rudb_compat::report::spent(&into, spends, &provenance) {
+        Ok(file) => {
+            println!("recorded in {}, where report reads it back", file.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("rudb-compat: the numbers are above but they were not recorded: {e}");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Print a corpus cost run at the three granularities the milestone asks for.
+fn print_records(spends: &Spends, runs: usize) {
+    println!("records    {}, measured on both engines", spends.records.len());
+    println!(
+        "one sided  {}, one engine put a number on it and the other did not",
+        spends.ours_only + spends.theirs_only
+    );
+    println!("unmeasured {}, ran and neither engine could be measured", spends.unmeasured);
+    if let Some((ours, theirs)) = &spends.outcome {
+        println!("passed     {} on rudb and {} on the pin", ours.passed, theirs.passed);
+        println!("failed     {} on rudb and {} on the pin", ours.failed, theirs.failed);
+    }
+    println!();
+    println!(
+        "Each number below is rudb over the pinned binary, so one is even and the goal is 0.1."
+    );
+    println!("The median of {runs} runs with the quartiles beside it, never the minimum.");
+    println!();
+    match spends.overall() {
+        None => println!("no record was measured on both engines, so there is no ratio to print"),
+        Some(ratios) => {
+            println!("whole corpus");
+            print_ratios(&ratios, "records");
+        }
+    }
+    let files = spends.per_file();
+    if !files.is_empty() {
+        println!();
+        println!("per file, worst first, and a file with one measured record in it is left out");
+        println!("{:<44}{:>10}{:>10}{:>10}{:>7}", "file", "time", "cpu", "memory", "n");
+        for (file, ratios) in &files {
+            println!(
+                "{:<44}{:>10.2}{:>10.2}{:>10.2}{:>7}",
+                short(file, 43),
+                ratios.time.median,
+                ratios.cpu.median,
+                ratios.memory.median,
+                ratios.time.count
+            );
+        }
+    }
+    let worst = spends.worst(rudb_compat::report::WORST);
+    if !worst.is_empty() {
+        println!();
+        println!("the worst {}, which is the column to read", worst.len());
+        println!("{:<48}{:>9}{:>9}{:>9}", "record", "time", "cpu", "memory");
+        for one in worst {
+            println!(
+                "{:<48}{:>9.2}{:>9.2}{:>9.2}",
+                short(&one.name(), 47),
+                one.time(),
+                one.cpu(),
+                one.memory()
+            );
+        }
+    }
+    println!();
+    println!("A record is in the denominator when both engines answered it and both put a number");
+    println!("on it. A record that failed on either side is never timed, because timing an error");
+    println!("path measures the error path, and a record under ten milliseconds on both sides is");
+    println!("dropped because what is being divided there is mostly the cost of starting a shell.");
+    println!();
+    println!("Read the wall clock as the cost of answering a small question from cold. A corpus");
+    println!(
+        "record is a handful of rows and the query is under a millisecond on both engines, so"
+    );
+    println!(
+        "most of what the clock sees is a shell starting, opening the file, reading a catalog"
+    );
+    println!("and printing. The number for a query that does work is `rudb-compat cost`.");
+    println!();
+    println!("The processor time reads 0.00 on nearly every record because GNU time counts it in");
+    println!("hundredths of a second and rudb answers a record in less than one of them. That is");
+    println!("the meter running out of digits and not a result. Read the clock and the peak.");
+}
+
 /// Write a cost run down beside the pages, or say why it was not written.
 ///
 /// A run that is not recorded still printed everything above, so this never fails the command. The
@@ -1529,7 +1695,7 @@ fn print_costs(costs: &Costs, asked: usize, runs: usize, seconds: u64) {
         }
         Some(ratios) => {
             println!("whole corpus");
-            print_ratios(&ratios);
+            print_ratios(&ratios, "benchmarks");
         }
     }
     let groups = costs.per_group();
@@ -1584,10 +1750,13 @@ fn grouped(refused: &[(String, String)]) -> Vec<(String, usize)> {
 }
 
 /// The three medians with their quartiles under a heading.
-fn print_ratios(ratios: &Ratios) {
+///
+/// The unit is named by the caller because the two cost commands divide different things, and a
+/// count of benchmarks printed over a corpus run would be a lie about what was measured.
+fn print_ratios(ratios: &Ratios, unit: &str) {
     let line = |what: &str, spread: &Spread| {
         println!(
-            "  {what:<8}{:>8.2}   quartiles {:.2} to {:.2} over {} benchmarks",
+            "  {what:<8}{:>8.2}   quartiles {:.2} to {:.2} over {} {unit}",
             spread.median, spread.low, spread.high, spread.count
         );
     };
@@ -1965,6 +2134,14 @@ fn help() {
     println!("                against the pinned binary is recorded beside the pages, where");
     println!("                report reads it back. Takes --count, --runs, --group, --seconds");
     println!("                and --out.");
+    println!("  records [path] measure the sqllogictest corpus on both engines record by record");
+    println!("                and print the same three ratios at the same three granularities,");
+    println!("                which are the whole corpus, per file, and the worst twenty. The");
+    println!("                committed corpus unless a path says otherwise. Both engines are");
+    println!("                driven as sessions on a database file, so what a record costs is");
+    println!("                what the record costs. The other half of cost: a benchmark suite");
+    println!("                measures the shapes somebody chose and a corpus measures the shapes");
+    println!("                nobody chose. Takes --runs and --out.");
     println!("  vendor        fetch the upstream sqllogictest corpus and say where it went");
     println!("  reach <file>  say which parts of the engine the generators never reach, from an");
     println!("                lcov report that scripts/reach produces. Feedback for the");
