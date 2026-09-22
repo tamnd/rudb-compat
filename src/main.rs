@@ -591,9 +591,16 @@ fn engines(through_shells: bool) -> Result<Pair, HarnessError> {
 ///
 /// A test file is a session. It makes a table and then asks questions about it, so a driver that
 /// forgets between statements fails every record after the first one for a reason that has nothing
-/// to do with the record. `crate::shell::Session` is the only thing here that does not forget,
-/// because it replays the statements that left something behind in front of the next one, and it is
-/// the only driver a whole file can be run through and mean anything.
+/// to do with the record. `crate::shell::Session` is the only thing here that does not forget, and
+/// it is the only driver a whole file can be run through and mean anything.
+///
+/// It has two ways of not forgetting and this picks the slow one. The fast one keeps a database
+/// file between statements and lets the engine remember; the slow one replays every statement that
+/// left something behind in front of the next one. The file is the honest way to drive a shell and
+/// it is also the one rudb cannot carry yet, because native storage has no tag for a float, a time
+/// or a blob, so a corpus file that makes a column of one of those fails at the `CREATE TABLE`.
+/// That is tamnd/rudb#1244, #1245 and #1246. When they land this asks for the file instead, which
+/// is `Session::on_a_file()` and nothing else.
 fn sessions() -> Result<Pair, HarnessError> {
     Ok((Box::new(Session::new(Shell::duckdb()?)), Box::new(Session::new(Shell::rudb()?))))
 }
