@@ -595,15 +595,21 @@ fn engines(through_shells: bool) -> Result<Pair, HarnessError> {
 /// it is the only driver a whole file can be run through and mean anything.
 ///
 /// It has two ways of not forgetting and this picks the file. A file lets the engine remember,
-/// which is what a database is for and what the corpus is trying to find out about. The other way
-/// replays every statement that left something behind in front of the next one, so a file of a
-/// thousand records answers its last question by running a thousand and one statements and never
-/// once asks the engine to remember anything.
+/// which is what a database is for and what a run of two engines is trying to find out about. The
+/// other way replays every statement that left something behind in front of the next one, so a run
+/// of a thousand statements answers its last question by running a thousand and one and never once
+/// asks the engine to remember anything.
 ///
-/// The replay is still here and a session falls back to it on its own for the statements a file
-/// cannot carry, which are the ones in `shell::the_file_keeps_it`. What changed is which one is
-/// asked for first. It used to be the replay because rudb could not open a file holding a float, a
-/// time or a blob, and native storage has tags for all of those since tamnd/rudb#1255.
+/// This is `oracles` and `sqlsmith` and not the committed corpus, which drives its own session in
+/// `tests/corpus.rs` and is still on the replay. Two things stop it. A view is not written to a
+/// native file, tamnd/rudb#1264, and a nullable `VARCHAR` read back from one raises an internal
+/// error when it becomes a domain key, tamnd/rudb#1265. Between them that is sixteen of the 1121
+/// records. The seventeenth is `is_bound` in `duckdb_views()`, which is per process state that a
+/// driver spawning a process per statement cannot carry on either engine, so that record belongs
+/// to the replay for good rather than to a list of things to fix.
+///
+/// The replay is still here either way, and a session falls back to it on its own for the
+/// statements a file cannot carry, which are the ones in `shell::the_file_keeps_it`.
 fn sessions() -> Result<Pair, HarnessError> {
     Ok((
         Box::new(Session::new(Shell::duckdb()?).on_a_file()),
