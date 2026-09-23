@@ -600,6 +600,10 @@ fn statement(
             message: "a statement with no SQL under it".to_owned(),
         });
     }
+    // The word after `ok` names a second connection, which upstream opens on first use.
+    if let Some(connection) = rest.get(1) {
+        return Ok(Directive::Unsupported(format!("statement {kind} {connection}")));
+    }
     Ok(Directive::Statement { expected, sql })
 }
 
@@ -621,11 +625,17 @@ fn query(
     // `query I error` is DuckDB's spelling for a query that has to fail, and it is the one place
     // where the word in the sort position is not a sort.
     let failing = rest.get(1).copied() == Some("error");
+    // Upstream reads `sort` as `rowsort` and `none` as `nosort`, and any other word in this place
+    // as the name of a second connection.
     let sort = match rest.get(1).copied() {
-        Some("rowsort") => Sort::RowSort,
+        Some("rowsort" | "sort") => Sort::RowSort,
         Some("valuesort") => Sort::ValueSort,
         _ => Sort::NoSort,
     };
+    let connection = rest
+        .get(1)
+        .copied()
+        .filter(|word| !["nosort", "none", "rowsort", "sort", "valuesort", "error"].contains(word));
     let label = if failing { String::new() } else { rest.get(2).copied().unwrap_or("").to_owned() };
 
     let sql = sql_body(lines, at);
@@ -647,6 +657,9 @@ fn query(
     }
 
     let raw = result_lines(lines, at);
+    if let Some(connection) = connection {
+        return Ok(Directive::Unsupported(format!("query {types} {connection}")));
+    }
     Ok(Directive::Query { types, sort, label, sql, expected: expectation(raw) })
 }
 
@@ -894,6 +907,17 @@ SELECT a FROM t
                 panic!("a query");
             };
             assert_eq!(*got, QueryResult::Lines(lines));
+        }
+    }
+
+    #[test]
+    fn sort_is_rowsort_and_none_is_nosort_the_way_upstream_reads_them() {
+        for (word, sort) in [("sort", Sort::RowSort), ("none", Sort::NoSort)] {
+            let file = parse("x.test", &format!("query I {word}\nSELECT 1\n----\n1\n")).unwrap();
+            let Directive::Query { sort: got, .. } = &file.records[0].directive else {
+                panic!("a query");
+            };
+            assert_eq!(*got, sort);
         }
     }
 
