@@ -46,6 +46,7 @@ pub mod isolate;
 pub mod kinds;
 pub mod norec;
 pub mod oracles;
+pub mod pattern;
 pub mod predicate;
 pub mod queries;
 pub mod quote;

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use crate::engine::{Cell, Engine, EngineError, HarnessError, Outcome, Table};
 use crate::hash::hash_values;
 use crate::kinds::Kinds;
+use crate::pattern::{self, Expect};
 use crate::resource::Usage;
 use crate::slt::{
     Directive, ParseError, QueryResult, Record, Setting, Sort, StatementResult, TestFile,
@@ -1275,14 +1276,14 @@ fn check(
                 }
                 (StatementResult::Maybe(Some(_)), Outcome::Rows(_)) => Ok(()),
                 (StatementResult::Maybe(Some(wanted)), Outcome::Error(e)) => {
-                    if contains(e, wanted) {
-                        Ok(())
-                    } else {
-                        fail(
+                    match contains(e, wanted) {
+                        Ok(true) => Ok(()),
+                        Err(why) => fail(sql, Reason::ErrorText, why),
+                        Ok(false) => fail(
                             sql,
                             wrong_error(e, wanted),
                             format!("expected it to work or say\n{wanted}\nand it said\n{e}"),
-                        )
+                        ),
                     }
                 }
                 (StatementResult::Ok, Outcome::Error(e)) => {
@@ -1290,14 +1291,14 @@ fn check(
                 }
                 (StatementResult::Error(None), Outcome::Error(_)) => Ok(()),
                 (StatementResult::Error(Some(wanted)), Outcome::Error(e)) => {
-                    if contains(e, wanted) {
-                        Ok(())
-                    } else {
-                        fail(
+                    match contains(e, wanted) {
+                        Ok(true) => Ok(()),
+                        Err(why) => fail(sql, Reason::ErrorText, why),
+                        Ok(false) => fail(
                             sql,
                             wrong_error(e, wanted),
                             format!("expected an error containing\n{wanted}\nand it said\n{e}"),
-                        )
+                        ),
                     }
                 }
                 (StatementResult::Error(_), Outcome::Rows(_)) => {
@@ -1327,14 +1328,14 @@ fn check(
                     return Ok(Verdict::Ran(Ok(())));
                 }
                 (Outcome::Error(e), QueryResult::Error(Some(wanted))) => {
-                    return Ok(Verdict::Ran(if contains(e, wanted) {
-                        Ok(())
-                    } else {
-                        fail(
+                    return Ok(Verdict::Ran(match contains(e, wanted) {
+                        Ok(true) => Ok(()),
+                        Err(why) => fail(sql, Reason::ErrorText, why),
+                        Ok(false) => fail(
                             sql,
                             wrong_error(e, wanted),
                             format!("expected an error containing\n{wanted}\nand it said\n{e}"),
-                        )
+                        ),
                     }));
                 }
                 (Outcome::Error(e), _) => {
@@ -1384,7 +1385,11 @@ fn check(
             Ok(Verdict::Ran(match expected {
                 QueryResult::Lines(raw) => match wanted(raw, width, table.height()) {
                     Ok(wanted) => {
-                        if agrees(&wanted, &values, &kinds, width) {
+                        if let Some(why) =
+                            wanted.iter().find_map(|cell| pattern::satisfies(cell, "")?.err())
+                        {
+                            fail(sql, Reason::WrongAnswer, why)
+                        } else if agrees(&wanted, &values, &kinds, width) {
                             Ok(())
                         } else {
                             fail(
@@ -1464,17 +1469,35 @@ fn wrong_error(got: &EngineError, wanted: &str) -> Reason {
 /// it, and a bare `Conversion Error` on its own line names one without, and both are common enough
 /// that reading only the first would put most of these in the wrong row.
 fn wanted_kind(wanted: &str) -> Option<&str> {
+    if !matches!(Expect::of(wanted.trim()), Expect::Plain(_)) {
+        return None;
+    }
     let first = wanted.lines().map(str::trim).find(|line| !line.is_empty())?;
     let head = first.split_once(": ").map_or(first, |(kind, _)| kind);
     head.ends_with("Error").then_some(head)
 }
 
-fn contains(error: &EngineError, wanted: &str) -> bool {
+///
+/// A `<REGEX>:` or `<!REGEX>:` expectation is a pattern over the whole of that text instead, read
+/// by [`crate::pattern`].
+///
+/// # Errors
+///
+/// When the expectation is a pattern the matcher cannot read, with a sentence saying why, so the
+/// record is reported as that and not as whatever the engine said.
+fn contains(error: &EngineError, wanted: &str) -> Result<bool, String> {
     let full = format!("{}: {}", error.kind, error.message);
     let wanted = wanted.trim();
+    if let Some(answer) = pattern::satisfies(wanted, &full) {
+        return answer;
+    }
     // The corpus writes an expected error over several lines when the real one has several lines,
     // and the leading whitespace on the continuations is not part of the claim.
-    wanted.lines().map(str::trim).filter(|line| !line.is_empty()).all(|line| full.contains(line))
+    Ok(wanted
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .all(|line| full.contains(line)))
 }
 
 /// Turn a result set into the flat list of values the format compares.
@@ -1587,6 +1610,9 @@ fn kind_at(types: &[String], width: usize, at: usize) -> &str {
 fn matched(wanted: &str, got: &str, ty: &str) -> bool {
     if wanted == got {
         return true;
+    }
+    if let Some(answer) = pattern::satisfies(wanted, got) {
+        return answer.unwrap_or(false);
     }
     if boolean(ty) {
         return truth(wanted).is_some() && truth(wanted) == truth(got);
@@ -2467,6 +2493,28 @@ mod tests {
             "statement error\nSELECT 1\n----\nConversion Error: Could not convert\n",
         );
         assert_eq!(text.failures[0].reason, Reason::ErrorText);
+    }
+
+    #[test]
+    fn a_regex_expectation_is_a_pattern_over_the_whole_error_and_not_a_literal() {
+        let wanted =
+            "statement error\nSELECT 1\n----\n<REGEX>:Constraint Error.*does not exist.*\n";
+        let said = "Violates foreign key constraint because key \"a: 1\" does not exist in t";
+        let pass = run(vec![errored("Constraint Error", said)], wanted);
+        assert_eq!(pass.passed, 1);
+        let fail = run(vec![errored("Binder Error", said)], wanted);
+        assert_eq!(fail.failures[0].reason, Reason::ErrorText);
+        let refused = "statement error\nSELECT 1\n----\n<!REGEX>:.*does not exist.*\n";
+        assert_eq!(run(vec![errored("Constraint Error", said)], refused).failed, 1);
+    }
+
+    #[test]
+    fn a_regex_cell_matches_the_value_it_stands_for() {
+        let answers = vec![Outcome::Rows(table(2, &["x", "1234"]))];
+        let summary = run(answers.clone(), "query II\nSELECT a, b\n----\nx\t<REGEX>:\\d+\n");
+        assert_eq!(summary.passed, 1);
+        let summary = run(answers, "query II\nSELECT a, b\n----\nx\t<REGEX>:[a-z]+\n");
+        assert_eq!(summary.failed, 1);
     }
 
     #[test]
