@@ -1084,6 +1084,11 @@ fn effect(line: &str, loaded: &mut Vec<String>) -> Effect {
         // everything after it is about what one connection sees of another.
         "reconnect" => Effect::Ends(Gap::Harness),
 
+        // A statement or query on a named connection, the other way a file opens a second one.
+        // Running it on the first connection would pass a record about isolation by never having
+        // any, so the file ends here the same way it does at a `reconnect`.
+        "statement" | "query" => Effect::Ends(Gap::Harness),
+
         // Unpacking a gzip to make a database file to load. The decompressor is the problem, not the
         // directive: this crate has one dependency on purpose and a second one for this is not a
         // trade worth making while `load` cannot use the result anyway.
@@ -2243,6 +2248,17 @@ mod tests {
             run(vec![Outcome::Rows(Table::default()), Outcome::Rows(table(1, &["2"]))], text);
         assert_eq!(summary.passed, 1);
         assert_eq!(summary.failed, 1);
+        assert_eq!(summary.skipped.unsupported, 2);
+        assert_eq!(summary.skipped_files[0].1.gap(), Gap::Harness);
+    }
+
+    #[test]
+    fn a_record_on_a_named_connection_ends_the_file_the_way_a_reconnect_does() {
+        // `con1` and `con2` are two sessions on upstream, and on the one shell this runner has they
+        // would be one session that passes a test about isolation by having none.
+        let text = "statement ok\nSELECT 1\n\nstatement ok con1\nBEGIN\n\nquery I con2\nSELECT 2\n----\n2\n";
+        let summary = run(vec![Outcome::Rows(Table::default())], text);
+        assert_eq!(summary.passed, 1);
         assert_eq!(summary.skipped.unsupported, 2);
         assert_eq!(summary.skipped_files[0].1.gap(), Gap::Harness);
     }
