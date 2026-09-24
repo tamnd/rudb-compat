@@ -792,6 +792,9 @@ pub fn run_file_telling(
     let mut loaded: Vec<String> = Vec::new();
     // What the file has said about the run, which lasts to the end of it.
     let mut settings = Settings::default();
+    // A directory of the file's own for `{TEST_DIR}`, empty when it starts and gone when it ends.
+    let scratch = Scratch::fresh();
+    settings.scratch = scratch.as_ref().map(|dir| dir.0.display().to_string());
 
     for (at, record) in file.records.iter().enumerate() {
         if let Directive::Mode(mode) = &record.directive {
@@ -1034,6 +1037,36 @@ enum Effect {
 /// rudb can answer today.
 const SCRATCH: &[&str] = &["{TEST_DIR}", "{TEMP_DIR}", "__TEST_DIR__"];
 
+/// The directory one file's `{TEST_DIR}` points at, removed with everything in it when the file is
+/// done.
+///
+/// One per file rather than one per run, because upstream empties its test directory between
+/// files and a file that attaches `{TEST_DIR}/x.db` expects to find nothing there. Under
+/// `RUDB_COMPAT_TEST_DIR` when that is set and under the system temporary directory otherwise, and
+/// named after the process and a counter so two files running at once never share one.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    /// A new empty directory, or `None` when one cannot be made, in which case the names are left
+    /// in the SQL as they were before this existed.
+    fn fresh() -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let base = std::env::var_os("RUDB_COMPAT_TEST_DIR")
+            .map_or_else(|| std::env::temp_dir().join("rudb-compat"), PathBuf::from);
+        let at = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = base.join(format!("{}-{at}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Self(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// What one of the directives this runner does not carry out does here, and where it cannot be
 /// done, whose gap that is.
 ///
@@ -1154,6 +1187,9 @@ struct Settings {
     always_fail: Vec<String>,
     /// Names the SQL below may write as `{name}` or `${name}`.
     variables: Vec<(String, String)>,
+    /// What `{TEST_DIR}`, `{TEMP_DIR}` and `__TEST_DIR__` stand for, when the run has a directory
+    /// for them.
+    scratch: Option<String>,
 }
 
 impl Default for Settings {
@@ -1163,7 +1199,12 @@ impl Default for Settings {
     /// there. An internal error is the engine saying it has broken an invariant of its own, and a
     /// file that asked for an error and got one of those did not get what it asked for.
     fn default() -> Self {
-        Self { ignore: Vec::new(), always_fail: vec!["INTERNAL".to_owned()], variables: Vec::new() }
+        Self {
+            ignore: Vec::new(),
+            always_fail: vec!["INTERNAL".to_owned()],
+            variables: Vec::new(),
+            scratch: None,
+        }
     }
 }
 
@@ -1187,13 +1228,19 @@ impl Settings {
     /// Put the variables the file has set into a piece of text.
     ///
     /// Both spellings, because the corpus writes both and upstream replaces both. A name nothing
-    /// has set is left as it stands, which is how `{TEST_DIR}` and the rest survive to be read by
-    /// whoever does know what they mean.
+    /// has set is left as it stands. The scratch directory goes in after the variables, under all
+    /// three of the names the corpus writes it as, which is what upstream's runner does with its
+    /// own test directory. With no directory those names are left as they stand too.
     fn fill(&self, text: &str) -> String {
         let mut out = text.to_owned();
         for (name, value) in &self.variables {
             out = out.replace(&format!("${{{name}}}"), value);
             out = out.replace(&format!("{{{name}}}"), value);
+        }
+        if let Some(dir) = &self.scratch {
+            for name in SCRATCH {
+                out = out.replace(name, dir);
+            }
         }
         out
     }
@@ -2247,6 +2294,20 @@ mod tests {
     fn a_name_nothing_set_is_left_alone_rather_than_emptied() {
         let settings = Settings::default();
         assert_eq!(settings.fill("COPY t TO '{TEST_DIR}/x.csv'"), "COPY t TO '{TEST_DIR}/x.csv'");
+    }
+
+    #[test]
+    fn the_scratch_names_all_point_at_the_files_own_directory() {
+        let settings = Settings { scratch: Some("/scratch/7".to_owned()), ..Settings::default() };
+        assert_eq!(
+            settings.fill("ATTACH '{TEST_DIR}/a.db'; COPY t TO '__TEST_DIR__/b.csv' '{TEMP_DIR}'"),
+            "ATTACH '/scratch/7/a.db'; COPY t TO '/scratch/7/b.csv' '/scratch/7'"
+        );
+        let dir = super::Scratch::fresh().expect("a directory");
+        let path = dir.0.clone();
+        assert!(path.is_dir());
+        drop(dir);
+        assert!(!path.exists());
     }
 
     #[test]
