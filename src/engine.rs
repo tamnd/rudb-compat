@@ -291,6 +291,38 @@ pub trait Engine {
     fn usage(&self) -> Option<crate::resource::Usage> {
         None
     }
+
+    /// Whether this engine can hold more than one connection to the same database.
+    ///
+    /// A file that names a second connection, or says `reconnect`, is asking what one connection
+    /// sees of another. An engine driven through one shell has one connection and nothing else, so
+    /// the default is no and the runner ends the file there, which is the only honest thing to do
+    /// with a record about isolation run on the connection that made the change.
+    fn connections(&self) -> bool {
+        false
+    }
+
+    /// Run one statement on the named connection, opening it the first time it is named, the way
+    /// upstream's runner does.
+    ///
+    /// # Errors
+    ///
+    /// When the engine could not be run at all, and always for an engine where
+    /// [`Engine::connections`] is false.
+    fn run_on(&mut self, connection: &str, sql: &str) -> Result<Outcome, HarnessError> {
+        let _ = sql;
+        Err(HarnessError::new(format!("{} has no connection {connection}", self.name())))
+    }
+
+    /// Close the connection the file has been using and open a new one to the same database.
+    ///
+    /// # Errors
+    ///
+    /// When the engine could not reconnect, and always for an engine where
+    /// [`Engine::connections`] is false.
+    fn reconnect(&mut self) -> Result<(), HarnessError> {
+        Err(HarnessError::new(format!("{} cannot open a second connection", self.name())))
+    }
 }
 
 /// Whether an engine thinks a piece of text is SQL.

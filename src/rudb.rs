@@ -22,9 +22,10 @@
 //! something. It used to reach into `rudb-parse` for a tokenizer and into `rudb-common` for the
 //! error type, and both of those reaches were holes in `rudb` rather than conveniences here.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
-use rudb::{Config, Database, Error, ErrorCode, LogicalType, RowOrder, Value};
+use rudb::{Config, Connection, Database, Error, ErrorCode, LogicalType, RowOrder, Value};
 
 use crate::compare::Ordering;
 use crate::engine::{Acceptance, Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
@@ -36,6 +37,11 @@ pub struct Rudb {
     config: Config,
     optimizer: Optimizer,
     database: Database,
+    /// The connection a file's unnamed records run on once it has said `reconnect`, and until then
+    /// `None`, which means the database's own.
+    current: Option<Connection>,
+    /// The connections a file has named, each opened the first time it was named.
+    named: BTreeMap<String, Connection>,
 }
 
 /// Whether the optimizer passes run at all.
@@ -146,6 +152,8 @@ impl Rudb {
             config,
             optimizer,
             database: opened(config, optimizer),
+            current: None,
+            named: BTreeMap::new(),
         }
     }
 }
@@ -202,10 +210,29 @@ impl Engine for Rudb {
     }
 
     fn run(&mut self, sql: &str) -> Result<Outcome, HarnessError> {
-        match self.database.execute(sql) {
-            Ok(result) => Ok(Outcome::Rows(table(&result))),
-            Err(e) => Ok(Outcome::Error(engine_error(&e))),
-        }
+        let result = match &self.current {
+            Some(connection) => connection.execute(sql),
+            None => self.database.execute(sql),
+        };
+        Ok(outcome(result))
+    }
+
+    fn connections(&self) -> bool {
+        true
+    }
+
+    fn run_on(&mut self, connection: &str, sql: &str) -> Result<Outcome, HarnessError> {
+        let database = &self.database;
+        let connection =
+            self.named.entry(connection.to_owned()).or_insert_with(|| database.connect());
+        Ok(outcome(connection.execute(sql)))
+    }
+
+    fn reconnect(&mut self) -> Result<(), HarnessError> {
+        // Upstream closes the connection and opens another. The settings live on the database, so
+        // the optimizer being off carries across, which is what upstream's reconnect does as well.
+        self.current = Some(self.database.connect());
+        Ok(())
     }
 
     fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError> {
@@ -221,8 +248,18 @@ impl Engine for Rudb {
     fn reset(&mut self) -> Result<(), HarnessError> {
         // The configuration comes with it, and so does the optimizer being off. A reset is the next
         // file starting, not the limits being handed back or the passes coming back on.
+        self.current = None;
+        self.named.clear();
         self.database = opened(self.config, self.optimizer);
         Ok(())
+    }
+}
+
+/// What a statement did, as the comparison wants it.
+fn outcome(result: Result<rudb::QueryResult, Error>) -> Outcome {
+    match result {
+        Ok(result) => Outcome::Rows(table(&result)),
+        Err(e) => Outcome::Error(engine_error(&e)),
     }
 }
 
@@ -357,6 +394,21 @@ mod tests {
             panic!("an insert is not an error");
         };
         assert_eq!(table.width(), 0);
+    }
+
+    #[test]
+    fn a_named_connection_sees_the_same_database_and_a_reset_forgets_it() {
+        let mut rudb = Rudb::new();
+        rudb.run("CREATE TABLE t (a INTEGER)").unwrap();
+        rudb.run_on("con1", "INSERT INTO t VALUES (7)").unwrap();
+        rudb.reconnect().unwrap();
+        let Outcome::Rows(table) = rudb.run("SELECT a FROM t").unwrap() else {
+            panic!("the table is there on every connection");
+        };
+        assert_eq!(table.height(), 1);
+        rudb.reset().unwrap();
+        assert!(rudb.named.is_empty() && rudb.current.is_none());
+        assert!(matches!(rudb.run_on("con1", "SELECT a FROM t").unwrap(), Outcome::Error(_)));
     }
 
     #[test]

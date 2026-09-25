@@ -48,6 +48,9 @@ pub enum Directive {
         expected: StatementResult,
         /// The SQL, with the newlines it was written with.
         sql: String,
+        /// The named connection it runs on, which upstream opens on first use, or `None` for the
+        /// connection the file started with.
+        connection: Option<String>,
     },
     /// `query <types> [sortmode] [label]`, then the SQL, then `----` and the results.
     Query {
@@ -62,6 +65,8 @@ pub enum Directive {
         sql: String,
         /// What it is supposed to produce.
         expected: QueryResult,
+        /// The named connection it runs on, as for a statement.
+        connection: Option<String>,
     },
     /// `halt`, which stops reading the file where it stands.
     ///
@@ -601,10 +606,8 @@ fn statement(
         });
     }
     // The word after `ok` names a second connection, which upstream opens on first use.
-    if let Some(connection) = rest.get(1) {
-        return Ok(Directive::Unsupported(format!("statement {kind} {connection}")));
-    }
-    Ok(Directive::Statement { expected, sql })
+    let connection = rest.get(1).map(|name| (*name).to_owned());
+    Ok(Directive::Statement { expected, sql, connection })
 }
 
 /// `query <types> [sortmode] [label]`, then the SQL, then `----` and the results.
@@ -635,7 +638,8 @@ fn query(
     let connection = rest
         .get(1)
         .copied()
-        .filter(|word| !["nosort", "none", "rowsort", "sort", "valuesort", "error"].contains(word));
+        .filter(|word| !["nosort", "none", "rowsort", "sort", "valuesort", "error"].contains(word))
+        .map(str::to_owned);
     let label = if failing { String::new() } else { rest.get(2).copied().unwrap_or("").to_owned() };
 
     let sql = sql_body(lines, at);
@@ -653,14 +657,12 @@ fn query(
             label,
             sql,
             expected: QueryResult::Error(tail(lines, at)),
+            connection,
         });
     }
 
     let raw = result_lines(lines, at);
-    if let Some(connection) = connection {
-        return Ok(Directive::Unsupported(format!("query {types} {connection}")));
-    }
-    Ok(Directive::Query { types, sort, label, sql, expected: expectation(raw) })
+    Ok(Directive::Query { types, sort, label, sql, expected: expectation(raw), connection })
 }
 
 /// Turn the lines under a `----` into what the query is supposed to produce.
@@ -820,7 +822,7 @@ fn substitute(body: &[Record], name: &str, value: &str) -> Vec<Record> {
         .map(|record| {
             let mut record = record.clone();
             match &mut record.directive {
-                Directive::Statement { sql, expected } => {
+                Directive::Statement { sql, expected, .. } => {
                     *sql = put(sql);
                     if let StatementResult::Error(Some(text)) = expected {
                         *text = put(text);
@@ -885,7 +887,7 @@ SELECT a FROM t
 ";
         let file = parse("x.test", text).unwrap();
         assert_eq!(file.records.len(), 2);
-        let Directive::Statement { expected, sql } = &file.records[0].directive else {
+        let Directive::Statement { expected, sql, .. } = &file.records[0].directive else {
             panic!("the first record is a statement");
         };
         assert_eq!(*expected, StatementResult::Ok);
