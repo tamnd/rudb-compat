@@ -54,18 +54,18 @@ fn rows_land_converted_to_their_columns() {
     let database = table();
     appended(&database);
     database
-        .append("t", &[
-            vec![Value::BigInt(4), text("d"), Value::BigInt(7)],
-            vec![text("5"), text("e"), Value::Double(0.25)],
-        ])
+        .append(
+            "t",
+            &[
+                vec![Value::BigInt(4), text("d"), Value::BigInt(7)],
+                vec![text("5"), text("e"), Value::Double(0.25)],
+            ],
+        )
         .expect("values that convert");
-    assert_eq!(rows(&database), [
-        "1\ta\t1.5",
-        "2\tb\t2.0",
-        "3\tc\tNULL",
-        "4\td\t7.0",
-        "5\te\t0.25"
-    ]);
+    assert_eq!(
+        rows(&database),
+        ["1\ta\t1.5", "2\tb\t2.0", "3\tc\tNULL", "4\td\t7.0", "5\te\t0.25"]
+    );
 }
 
 #[test]
@@ -83,10 +83,13 @@ fn a_null_in_a_not_null_column_rejects_the_batch() {
     let database = table();
     appended(&database);
     let error = database
-        .append("t", &[
-            vec![Value::Integer(6), text("f"), Value::Double(1.0)],
-            vec![Value::Integer(7), Value::Null, Value::Double(1.0)],
-        ])
+        .append(
+            "t",
+            &[
+                vec![Value::Integer(6), text("f"), Value::Double(1.0)],
+                vec![Value::Integer(7), Value::Null, Value::Double(1.0)],
+            ],
+        )
         .expect_err("the pin says NOT NULL constraint failed: t.\"name\"");
     assert!(error.to_string().contains("NOT NULL constraint failed"), "{error}");
     assert_eq!(rows(&database).len(), 3, "row 6 came before the bad row and still must not land");
@@ -97,10 +100,13 @@ fn a_key_already_there_rejects_the_batch() {
     let database = table();
     appended(&database);
     let error = database
-        .append("t", &[
-            vec![Value::Integer(8), text("g"), Value::Double(0.0)],
-            vec![Value::Integer(1), text("again"), Value::Double(0.0)],
-        ])
+        .append(
+            "t",
+            &[
+                vec![Value::Integer(8), text("g"), Value::Double(0.0)],
+                vec![Value::Integer(1), text("again"), Value::Double(0.0)],
+            ],
+        )
         .expect_err("the pin says Duplicate key \"id: 1\" violates primary key constraint.");
     assert!(error.to_string().contains("Duplicate key \"id: 1\""), "{error}");
     assert_eq!(rows(&database).len(), 3);
@@ -110,10 +116,13 @@ fn a_key_already_there_rejects_the_batch() {
 fn a_key_twice_in_one_batch_rejects_the_batch() {
     let database = table();
     let error = database
-        .append("t", &[
-            vec![Value::Integer(7), text("x"), Value::Double(0.0)],
-            vec![Value::Integer(7), text("y"), Value::Double(0.0)],
-        ])
+        .append(
+            "t",
+            &[
+                vec![Value::Integer(7), text("x"), Value::Double(0.0)],
+                vec![Value::Integer(7), text("y"), Value::Double(0.0)],
+            ],
+        )
         .expect_err("the pin says PRIMARY KEY or UNIQUE constraint violation: duplicate key \"7\"");
     assert!(error.to_string().to_lowercase().contains("duplicate key"), "{error}");
     assert!(rows(&database).is_empty());

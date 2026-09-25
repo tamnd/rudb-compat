@@ -387,13 +387,13 @@ mod tests {
     }
 
     #[test]
-    fn a_statement_that_writes_returns_no_columns_rather_than_a_count() {
+    fn an_insert_returns_the_count_of_rows_it_wrote_as_duckdb_does() {
         let mut rudb = Rudb::new();
         rudb.run("CREATE TABLE t (a INTEGER)").unwrap();
-        let Outcome::Rows(table) = rudb.run("INSERT INTO t VALUES (1)").unwrap() else {
+        let Outcome::Rows(table) = rudb.run("INSERT INTO t VALUES (1), (2)").unwrap() else {
             panic!("an insert is not an error");
         };
-        assert_eq!(table.width(), 0);
+        assert_eq!((table.width(), table.height()), (1, 1), "{table:?}");
     }
 
     #[test]
