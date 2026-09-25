@@ -17,12 +17,20 @@
 //! `RUDB_COMPAT_RUDB` names the rudb binary. Both engines run as binaries on their own file, one
 //! process per query, so the comparison costs no load at all and the run takes a few minutes.
 //!
+//! A third test runs the files in `corpus/job/shapes` over a few rows each, on both engines and
+//! with no data needed. The files marked `fires` are JOB's shape, with a NULL key, a dangling key,
+//! an empty answer or a byte order trap built in, and the plan has to be the reduction and the
+//! answer has to match. The files marked `declines` are near misses, and the plan must not be the
+//! reduction and has to say why. The answer still has to match, because declining means the
+//! ordinary join answers.
+//!
 //! Every JOB query returns exactly one row, there is no `LIMIT` and there is no floating point
 //! aggregate, so there is nothing to forgive: the two engines have to agree to the byte.
 
 use std::path::{Path, PathBuf};
 
 use rudb_compat::compare::MessageMatch;
+use rudb_compat::duckdb::Duckdb;
 use rudb_compat::engine::{Cell, Engine, Outcome};
 use rudb_compat::rudb::Rudb;
 use rudb_compat::shell::Shell;
@@ -58,7 +66,7 @@ fn queries() -> Vec<(String, String)> {
 }
 
 /// Every cell of a result on its own line, which is how a plan reads once it is text again.
-fn text(outcome: &Outcome) -> String {
+fn text_of(outcome: &Outcome) -> String {
     let Outcome::Rows(table) = outcome else {
         return format!("{outcome:?}");
     };
@@ -83,12 +91,13 @@ fn every_job_query_is_planned_as_a_semijoin_reduction() {
         assert!(made.is_rows(), "rudb could not make the JOB schema\n{statement}\n{made:?}");
     }
 
-    // The rule decides on the shape of the query and never on the rows, so an empty table is as
+    // The node prints as `Consistent #n`, and a plan the rule declined says `Consistent declined`,
+    // so the check is for the node and not for the word. The rule decides on the shape of the query and never on the rows, so an empty table is as
     // good as a full one for asking what the plan is. That is what lets this run on every machine.
     let mut missed = Vec::new();
     for (name, sql) in queries() {
-        let plan = text(&rudb.run(&format!("EXPLAIN {sql}")).expect("rudb should answer"));
-        if !plan.contains("Consistent") {
+        let plan = text_of(&rudb.run(&format!("EXPLAIN {sql}")).expect("rudb should answer"));
+        if !plan.contains("Consistent #") {
             missed.push(format!("{name}\n{plan}"));
         }
     }
@@ -137,4 +146,85 @@ fn every_job_query_answers_what_duckdb_answers_on_the_imdb_load() {
         at.display(),
         wrong.join("\n\n")
     );
+}
+
+/// What a shape file says the rule does with it, read off its first line.
+enum Expect {
+    /// The plan is the reduction.
+    Fires,
+    /// The plan is not the reduction, and when there is a reason it is written in the plan.
+    Declines(Option<String>),
+}
+
+/// The first line of a shape file, which is `-- fires`, `-- declines` or `-- declines: reason`.
+fn expect(text: &str, path: &Path) -> Expect {
+    let first = text.lines().next().unwrap_or_default();
+    match first.strip_prefix("-- ") {
+        Some("fires") => Expect::Fires,
+        Some("declines") => Expect::Declines(None),
+        Some(line) if line.starts_with("declines: ") => {
+            Expect::Declines(Some(line["declines: ".len()..].to_owned()))
+        }
+        _ => panic!("{} should start with -- fires or -- declines", path.display()),
+    }
+}
+
+#[test]
+fn the_shapes_fire_or_decline_as_marked_and_answer_what_duckdb_answers() {
+    let shapes = Path::new(CORPUS).join("shapes");
+    let setup = statements(&std::fs::read_to_string(shapes.join("setup.sql")).unwrap());
+    let mut rudb = Rudb::new();
+    for statement in &setup {
+        let made = rudb.run(statement).expect("rudb should answer");
+        assert!(made.is_rows(), "rudb could not make the shape tables\n{statement}\n{made:?}");
+    }
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&shapes)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.file_stem().is_some_and(|stem| stem != "setup"))
+        .collect();
+    files.sort();
+
+    // The plan is checked on every machine. The answers need DuckDB, and a machine without one
+    // still learns which way the rule went.
+    let mut wrong = Vec::new();
+    let mut queries = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).unwrap();
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let mut one = statements(&text);
+        assert_eq!(one.len(), 1, "{} should be one statement", path.display());
+        let sql = one.remove(0);
+        let plan = text_of(&rudb.run(&format!("EXPLAIN {sql}")).expect("rudb should answer"));
+        // The node prints as `Consistent #n`. A declined rewrite prints `Consistent declined`, so the
+        // bare word is on both kinds of plan and says nothing.
+        let fired = plan.contains("Consistent #");
+        match expect(&text, path) {
+            Expect::Fires if !fired => wrong.push(format!("{name} should fire\n{plan}")),
+            Expect::Declines(_) if fired => wrong.push(format!("{name} should decline\n{plan}")),
+            Expect::Declines(Some(reason)) if !plan.contains(&reason) => {
+                wrong.push(format!("{name} should say {reason}\n{plan}"));
+            }
+            _ => {}
+        }
+        queries.push((name, sql));
+    }
+
+    match Duckdb::discover() {
+        Ok(duckdb) => {
+            let mut left = duckdb.with_setup(setup.clone());
+            for (name, sql) in queries {
+                let report =
+                    run(&mut left, &mut rudb, &[sql], MessageMatch::Kind, Measure::Off).unwrap();
+                for case in &report.cases {
+                    for difference in &case.differences {
+                        wrong.push(format!("{name}\n    {difference}"));
+                    }
+                }
+            }
+        }
+        Err(_) => eprintln!("no DuckDB here, so the plans were checked and not the answers"),
+    }
+    assert!(wrong.is_empty(), "{} shapes went wrong\n\n{}", wrong.len(), wrong.join("\n\n"));
 }
