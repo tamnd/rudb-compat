@@ -1,0 +1,160 @@
+# name: corpus/pending/conflicts.test
+# description: Two connections writing the same rows, and the texts the pin gives when they conflict
+# group: [pending]
+
+# Every expected answer here was captured by the pin's own sqllogictest runner, the unittest binary
+# built at cc7e7bac7f, and the whole file passes there. rudb holds one transaction for the whole
+# database until W3, so this file lives outside the passing corpus until then.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20);
+
+# Two updates of one row. The second writer fails at once, not at its commit.
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+UPDATE t SET v = 11 WHERE id = 1
+
+statement error con2
+UPDATE t SET v = 12 WHERE id = 1
+----
+TransactionContext Error: Conflict on update!
+
+statement ok con1
+COMMIT
+
+statement ok con2
+ROLLBACK
+
+query II
+SELECT id, v FROM t ORDER BY id
+----
+1	11
+2	20
+
+# Two inserts of one key. Both succeed, and the key is only checked when the second one commits.
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+INSERT INTO t VALUES (3, 30)
+
+statement ok con2
+INSERT INTO t VALUES (3, 31)
+
+statement ok con1
+COMMIT
+
+statement error con2
+COMMIT
+----
+TransactionContext Error: Failed to commit: PRIMARY KEY or UNIQUE constraint violation: duplicate key "3"
+
+# Two deletes of one row. The second fails at once.
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+DELETE FROM t WHERE id = 2
+
+statement error con2
+DELETE FROM t WHERE id = 2
+----
+TransactionContext Error: Conflict on tuple deletion!
+
+statement ok con1
+COMMIT
+
+statement ok con2
+ROLLBACK
+
+# Two creates of one table name. The second fails at the CREATE. The full text goes on to name the
+# catalog entry, so only the start of it is held here.
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+CREATE TABLE u (a INTEGER)
+
+statement error con2
+CREATE TABLE u (a INTEGER)
+----
+TransactionContext Error: Catalog write-write conflict on create with
+
+statement ok con1
+COMMIT
+
+statement ok con2
+ROLLBACK
+
+# An update and then a delete of the same row from another transaction. The pin lets both run and
+# both commit, and the delete wins because it committed last.
+
+statement ok con1
+BEGIN
+
+statement ok con2
+BEGIN
+
+statement ok con1
+UPDATE t SET v = 100 WHERE id = 1
+
+statement ok con2
+DELETE FROM t WHERE id = 1
+
+statement ok con1
+COMMIT
+
+statement ok con2
+COMMIT
+
+query II
+SELECT id, v FROM t ORDER BY id
+----
+3	30
+
+# A connection sees its own uncommitted rows, and another connection does not.
+
+statement ok con1
+BEGIN
+
+statement ok con1
+INSERT INTO t VALUES (4, 40)
+
+query I con1
+SELECT count(*) FROM t
+----
+2
+
+query I con2
+SELECT count(*) FROM t
+----
+1
+
+statement ok con1
+ROLLBACK
+
+query I
+SELECT count(*) FROM t
+----
+1
