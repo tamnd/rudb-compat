@@ -1,0 +1,156 @@
+# name: corpus/slt/on_conflict.test
+# description: A key that is already there, and each of the ways an INSERT can say what to do about it
+# group: [smoke]
+
+statement ok
+CREATE TABLE kv (k INTEGER PRIMARY KEY, v VARCHAR, n INTEGER DEFAULT 0);
+
+statement ok
+INSERT INTO kv VALUES (1, 'one', 1), (2, 'two', 2);
+
+statement error
+INSERT INTO kv VALUES (1, 'again', 9);
+----
+Duplicate key "k: 1" violates primary key constraint.
+
+# The failed INSERT wrote nothing, not even its rows that did not conflict.
+statement error
+INSERT INTO kv VALUES (3, 'three', 3), (2, 'dup', 9);
+----
+Duplicate key "k: 2" violates primary key constraint.
+
+query I
+SELECT count(*) FROM kv;
+----
+2
+
+statement ok
+INSERT INTO kv VALUES (1, 'again', 9) ON CONFLICT DO NOTHING;
+
+statement ok
+INSERT INTO kv VALUES (1, 'again', 9), (3, 'three', 3) ON CONFLICT (k) DO NOTHING;
+
+query ITI
+SELECT k, v, n FROM kv ORDER BY k;
+----
+1	one	1
+2	two	2
+3	three	3
+
+# EXCLUDED is the row that was refused, and the bare column name is the row already there.
+statement ok
+INSERT INTO kv VALUES (2, 'TWO', 20) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = n + excluded.n;
+
+query ITI
+SELECT k, v, n FROM kv ORDER BY k;
+----
+1	one	1
+2	TWO	22
+3	three	3
+
+# A WHERE on DO UPDATE leaves the row alone when it is false.
+statement ok
+INSERT INTO kv VALUES (3, 'skip', 30) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE n > 100;
+
+query T
+SELECT v FROM kv WHERE k = 3;
+----
+three
+
+# An upsert that is an insert for one row and an update for another.
+statement ok
+INSERT INTO kv VALUES (3, 'THREE', 300), (4, 'four', 4) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = excluded.n;
+
+query ITI
+SELECT k, v, n FROM kv ORDER BY k;
+----
+1	one	1
+2	TWO	22
+3	THREE	300
+4	four	4
+
+# INSERT OR REPLACE and INSERT OR IGNORE are the same two things spelled SQLite's way.
+statement ok
+INSERT OR REPLACE INTO kv VALUES (4, 'FOUR', 40);
+
+statement ok
+INSERT OR IGNORE INTO kv VALUES (4, 'ignored', 0), (5, 'five', 5);
+
+query ITI
+SELECT k, v, n FROM kv ORDER BY k;
+----
+1	one	1
+2	TWO	22
+3	THREE	300
+4	FOUR	40
+5	five	5
+
+# A column the INSERT does not name keeps its default on the insert side of an upsert.
+statement ok
+INSERT INTO kv (k, v) VALUES (6, 'six') ON CONFLICT DO NOTHING;
+
+query ITI
+SELECT k, v, n FROM kv WHERE k = 6;
+----
+6	six	0
+
+query ITI rowsort
+INSERT INTO kv VALUES (6, 'SIX', 60), (7, 'seven', 7) ON CONFLICT (k) DO UPDATE SET v = excluded.v, n = excluded.n RETURNING k, v, n;
+----
+6	SIX	60
+7	seven	7
+
+statement error
+INSERT INTO kv VALUES (1, 'x', 0) ON CONFLICT (v) DO NOTHING;
+----
+The specified columns as conflict target are not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT or INDEX
+
+# A key that is a pair of columns.
+statement ok
+CREATE TABLE pair (a INTEGER, b INTEGER, c VARCHAR, PRIMARY KEY (a, b));
+
+statement ok
+INSERT INTO pair VALUES (1, 1, 'x'), (1, 2, 'y');
+
+statement ok
+INSERT INTO pair VALUES (1, 2, 'Y'), (2, 1, 'z') ON CONFLICT (a, b) DO UPDATE SET c = excluded.c;
+
+query IIT
+SELECT a, b, c FROM pair ORDER BY a, b;
+----
+1	1	x
+1	2	Y
+2	1	z
+
+# A UNIQUE column conflicts the same way a key does, and NULLs never conflict.
+statement ok
+CREATE TABLE u (id INTEGER, email VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO u VALUES (1, 'a@x'), (2, NULL), (3, NULL);
+
+statement error
+INSERT INTO u VALUES (4, 'a@x');
+----
+Duplicate key "email: a@x" violates unique constraint.
+
+statement ok
+INSERT INTO u VALUES (4, 'a@x') ON CONFLICT (email) DO UPDATE SET id = excluded.id;
+
+query IT
+SELECT id, email FROM u ORDER BY id;
+----
+2	NULL
+3	NULL
+4	a@x
+
+# An UPDATE that makes two rows share a key fails and changes nothing.
+statement error
+UPDATE kv SET k = 1 WHERE k = 2;
+----
+Duplicate key "k: 1" violates primary key constraint.
+
+query I
+SELECT count(*) FROM kv WHERE k = 1;
+----
+1

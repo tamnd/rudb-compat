@@ -1,0 +1,160 @@
+# name: corpus/slt/update.test
+# description: UPDATE with and without a WHERE, from another table, on NULLs, and with RETURNING
+# group: [smoke]
+
+statement ok
+CREATE TABLE t (id INTEGER, name VARCHAR, score DOUBLE);
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 1.5), (2, 'b', 2.5), (3, 'c', NULL), (4, NULL, 4.0);
+
+statement ok
+UPDATE t SET score = score * 2 WHERE id <= 2;
+
+query ITR
+SELECT id, name, score FROM t ORDER BY id;
+----
+1	a	3
+2	b	5
+3	c	NULL
+4	NULL	4
+
+# A column set to an expression over itself reads the old value, not one this statement wrote.
+statement ok
+UPDATE t SET id = id + 10, score = id;
+
+query ITR
+SELECT id, name, score FROM t ORDER BY id;
+----
+11	a	1
+12	b	2
+13	c	3
+14	NULL	4
+
+# NULL compares to nothing, so a WHERE on it matches no row, and IS NULL is how you find one.
+statement ok
+UPDATE t SET name = 'x' WHERE name = NULL;
+
+query I
+SELECT count(*) FROM t WHERE name = 'x';
+----
+0
+
+statement ok
+UPDATE t SET name = 'x' WHERE name IS NULL;
+
+query IT
+SELECT id, name FROM t ORDER BY id;
+----
+11	a
+12	b
+13	c
+14	x
+
+# A WHERE that matches nothing changes nothing.
+statement ok
+UPDATE t SET name = 'never' WHERE id > 100;
+
+query I
+SELECT count(*) FROM t WHERE name = 'never';
+----
+0
+
+# Setting a column to NULL, and to a value of another type that casts.
+statement ok
+UPDATE t SET score = NULL WHERE id = 11;
+
+statement ok
+UPDATE t SET score = '7.25' WHERE id = 12;
+
+query IR
+SELECT id, score FROM t ORDER BY id;
+----
+11	NULL
+12	7.25
+13	3
+14	4
+
+# UPDATE ... FROM joins another table in.
+statement ok
+CREATE TABLE bonus (id INTEGER, extra DOUBLE);
+
+statement ok
+INSERT INTO bonus VALUES (13, 100), (14, 200), (99, 900);
+
+statement ok
+UPDATE t SET score = t.score + bonus.extra FROM bonus WHERE t.id = bonus.id;
+
+query IR
+SELECT id, score FROM t ORDER BY id;
+----
+11	NULL
+12	7.25
+13	103
+14	204
+
+# A subquery in the SET list.
+statement ok
+UPDATE t SET score = (SELECT max(extra) FROM bonus) WHERE id = 11;
+
+query R
+SELECT score FROM t WHERE id = 11;
+----
+900
+
+query IT rowsort
+UPDATE t SET name = upper(name) WHERE id IN (11, 12) RETURNING id, name;
+----
+11	A
+12	B
+
+query IT
+SELECT id, name FROM t ORDER BY id;
+----
+11	A
+12	B
+13	c
+14	x
+
+statement error
+UPDATE t SET missing = 1;
+----
+Referenced update column missing not found in table!
+
+statement error
+UPDATE nowhere SET id = 1;
+----
+Table with name nowhere does not exist!
+
+# The same row updated again in the same transaction sees its own first update.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE t SET score = 1 WHERE id = 13;
+
+statement ok
+UPDATE t SET score = score + 1 WHERE id = 13;
+
+statement ok
+COMMIT;
+
+query R
+SELECT score FROM t WHERE id = 13;
+----
+2
+
+# A rolled back update leaves the row as it was.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE t SET name = 'gone' WHERE id = 14;
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT name FROM t WHERE id = 14;
+----
+x
