@@ -1676,7 +1676,8 @@ fn kind_at(types: &[String], width: usize, at: usize) -> &str {
 /// The text matching is the whole of it for most types. A boolean column compares true against 1
 /// and false against 0 in either spelling and either case, because the corpus writes all four and
 /// the engine prints one. A numeric column compares the two as numbers, which is what lets a file
-/// that wrote `2.000000` agree with an engine that printed `2.0` without anybody rounding anything.
+/// that wrote `2.000000` agree with an engine that printed `2.0` without anybody rounding anything,
+/// and a float column allows upstream's one percent on top of that, see [`close`].
 ///
 /// The numeric rule splits in two where upstream's does not have to. Upstream casts both sides to
 /// the column's own type and compares the results, so a `HUGEINT` is compared as a 128 bit integer
@@ -1701,7 +1702,7 @@ fn matched(wanted: &str, got: &str, ty: &str) -> bool {
     }
     match kind(ty) {
         Some(Numeric::Float) => match (wanted.parse::<f64>(), got.parse::<f64>()) {
-            (Ok(wanted), Ok(got)) => wanted == got || (wanted.is_nan() && got.is_nan()),
+            (Ok(wanted), Ok(got)) => close(wanted, got, single(ty)),
             _ => false,
         },
         Some(Numeric::Exact) => match (exact(wanted), exact(got)) {
@@ -1710,6 +1711,39 @@ fn matched(wanted: &str, got: &str, ty: &str) -> bool {
         },
         None => false,
     }
+}
+
+/// Whether two floats are the same number the way `ApproxEqual` in upstream's `types.cpp` decides
+/// it, which is what `ValuesAreEqual` calls for a FLOAT or DOUBLE column.
+///
+/// Two NaNs agree, an infinity agrees only with itself, and anything finite agrees within one
+/// percent of the engine's value plus 1e-8. That percent is why a file can write `2.321928` for an
+/// entropy the engine prints as `2.321928094887362`. A FLOAT column does the same sum in single
+/// precision after casting both sides to it, because upstream casts to the column's type first.
+#[expect(clippy::cast_possible_truncation, reason = "a FLOAT column is compared as floats")]
+fn close(wanted: f64, got: f64, single: bool) -> bool {
+    if single {
+        let (wanted, got) = (wanted as f32, got as f32);
+        if wanted.is_nan() && got.is_nan() {
+            return true;
+        }
+        if !wanted.is_finite() || !got.is_finite() {
+            return wanted == got;
+        }
+        return (wanted - got).abs() <= (f64::from(got.abs()) * 0.01 + 0.000_000_01) as f32;
+    }
+    if wanted.is_nan() && got.is_nan() {
+        return true;
+    }
+    if !wanted.is_finite() || !got.is_finite() {
+        return wanted == got;
+    }
+    (wanted - got).abs() <= got.abs() * 0.01 + 0.000_000_01
+}
+
+/// Whether a type name is the single precision float.
+fn single(ty: &str) -> bool {
+    matches!(ty.to_ascii_uppercase().as_str(), "FLOAT" | "REAL" | "FLOAT4")
 }
 
 /// A number written with no trailing zeros and no leading ones, so two spellings of it are one
@@ -2528,6 +2562,13 @@ mod tests {
         assert!(matched("2.000000", "2.0", "DOUBLE"));
         assert!(matched("0.500", "0.5", "DECIMAL(18,3)"));
         assert!(!matched("2.5", "2.6", "DOUBLE"));
+        assert!(matched("2.321928", "2.321928094887362", "DOUBLE"));
+        assert!(matched("100", "100.9", "DOUBLE"));
+        assert!(!matched("100", "101.1", "DOUBLE"));
+        assert!(matched("0", "0.000000001", "DOUBLE"));
+        assert!(matched("nan", "-nan", "DOUBLE"));
+        assert!(!matched("inf", "1e308", "DOUBLE"));
+        assert!(matched("1.5", "1.51", "FLOAT"));
         assert!(!matched("2.000000", "2.0", "VARCHAR"));
         assert!(!matched("2.0", "NULL", "DOUBLE"));
         assert!(matched("true", "1", "BOOLEAN"));
