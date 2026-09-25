@@ -38,12 +38,17 @@ fn a_query_that_is_too_slow_is_a_failed_record_and_not_a_killed_process() {
 
 #[test]
 fn a_query_that_is_too_large_is_a_failed_record_and_not_a_killed_process() {
-    // A cap the engine gets a quarter of, against a clock the sort underneath it finishes well
+    // A cap the engine gets a quarter of, against a clock the query underneath it finishes well
     // inside on any machine this runs on. The cap is not small: it is the size of the process and
     // the process is a database, so a cap the engine can reach has to leave room for the binary
     // underneath it and for everything the engine allocates without charging itself for it. A
-    // quarter of 512 MB is a 128 MB budget, and the sort below was measured holding 408 MB of
-    // process while it was inside that budget, so the room this leaves is real and it is deliberate.
+    // quarter of 512 MB is a 128 MB budget, and the sort this used to run was measured holding 408 MB
+    // of process while it was inside that budget, so the room this leaves is real and deliberate.
+    //
+    // The query was a sort until rudb's sort learned to spill (tamnd/rudb#1330 and #1339). A sort
+    // over its budget writes runs and finishes now, which is what DuckDB does too, so it is no longer
+    // a query that has to stop. Ten million groups in a hash aggregate still do, at 128 MB charged
+    // and about 290 MB of process in a release build.
     //
     // This was 256 MB until rudb's vector went from 1024 to 8192 in tamnd/rudb#480. The sort still
     // stops itself at its budget, which is the thing under test, but the process it stops in got
@@ -54,7 +59,7 @@ fn a_query_that_is_too_large_is_a_failed_record_and_not_a_killed_process() {
     let limits = Limits { time: Duration::from_secs(120), memory: 512 * 1024 * 1024 };
     let detail = stopped_by(
         "budget",
-        "query I\nSELECT count(*) FROM (SELECT * FROM range(10000000) ORDER BY range) t;\n\
+        "query I\nSELECT count(*) FROM (SELECT range, count(*) FROM range(10000000) GROUP BY range) t;\n\
          ----\n10000000\n",
         limits,
     );
