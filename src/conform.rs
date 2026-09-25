@@ -876,6 +876,27 @@ pub fn run_file_telling(
             std::thread::sleep(*how_long);
             continue;
         }
+        // A second connection, when the engine can hold one. Otherwise `effect` ends the file,
+        // because a record about what one connection sees of another says nothing when both are
+        // the same connection.
+        if let Directive::Unsupported(line) = &record.directive {
+            if line.trim() == "reconnect" && engine.connections() {
+                engine.reconnect()?;
+                continue;
+            }
+        }
+        if let Some(name) = on_connection(&record.directive) {
+            if !engine.connections() {
+                let why = Skipped::Changes {
+                    what: format!("a record on connection {name}"),
+                    gap: Gap::Harness,
+                    records: runnable(&file.records[at..]),
+                };
+                summary.skipped.charge(&why);
+                summary.skipped_files.push((file.name.clone(), why));
+                return Ok(summary);
+            }
+        }
         if let Directive::Unsupported(line) = &record.directive {
             match effect(line, &mut loaded) {
                 Effect::Fresh => engine.reset()?,
@@ -1067,6 +1088,16 @@ impl Drop for Scratch {
     }
 }
 
+/// The named connection a statement or query runs on, when it names one.
+fn on_connection(directive: &Directive) -> Option<&str> {
+    match directive {
+        Directive::Statement { connection, .. } | Directive::Query { connection, .. } => {
+            connection.as_deref()
+        }
+        _ => None,
+    }
+}
+
 /// What one of the directives this runner does not carry out does here, and where it cannot be
 /// done, whose gap that is.
 ///
@@ -1113,15 +1144,10 @@ fn effect(line: &str, loaded: &mut Vec<String>) -> Effect {
             }
         }
 
-        // A second connection to a database that is already open. This runner talks to both engines
-        // as processes through one shell each, so there is no second connection to be had, and
-        // everything after it is about what one connection sees of another.
+        // A second connection to a database that is already open, reached here only for an engine
+        // that cannot hold one, such as DuckDB driven through its shell. Everything after it is
+        // about what one connection sees of another, so the file ends.
         "reconnect" => Effect::Ends(Gap::Harness),
-
-        // A statement or query on a named connection, the other way a file opens a second one.
-        // Running it on the first connection would pass a record about isolation by never having
-        // any, so the file ends here the same way it does at a `reconnect`.
-        "statement" | "query" => Effect::Ends(Gap::Harness),
 
         // Unpacking a gzip to make a database file to load. The decompressor is the problem, not the
         // directive: this crate has one dependency on purpose and a second one for this is not a
@@ -1293,9 +1319,12 @@ fn check(
     };
 
     match &record.directive {
-        Directive::Statement { expected, sql } => {
+        Directive::Statement { expected, sql, connection } => {
             let sql = &settings.fill(sql);
-            let outcome = engine.run(sql)?;
+            let outcome = match connection {
+                Some(name) => engine.run_on(name, sql)?,
+                None => engine.run(sql)?,
+            };
             if let Outcome::Error(e) = &outcome {
                 if let Some(which) = settings.ignored(e) {
                     return Ok(Verdict::Ignored(which));
@@ -1353,9 +1382,12 @@ fn check(
                 }
             }))
         }
-        Directive::Query { types, sort, label, sql, expected } => {
+        Directive::Query { types, sort, label, sql, expected, connection } => {
             let sql = &settings.fill(sql);
-            let outcome = engine.run(sql)?;
+            let outcome = match connection {
+                Some(name) => engine.run_on(name, sql)?,
+                None => engine.run(sql)?,
+            };
             if let Outcome::Error(e) = &outcome {
                 if let Some(which) = settings.ignored(e) {
                     return Ok(Verdict::Ignored(which));
@@ -2351,6 +2383,17 @@ mod tests {
     }
 
     #[test]
+    fn an_engine_with_connections_runs_the_named_ones_and_the_reconnect() {
+        // rudb can open a second connection in process, so the same file runs to the end on it and
+        // every record is scored rather than skipped.
+        let text = "statement ok\nCREATE TABLE t (a INTEGER)\n\nstatement ok con1\nINSERT INTO t VALUES (1)\n\nreconnect\n\nquery I con2\nSELECT a FROM t\n----\n1\n\nquery I\nSELECT count(*) FROM t\n----\n1\n";
+        let mut rudb = crate::rudb::Rudb::new();
+        let summary = run_text(&mut rudb, "x.test", text).expect("rudb runs");
+        assert_eq!(summary.passed, 4, "{:?}", summary.failures);
+        assert!(summary.skipped_files.is_empty());
+    }
+
+    #[test]
     fn a_maybe_is_the_file_saying_it_does_not_know_so_it_is_excused_and_not_passed() {
         // A `statement maybe` cannot fail, so counting it as a pass puts a number in the report
         // that no engine had to earn. One corpus file is a thousand of them.
@@ -2390,6 +2433,7 @@ mod tests {
                 directive: Directive::Statement {
                     sql: "INSERT INTO t VALUES (1)".to_owned(),
                     expected: StatementResult::Maybe(wanted.map(str::to_owned)),
+                    connection: None,
                 },
             };
             let mut engine = Canned { answers: vec![answer], at: 0 };
