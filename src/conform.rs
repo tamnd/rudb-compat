@@ -1701,7 +1701,7 @@ fn matched(wanted: &str, got: &str, ty: &str) -> bool {
     if let Some(answer) = pattern::satisfies(wanted, got) {
         return answer.unwrap_or(false);
     }
-    if boolean(ty) {
+    if boolean(ty) || boolean_state(ty, got) {
         return truth(wanted).is_some() && truth(wanted) == truth(got);
     }
     if wanted == "NULL" || got == "NULL" {
@@ -1793,6 +1793,17 @@ fn truth(value: &str) -> Option<bool> {
 /// Whether a type name is the boolean one.
 fn boolean(ty: &str) -> bool {
     matches!(ty.to_ascii_uppercase().as_str(), "BOOLEAN" | "BOOL" | "LOGICAL")
+}
+
+/// Whether a value is an exported state that is a boolean, which `bool_and` and `bool_or` export.
+///
+/// Both engines describe the column as `AGGREGATE_STATE` whatever the state holds, so the type name
+/// cannot say. Upstream casts the expected text to the state's own layout, which for these two is
+/// a boolean, and that is how a file that wrote 1 agrees with an engine that printed true. A state
+/// printed as exactly true or false is taken to be that layout, since every other layout prints as
+/// a number, a string of its own or a struct.
+fn boolean_state(ty: &str, got: &str) -> bool {
+    ty.eq_ignore_ascii_case("AGGREGATE_STATE") && matches!(got, "true" | "false")
 }
 
 /// The two ways a number can be compared, and nothing for a type that is not a number at all.
@@ -2591,6 +2602,10 @@ mod tests {
         assert!(!matched("2.0", "NULL", "DOUBLE"));
         assert!(matched("true", "1", "BOOLEAN"));
         assert!(!matched("true", "0", "BOOLEAN"));
+        assert!(matched("1", "true", "AGGREGATE_STATE"));
+        assert!(matched("0", "false", "AGGREGATE_STATE"));
+        assert!(!matched("1", "false", "AGGREGATE_STATE"));
+        assert!(!matched("1", "2", "AGGREGATE_STATE"));
     }
 
     #[test]
