@@ -1435,13 +1435,6 @@ fn check(
             };
 
             let width = types.chars().count();
-            if table.width() != width {
-                return Ok(Verdict::Ran(fail(
-                    sql,
-                    Reason::WrongAnswer,
-                    format!("expected {width} columns and got {}", table.width()),
-                )));
-            }
             let kinds: Vec<String> = table.columns.iter().map(|column| column.ty.clone()).collect();
             let values = flatten(table, *sort);
 
@@ -1459,6 +1452,20 @@ fn check(
                 } else {
                     labels.insert(label.clone(), values.clone());
                 }
+                // A labelled query with nothing under its `----` is only there to answer the same
+                // as the others with that label, which is how DuckDB's runner reads it. Holding it
+                // to an empty result, or to the column count its types say, fails a query that
+                // answers exactly what the file asks for.
+                if matches!(expected, QueryResult::Lines(raw) if raw.is_empty()) {
+                    return Ok(Verdict::Ran(Ok(())));
+                }
+            }
+            if table.width() != width {
+                return Ok(Verdict::Ran(fail(
+                    sql,
+                    Reason::WrongAnswer,
+                    format!("expected {width} columns and got {}", table.width()),
+                )));
             }
 
             Ok(Verdict::Ran(match expected {
@@ -2502,6 +2509,17 @@ mod tests {
         let summary = run(answers, &shared("7", "9"));
         assert_eq!(summary.passed, 2);
         assert_eq!(summary.failed, 0);
+    }
+
+    #[test]
+    fn a_labelled_query_with_no_result_block_answers_only_to_its_label() {
+        let text = "query I nosort lbl\nSELECT 1\n----\n\nquery II nosort lbl\nSELECT 2\n----\n\n";
+        let same = vec![Outcome::Rows(table(1, &["7"])), Outcome::Rows(table(1, &["7"]))];
+        let summary = run(same, text);
+        assert_eq!((summary.passed, summary.failed), (2, 0));
+        let different = vec![Outcome::Rows(table(1, &["7"])), Outcome::Rows(table(1, &["9"]))];
+        let summary = run(different, text);
+        assert_eq!((summary.passed, summary.failed), (1, 1));
     }
 
     #[test]
