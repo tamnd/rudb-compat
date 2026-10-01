@@ -1,10 +1,10 @@
-# name: corpus/pending/conflicts.test
+# name: corpus/slt/conflicts.test
 # description: Two connections writing the same rows, and the texts the pin gives when they conflict
-# group: [pending]
+# group: [transaction]
 
 # Every expected answer here was captured by the pin's own sqllogictest runner, the unittest binary
-# built at cc7e7bac7f, and the whole file passes there. rudb holds one transaction for the whole
-# database until W3, so this file lives outside the passing corpus until then.
+# built at cc7e7bac7f, and the whole file passes there. It sat in corpus/pending until rudb gave
+# each connection its own transaction.
 
 statement ok
 CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER);
