@@ -167,6 +167,10 @@ impl Rudb {
 /// a test of its own that says they agree.
 fn opened(config: Config, optimizer: Optimizer) -> Database {
     let database = Database::with_config(config);
+    // rudb waits a second for a row another transaction holds, and the pin never waits, so the
+    // conflict files would wait out every conflict before failing it. `18-compat.md` says the
+    // runner turns the wait off.
+    database.execute("SET lock_timeout = 0").expect("rudb has lock_timeout");
     let off = turned_off(optimizer);
     if !off.is_empty() {
         let names = off.join(",");
