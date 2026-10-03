@@ -1897,7 +1897,15 @@ fn one_file(path: &Path, name: &str, timeout: Duration, memory: u64) -> ExitCode
     let mut rudb = Rudb::limited(timeout, memory);
     // An `include` path is written from the top of the corpus, and this process was handed one file
     // rather than the directory, so the top is found from where the file sits.
-    let top = path.parent().and_then(rudb_compat::conform::corpus_top);
+    // Found from the absolute path, because a relative one walks up to the empty path, and then
+    // gone into, because upstream runs every file from the top of the checkout and a file that
+    // reads `data/json/x.json` with no `{DATA_DIR}` in front of it is reading it from there.
+    let top = std::fs::canonicalize(path)
+        .ok()
+        .and_then(|path| path.parent().and_then(rudb_compat::conform::corpus_top));
+    if let Some(top) = &top {
+        let _ = std::env::set_current_dir(top);
+    }
     let summary = match String::from_utf8(bytes) {
         Ok(text) => match rudb_compat::conform::run_under(&mut rudb, top.as_deref(), name, &text) {
             Ok(summary) => summary,

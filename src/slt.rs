@@ -25,7 +25,7 @@
 
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// One record from a `.test` file, after loops are expanded.
@@ -258,6 +258,9 @@ pub struct TestFile {
     pub name: String,
     /// Every record, in order, with loops already expanded.
     pub records: Vec<Record>,
+    /// The top of the corpus it was read under, which is the directory upstream runs it from and
+    /// the one `{DATA_DIR}` is under. `None` for a file read with no corpus around it.
+    pub top: Option<PathBuf>,
 }
 
 /// A problem with the file itself, which is never a failing test.
@@ -301,7 +304,7 @@ pub fn parse_under(root: Option<&Path>, name: &str, text: &str) -> Result<TestFi
     let lines: Vec<&str> = text.lines().collect();
     let mut at = 0usize;
     let records = block(root, &lines, &mut at, false, 0)?;
-    Ok(TestFile { name: name.to_owned(), records })
+    Ok(TestFile { name: name.to_owned(), records, top: root.map(Path::to_owned) })
 }
 
 /// How deep one `include` may reach through another.

@@ -42,9 +42,17 @@ pub const DEST: &str = "target/corpus";
 /// and `crate::queries` reads them for the weights. The last two are there because the TPC-H and
 /// TPC-DS benchmarks do not hold their own queries: each one is four lines naming a template, and
 /// the template runs a `.sql` file that lives beside the generator. Without those two directories
-/// the corpus is missing a hundred and twenty one of the best known queries in the business.
-pub const PARTS: [&str; 4] =
-    ["test/sql", "benchmark", "extension/tpch/dbgen/queries", "extension/tpcds/dsdgen/queries"];
+/// the corpus is missing a hundred and twenty one of the best known queries in the business. The
+/// json data is what the json tests read through `{DATA_DIR}`, and it is five megabytes where the
+/// whole data directory is far more, so it is the one part of it fetched until another reader is
+/// in the engine to read the rest.
+pub const PARTS: [&str; 5] = [
+    "test/sql",
+    "benchmark",
+    "extension/tpch/dbgen/queries",
+    "extension/tpcds/dsdgen/queries",
+    "data/json",
+];
 
 /// The corpus directory, fetching it first if it is not already there.
 ///
