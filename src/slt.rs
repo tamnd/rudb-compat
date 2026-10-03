@@ -435,7 +435,21 @@ fn include(
 /// by this point the question is answerable. A condition naming an engine rather than the loop is
 /// left alone for the runner, because this is the wrong place to know which engine is running.
 fn iteration(body: &[Record], name: &str, value: &str) -> Vec<Record> {
-    let mut out = substitute(body, name, value);
+    let mut out = if name.contains(',') {
+        let names = comma_parts(name);
+        let values = comma_parts(value);
+        if names.len() == values.len() {
+            let mut out = body.to_vec();
+            for (name, value) in names.iter().zip(&values) {
+                out = substitute(&out, name, value);
+            }
+            out
+        } else {
+            substitute(body, name, value)
+        }
+    } else {
+        substitute(body, name, value)
+    };
     let stop = out.iter().position(|record| {
         record.directive == Directive::Continue && record.condition == Condition::Always
     });
@@ -443,6 +457,17 @@ fn iteration(body: &[Record], name: &str, value: &str) -> Vec<Record> {
         out.truncate(stop);
     }
     out
+}
+
+/// Split a loop variable list such as `a,b,c`, or one value of it, the way DuckDB's runner does,
+/// which drops the empty pieces.
+///
+/// The value keeps any quotes it was written with, so the corpus writes
+/// `foreach a,b,c '%Y-%m-%d,%H:%M:%S,'` and `{a} {b} {c}` comes out as a quoted string with spaces
+/// in it, which a value split on whitespace could not otherwise hold.
+fn comma_parts(text: &str) -> Vec<&str> {
+    let parts: Vec<&str> = text.split(',').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() { vec![text] } else { parts }
 }
 
 /// Read one record, starting at a line that is neither blank nor a comment.
@@ -1069,6 +1094,22 @@ SELECT a FROM t
                 "INSERT INTO t VALUES (2)"
             ]
         );
+    }
+
+    #[test]
+    fn a_foreach_over_several_names_splits_each_value_on_its_commas() {
+        let text =
+            "foreach a,b,c '%Y,%H:%M,' '%y,%I,%p'\nstatement ok\nSELECT {a} {b} {c}\nendloop\n";
+        let file = parse("x.test", text).unwrap();
+        let sql: Vec<&str> = file
+            .records
+            .iter()
+            .map(|record| match &record.directive {
+                Directive::Statement { sql, .. } => sql.as_str(),
+                other => panic!("a statement, not {other:?}"),
+            })
+            .collect();
+        assert_eq!(sql, ["SELECT '%Y %H:%M '", "SELECT '%y %I %p'"]);
     }
 
     #[test]
