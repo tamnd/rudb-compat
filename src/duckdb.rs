@@ -280,7 +280,7 @@ impl Engine for Duckdb {
             .map_err(|e| HarnessError::new(format!("cannot read {}: {e}", rows_at.display())))?;
         let _ = std::fs::remove_file(&types_at);
         let _ = std::fs::remove_file(&rows_at);
-        Ok(Outcome::Rows(assemble(&csv::read(&types)?, &csv::read(&rows)?)?))
+        Ok(Outcome::Rows(assemble(&csv::read(&types)?, &csv::read(&rows)?, true)?))
     }
 
     fn accepts(&mut self, sql: &str) -> Result<Acceptance, HarnessError> {
@@ -370,7 +370,9 @@ fn classify(version: &str) -> Pin {
 /// A name that resolves to nothing comes back unchanged, so the failure is the one from trying to
 /// run it, which already says what to do about it.
 pub(crate) fn on_path(name: &str) -> PathBuf {
-    let Some(path) = std::env::var_os("PATH") else { return PathBuf::from(name) };
+    let Some(path) = std::env::var_os("PATH") else {
+        return PathBuf::from(name);
+    };
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())

@@ -157,14 +157,21 @@ impl fmt::Display for Cell {
 /// They are the same names with one exception, and it is why [`uniquely`] exists. A header is one
 /// row of a CSV file and two columns in it cannot be told apart by name, so a writer that has to
 /// produce one makes the names unique. `DESCRIBE` is a result set rather than a header and says
-/// what the query really called them. So the check is against the names made unique the way the
-/// writer makes them, and the names kept are the ones `DESCRIBE` gave.
+/// what the query really called them. So when `made_unique` says the header came from such a
+/// writer, the check is against the names made unique the way the writer makes them, and the names
+/// kept are the ones `DESCRIBE` gave. The shell's `.mode quote` is not such a writer: it prints
+/// `'u','u'` for `SELECT l.u, r.u`, the same names `DESCRIBE` gives, so there the check is against
+/// the names as they are.
 ///
 /// # Errors
 ///
 /// When the `DESCRIBE` is malformed, when the two disagree about how many columns there are, or
 /// when they disagree about a name.
-pub(crate) fn assemble(types: &[Vec<Cell>], rows: &[Vec<Cell>]) -> Result<Table, HarnessError> {
+pub(crate) fn assemble(
+    types: &[Vec<Cell>],
+    rows: &[Vec<Cell>],
+    made_unique: bool,
+) -> Result<Table, HarnessError> {
     let mut columns = Vec::with_capacity(types.len().saturating_sub(1));
     for record in types.iter().skip(1) {
         let name = match record.first() {
@@ -186,7 +193,12 @@ pub(crate) fn assemble(types: &[Vec<Cell>], rows: &[Vec<Cell>]) -> Result<Table,
             columns.len()
         )));
     }
-    for (at, name) in uniquely(&columns).iter().enumerate() {
+    let names = if made_unique {
+        uniquely(&columns)
+    } else {
+        columns.iter().map(|column| column.name.clone()).collect()
+    };
+    for (at, name) in names.iter().enumerate() {
         if header[at] != Cell::Text(name.clone()) {
             return Err(HarnessError::new(format!(
                 "column {at} is {} in the result and {name} in the DESCRIBE",
@@ -429,9 +441,27 @@ mod tests {
             vec![Cell::Text("s".into()), Cell::Text("s_1".into())],
             vec![Cell::Text("1".into()), Cell::Text("1".into())],
         ];
-        let table = assemble(&types, &rows).expect("the header is the names made unique");
+        let table = assemble(&types, &rows, true).expect("the header is the names made unique");
         assert_eq!(table.columns[0].name, "s");
         assert_eq!(table.columns[1].name, "s");
         assert_eq!(table.rows.len(), 1);
+    }
+
+    #[test]
+    fn a_header_that_was_not_made_unique_is_checked_against_the_names_as_they_are() {
+        // What both shells print in `.mode quote` for `SELECT l.u, r.u` over two tables that
+        // each have a `u`, read off the pinned DuckDB.
+        let types = vec![
+            vec![Cell::Text("column_name".into()), Cell::Text("column_type".into())],
+            vec![Cell::Text("u".into()), Cell::Text("INTEGER".into())],
+            vec![Cell::Text("u".into()), Cell::Text("INTEGER".into())],
+        ];
+        let rows = vec![
+            vec![Cell::Text("u".into()), Cell::Text("u".into())],
+            vec![Cell::Text("1".into()), Cell::Text("2".into())],
+        ];
+        let table = assemble(&types, &rows, false).expect("the header is the names as they are");
+        assert_eq!(table.columns[1].name, "u");
+        assert!(assemble(&types, &rows, true).is_err());
     }
 }
