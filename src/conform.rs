@@ -51,10 +51,12 @@ const VECTOR_SIZE: usize = rudb::VECTOR_SIZE;
 ///
 /// DuckDB ships these as extensions and the corpus asks for them by name. rudb has no extension
 /// mechanism at all, so the question is not whether the extension is loaded but whether the
-/// capability is there, and for parquet it is: `read_parquet` and the parquet reader are in the
-/// engine. A name that lands here wrongly costs a wall of failures with a reason on each, and a
-/// name missing from here costs a silently smaller corpus, so the short list is the safe one.
-const BUILT_IN: &[&str] = &["parquet"];
+/// capability is there. For parquet it is, because `read_parquet` and the parquet reader are in the
+/// engine, and for json it is, because the json functions, the `read_json` family and the json
+/// type are in the engine too. A name that lands here wrongly costs a wall of failures with a
+/// reason on each, and a name missing from here costs a silently smaller corpus, so the short list
+/// is the safe one.
+const BUILT_IN: &[&str] = &["parquet", "json"];
 
 /// What kind of thing went wrong, as opposed to what went wrong.
 ///
@@ -795,6 +797,7 @@ pub fn run_file_telling(
     // A directory of the file's own for `{TEST_DIR}`, empty when it starts and gone when it ends.
     let scratch = Scratch::fresh();
     settings.scratch = scratch.as_ref().map(|dir| dir.0.display().to_string());
+    settings.top = file.top.as_ref().map(|top| top.display().to_string());
 
     for (at, record) in file.records.iter().enumerate() {
         if let Directive::Mode(mode) = &record.directive {
@@ -1216,6 +1219,9 @@ struct Settings {
     /// What `{TEST_DIR}`, `{TEMP_DIR}` and `__TEST_DIR__` stand for, when the run has a directory
     /// for them.
     scratch: Option<String>,
+    /// The top of the corpus, which is what `{WORKING_DIR}` stands for and what `{DATA_DIR}` is the
+    /// `data` directory under, when the file was read under one.
+    top: Option<String>,
 }
 
 impl Default for Settings {
@@ -1230,6 +1236,7 @@ impl Default for Settings {
             always_fail: vec!["INTERNAL".to_owned()],
             variables: Vec::new(),
             scratch: None,
+            top: None,
         }
     }
 }
@@ -1267,6 +1274,15 @@ impl Settings {
             for name in SCRATCH {
                 out = out.replace(name, dir);
             }
+        }
+        // Upstream's runner sets these from the directory it was started in, which is the top of
+        // the checkout, and `{DATA_DIR}` is `data` under it unless somebody passes another one.
+        // The local name is the same directory on a run that reads its data from disk.
+        if let Some(top) = &self.top {
+            for name in ["{DATA_DIR}", "{LOCAL_DATA_DIR}"] {
+                out = out.replace(name, &format!("{top}/data"));
+            }
+            out = out.replace("{WORKING_DIR}", top);
         }
         out
     }
@@ -1352,7 +1368,7 @@ fn check(
                 }
                 (StatementResult::Maybe(Some(_)), Outcome::Rows(_)) => Ok(()),
                 (StatementResult::Maybe(Some(wanted)), Outcome::Error(e)) => {
-                    match contains(e, wanted) {
+                    match contains(e, &settings.fill(wanted)) {
                         Ok(true) => Ok(()),
                         Err(why) => fail(sql, Reason::ErrorText, why),
                         Ok(false) => fail(
@@ -1367,7 +1383,7 @@ fn check(
                 }
                 (StatementResult::Error(None), Outcome::Error(_)) => Ok(()),
                 (StatementResult::Error(Some(wanted)), Outcome::Error(e)) => {
-                    match contains(e, wanted) {
+                    match contains(e, &settings.fill(wanted)) {
                         Ok(true) => Ok(()),
                         Err(why) => fail(sql, Reason::ErrorText, why),
                         Ok(false) => fail(
@@ -1407,7 +1423,7 @@ fn check(
                     return Ok(Verdict::Ran(Ok(())));
                 }
                 (Outcome::Error(e), QueryResult::Error(Some(wanted))) => {
-                    return Ok(Verdict::Ran(match contains(e, wanted) {
+                    return Ok(Verdict::Ran(match contains(e, &settings.fill(wanted)) {
                         Ok(true) => Ok(()),
                         Err(why) => fail(sql, Reason::ErrorText, why),
                         Ok(false) => fail(
@@ -1469,7 +1485,13 @@ fn check(
             }
 
             Ok(Verdict::Ran(match expected {
-                QueryResult::Lines(raw) => match wanted(raw, width, table.height()) {
+                // Upstream puts the same names into what a file expects as into what it runs, so
+                // a path the answer names is the path the query was given.
+                QueryResult::Lines(raw) => match wanted(
+                    &raw.iter().map(|line| settings.fill(line)).collect::<Vec<_>>(),
+                    width,
+                    table.height(),
+                ) {
                     Ok(wanted) => {
                         if let Some(why) =
                             wanted.iter().find_map(|cell| pattern::satisfies(cell, "")?.err())
@@ -2194,6 +2216,10 @@ mod tests {
         );
         assert!(summary.skipped_files.is_empty());
         assert_eq!(summary.passed, 1);
+        let summary =
+            run(vec![Outcome::Rows(Table::default())], "require json\n\nstatement ok\nSELECT 1\n");
+        assert!(summary.skipped_files.is_empty());
+        assert_eq!(summary.passed, 1);
     }
 
     #[test]
@@ -2387,6 +2413,11 @@ mod tests {
             settings.fill("ATTACH '{TEST_DIR}/a.db'; COPY t TO '__TEST_DIR__/b.csv' '{TEMP_DIR}'"),
             "ATTACH '/scratch/7/a.db'; COPY t TO '/scratch/7/b.csv' '/scratch/7'"
         );
+        let settings = Settings { top: Some("/corpus".to_owned()), ..Settings::default() };
+        assert_eq!(
+            settings.fill("FROM '{DATA_DIR}/json/a.json', '{LOCAL_DATA_DIR}/b', '{WORKING_DIR}/c'"),
+            "FROM '/corpus/data/json/a.json', '/corpus/data/b', '/corpus/c'"
+        );
         let dir = super::Scratch::fresh().expect("a directory");
         let path = dir.0.clone();
         assert!(path.is_dir());
@@ -2478,7 +2509,7 @@ mod tests {
             })
         };
         let read = |answer: Outcome, wanted: Option<&str>| {
-            let file = TestFile { name: "x.test".to_owned(), records: Vec::new() };
+            let file = TestFile { name: "x.test".to_owned(), records: Vec::new(), top: None };
             let record = Record {
                 line: 1,
                 condition: Condition::Always,
