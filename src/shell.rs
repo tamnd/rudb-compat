@@ -332,7 +332,7 @@ impl Engine for Shell {
         } else {
             &types.stdout
         };
-        assemble(&quote::read(stdout)?, &rows)
+        assemble(&quote::read(stdout)?, &rows, false)
             .map(Outcome::Rows)
             .map_err(|e| HarnessError::new(format!("{}: {e}", self.name)))
     }
@@ -368,7 +368,9 @@ fn without_duckdb_warnings(mut output: &str) -> &str {
     const HEADING: &str = "\u{1b}[90mWARNING:\n\u{1b}[00m";
     const RESET: &str = "\u{1b}[00m";
     while let Some(after_heading) = output.strip_prefix(HEADING) {
-        let Some(end) = after_heading.find(RESET) else { break };
+        let Some(end) = after_heading.find(RESET) else {
+            break;
+        };
         output = &after_heading[end + RESET.len()..];
     }
     output
