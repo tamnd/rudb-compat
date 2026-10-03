@@ -1729,6 +1729,9 @@ fn matched(wanted: &str, got: &str, ty: &str) -> bool {
     if wanted == "NULL" || got == "NULL" {
         return false;
     }
+    // Casting text to a number skips the spaces around it, so a file that wrote `1 ` agrees with
+    // an engine that printed 1 the way it does upstream.
+    let (wanted, got) = (spaced(wanted), spaced(got));
     match kind(ty) {
         Some(Numeric::Float) => match (wanted.parse::<f64>(), got.parse::<f64>()) {
             (Ok(wanted), Ok(got)) => close(wanted, got, single(ty)),
@@ -1740,6 +1743,12 @@ fn matched(wanted: &str, got: &str, ty: &str) -> bool {
         },
         None => false,
     }
+}
+
+/// A value with the spaces around it gone, spaces being what `StringUtil::CharacterIsSpace` calls
+/// one, which takes the vertical tab that Rust's own trim leaves.
+fn spaced(value: &str) -> &str {
+    value.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
 }
 
 /// Whether two floats are the same number the way `ApproxEqual` in upstream's `types.cpp` decides
@@ -1852,6 +1861,16 @@ fn kind(ty: &str) -> Option<Numeric> {
     }
 }
 
+/// The values a row-wise line holds, cut at each tab the way `StringUtil::Split` cuts it.
+///
+/// Upstream drops the empty pieces, so a row written with two tabs between values, which several
+/// union files do to line their columns up, has as many values as one written with one. A line
+/// that is nothing but tabs is the one value it is, since the split never hands back no pieces.
+fn split_row(line: &str) -> Vec<&str> {
+    let values: Vec<&str> = line.split('\t').filter(|piece| !piece.is_empty()).collect();
+    if values.is_empty() { vec![line] } else { values }
+}
+
 /// Split a result block into the values it means, which takes the result that came back to decide.
 ///
 /// A line under a `----` is a whole row in some files and one value in others, and nothing in the
@@ -1881,7 +1900,7 @@ pub fn wanted(raw: &[String], columns: usize, rows: usize) -> Result<Vec<String>
     if row_wise {
         let mut out = Vec::with_capacity(raw.len() * columns);
         for (at, line) in raw.iter().enumerate() {
-            let values: Vec<&str> = line.split('\t').collect();
+            let values = split_row(line);
             if values.len() != columns {
                 return Err(format!(
                     "row {} of the expected result has {} values under a query of {columns} columns",
@@ -1993,7 +2012,7 @@ fn collect(path: &Path, slow: bool, out: &mut Vec<PathBuf>) -> Result<(), Harnes
 mod tests {
     use super::{
         Gap, HashMap, NAMES, Reason, Settings, Skips, Summary, VECTOR_SIZE, Verdict, check, exact,
-        flatten, matched, render, run_text,
+        flatten, matched, render, run_text, split_row, wanted,
     };
     use crate::engine::{Cell, Column, Engine, EngineError, HarnessError, Outcome, Table};
     use crate::slt::{Condition, Directive, Record, Sort, StatementResult, TestFile};
@@ -2637,6 +2656,22 @@ mod tests {
         assert!(matched("0", "false", "AGGREGATE_STATE"));
         assert!(!matched("1", "false", "AGGREGATE_STATE"));
         assert!(!matched("1", "2", "AGGREGATE_STATE"));
+    }
+
+    #[test]
+    fn a_number_written_with_a_space_after_it_is_still_that_number() {
+        assert!(matched("1 ", "1", "INTEGER"));
+        assert!(matched(" 2.0", "2", "DOUBLE"));
+        assert!(!matched("1 ", "1", "VARCHAR"));
+        assert!(!matched("1 2", "12", "INTEGER"));
+    }
+
+    #[test]
+    fn a_row_drops_the_empty_pieces_between_two_tabs() {
+        let raw = ["1\t\tNULL\tNULL".to_owned(), "NULL\tNULL\ttext".to_owned()];
+        assert_eq!(wanted(&raw, 3, 2).unwrap(), ["1", "NULL", "NULL", "NULL", "NULL", "text"]);
+        assert_eq!(split_row("\t\t"), ["\t\t"]);
+        assert_eq!(split_row("a\tb\t"), ["a", "b"]);
     }
 
     #[test]
