@@ -212,8 +212,8 @@ dependencies = [
 
 [[package]]
 name = "rudb"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "iana-time-zone",
  "rudb-arrow",
@@ -242,8 +242,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-arrow"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-vector",
@@ -251,8 +251,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-bind"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-catalog",
  "rudb-common",
@@ -267,8 +267,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-catalog"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -281,8 +281,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-common"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -297,16 +297,16 @@ dependencies = [
 
 [[package]]
 name = "rudb-compress"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-csv"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -316,8 +316,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-encoding"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-vector",
@@ -325,8 +325,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-exec"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-catalog",
  "rudb-common",
@@ -351,10 +351,11 @@ dependencies = [
 
 [[package]]
 name = "rudb-functions"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
+ "rudb-compress",
  "rudb-csv",
  "rudb-io",
  "rudb-kernels",
@@ -365,8 +366,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-graph"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -374,16 +375,16 @@ dependencies = [
 
 [[package]]
 name = "rudb-io"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-kernels"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "libm",
  "memchr",
@@ -395,16 +396,16 @@ dependencies = [
 
 [[package]]
 name = "rudb-metrics"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-native"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -419,8 +420,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-opt"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "libm",
  "rudb-bind",
@@ -435,8 +436,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-parquet"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-compress",
@@ -447,16 +448,16 @@ dependencies = [
 
 [[package]]
 name = "rudb-parse"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-pipeline"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-metrics",
@@ -466,8 +467,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-plan"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-seam",
@@ -475,8 +476,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-catalog",
  "rudb-common",
@@ -497,16 +498,16 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-direct"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-qc-ir",
 ]
 
 [[package]]
 name = "rudb-qc-gen"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-kernels",
@@ -520,21 +521,21 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-interp"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-qc-ir",
 ]
 
 [[package]]
 name = "rudb-qc-ir"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 
 [[package]]
 name = "rudb-qc-pipe"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-plan",
@@ -545,8 +546,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-plan"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-plan",
@@ -554,8 +555,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-qc-rt"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "memchr",
  "rudb-common",
@@ -566,24 +567,24 @@ dependencies = [
 
 [[package]]
 name = "rudb-regex"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-seam"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
 
 [[package]]
 name = "rudb-stats"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-encoding",
@@ -591,8 +592,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-storage"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "libm",
  "rudb-common",
@@ -603,8 +604,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-txn"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
  "rudb-io",
@@ -613,8 +614,8 @@ dependencies = [
 
 [[package]]
 name = "rudb-vector"
-version = "0.8.18"
-source = "git+https://github.com/tamnd/rudb?branch=main#c36621145f83945058ee88e02f1018e12d96ca0d"
+version = "0.8.23"
+source = "git+https://github.com/tamnd/rudb?branch=main#8ba75e3d1f27ac68f500ca91a773beff6ec429f5"
 dependencies = [
  "rudb-common",
 ]
