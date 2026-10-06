@@ -786,8 +786,9 @@ pub fn run_file_telling(
     }
 
     // `mode skip` turns everything off until `mode unskip`, which is how a file marks a section
-    // that is known not to work without deleting it.
-    let mut skipping = false;
+    // that is known not to work without deleting it. Upstream counts them, so a skip inside a skip
+    // needs two unskips, and anything after the first word is the reason and changes nothing.
+    let mut skipping = 0_usize;
     let mut labels: HashMap<String, Vec<String>> = HashMap::new();
     // Every path the file has opened so far, which is what decides whether the next `load` or
     // `restart` is asking for an empty database or for one with history in it.
@@ -801,9 +802,9 @@ pub fn run_file_telling(
 
     for (at, record) in file.records.iter().enumerate() {
         if let Directive::Mode(mode) = &record.directive {
-            match mode.as_str() {
-                "skip" => skipping = true,
-                "unskip" => skipping = false,
+            match mode.split_whitespace().next() {
+                Some("skip") => skipping += 1,
+                Some("unskip") => skipping = skipping.saturating_sub(1),
                 _ => {}
             }
             continue;
@@ -821,7 +822,7 @@ pub fn run_file_telling(
             labels.remove(name);
             continue;
         }
-        if skipping {
+        if skipping > 0 {
             summary.skipped.mode += 1;
             continue;
         }
@@ -2608,6 +2609,15 @@ mod tests {
         let text = "mode skip\n\nstatement ok\nSELECT 1\n\nmode unskip\n\nstatement ok\nSELECT 2\n";
         let summary = run(Vec::new(), text);
         assert_eq!(summary.skipped.mode, 1);
+        assert_eq!(summary.passed, 1);
+    }
+
+    #[test]
+    fn a_skip_with_a_reason_still_skips_and_two_skips_need_two_unskips() {
+        let text = "mode skip unsupported\n\nmode skip\n\nstatement ok\nSELECT 1\n\nmode unskip\n\n\
+                    statement ok\nSELECT 2\n\nmode unskip\n\nstatement ok\nSELECT 3\n";
+        let summary = run(Vec::new(), text);
+        assert_eq!(summary.skipped.mode, 2);
         assert_eq!(summary.passed, 1);
     }
 
