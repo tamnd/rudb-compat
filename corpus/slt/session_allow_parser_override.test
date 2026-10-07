@@ -13,10 +13,12 @@ SET allow_parser_override_extension = DEFAULT;
 statement ok
 SET allow_parser_override_extension = 'default';
 
+# The pin keeps the word as it was written, so a quoted value reads back in its own case.
+
 query T
 SELECT current_setting('allow_parser_override_extension');
 ----
-DEFAULT
+default
 
 statement error
 SET allow_parser_override_extension = true;

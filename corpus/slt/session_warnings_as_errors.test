@@ -18,6 +18,11 @@ SELECT current_setting('warnings_as_errors');
 ----
 false
 
+# The pin has a logger by default, so escalation needs the logger turned off first to fail.
+
+statement ok
+SET enable_logging = false;
+
 statement error
 SET warnings_as_errors = true;
 ----
@@ -30,6 +35,9 @@ false
 
 statement ok
 RESET warnings_as_errors;
+
+statement ok
+RESET enable_logging;
 
 query TTT
 SELECT description, input_type, scope FROM duckdb_settings() WHERE name = 'warnings_as_errors';

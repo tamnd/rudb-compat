@@ -108,7 +108,9 @@ statement ok con2
 ROLLBACK
 
 # An update and then a delete of the same row from another transaction. The pin lets both run and
-# both commit, and the delete wins because it committed last.
+# both commit, and the delete wins because it committed last. rudb does not, on purpose: the update
+# would be lost, so the delete fails at once (`18-compat.md` section 18.8, question 2, and rudb #2366).
+# This is the one record in the file that does not hold the pin's answer.
 
 statement ok con1
 BEGIN
@@ -119,8 +121,10 @@ BEGIN
 statement ok con1
 UPDATE t SET v = 100 WHERE id = 1
 
-statement ok con2
+statement error con2
 DELETE FROM t WHERE id = 1
+----
+TransactionContext Error: Conflict on tuple deletion!
 
 statement ok con1
 COMMIT
@@ -131,6 +135,7 @@ COMMIT
 query II
 SELECT id, v FROM t ORDER BY id
 ----
+1	100
 3	30
 
 # A connection sees its own uncommitted rows, and another connection does not.
@@ -144,12 +149,12 @@ INSERT INTO t VALUES (4, 40)
 query I con1
 SELECT count(*) FROM t
 ----
-2
+3
 
 query I con2
 SELECT count(*) FROM t
 ----
-1
+2
 
 statement ok con1
 ROLLBACK
@@ -157,4 +162,4 @@ ROLLBACK
 query I
 SELECT count(*) FROM t
 ----
-1
+2

@@ -106,7 +106,7 @@ true	true	true
 statement error
 SELECT current_database;
 ----
-Referenced column "current_database" not found in FROM clause!
+Referenced column "current_database" was not found because the FROM clause is missing
 
 statement error
 SELECT current_timestamp();

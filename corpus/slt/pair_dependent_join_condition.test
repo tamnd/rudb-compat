@@ -195,11 +195,16 @@ SELECT l.a, r.b FROM pair_l l JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WH
 1	20
 2	20
 
-# A left join whose condition reads both sides has no plan yet. It is the pair dependent join
-# upstream builds, and the rewrite above is not it, because a left join pads the pairs its condition
-# dropped and a filter above a product cannot tell which left row a dropped pair came from.
+# A left join whose condition reads both sides. The pin refuses it with "Cannot perform non-inner
+# join on subquery!", and rudb plans it since rudb #2466, so this record holds rudb's answer. The
+# left row (3, 30) has no pair in pair_s and comes back padded.
 
-statement error
-SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b);
+query II
+SELECT l.a, r.b FROM pair_l l LEFT JOIN pair_r r ON EXISTS (SELECT 1 FROM pair_s s WHERE s.a = l.a AND s.b = r.b) ORDER BY l.a, l.x, r.b;
 ----
-reads both sides of that join
+1	10
+1	20
+1	10
+1	20
+2	20
+3	NULL
