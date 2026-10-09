@@ -1669,7 +1669,11 @@ pub fn render(cell: &Cell, ty: &str) -> String {
     }
     // An empty string and a null are different values and the format has to be able to tell them
     // apart on a line of their own, so the empty one is written out.
-    if text.is_empty() { "(empty)".to_owned() } else { text.to_owned() }
+    if text.is_empty() {
+        return "(empty)".to_owned();
+    }
+    // A zero byte is written as a backslash and a zero, which is how upstream prints it.
+    text.replace(char::from(0), "\\0")
 }
 
 /// Whether every value agrees with what the file said, column type by column type.
@@ -2636,6 +2640,12 @@ mod tests {
         assert_eq!(render(&Cell::Text("2.5".to_owned()), "VARCHAR"), "2.5");
         assert_eq!(render(&Cell::Null, "VARCHAR"), "NULL");
         assert_eq!(render(&Cell::Text(String::new()), "VARCHAR"), "(empty)");
+    }
+
+    #[test]
+    fn a_zero_byte_is_written_as_a_backslash_and_a_zero() {
+        assert_eq!(render(&Cell::Text("hello\0\0".to_owned()), "VARCHAR"), "hello\\0\\0");
+        assert_eq!(render(&Cell::Text("\0".to_owned()), "VARCHAR"), "\\0");
     }
 
     #[test]
