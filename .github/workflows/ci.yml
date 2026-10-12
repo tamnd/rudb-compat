@@ -128,7 +128,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           tail -30 slt.txt
       - name: keep the failures for reading
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sqllogictest-failures
           path: slt.txt
