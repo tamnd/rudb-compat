@@ -36,7 +36,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
 
       # Against the pin first. This is the same answer the pull request gate got, so it failing
       # means the nightly machine and CI disagree about a commit that already passed, which is
@@ -72,7 +72,7 @@ jobs:
 
       - name: keep the sweeps for reading
         if: always()
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: optimizer-sweep
           path: |
