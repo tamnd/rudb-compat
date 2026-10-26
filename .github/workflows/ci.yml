@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: cargo fmt
         run: cargo fmt --all --check
       - name: cargo clippy
@@ -59,7 +59,7 @@ jobs:
         os: [ubuntu-24.04, macos-26]
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: install duckdb
         shell: bash
         run: |
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - name: fetch the corpus
         run: cargo run --release -q -- vendor | tee vendor.txt
       - name: run the corpus
@@ -128,7 +128,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           tail -30 slt.txt
       - name: keep the failures for reading
-        uses: actions/upload-artifact@v7.0.1
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: sqllogictest-failures
           path: slt.txt
@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: Swatinem/rust-cache@v2.9.2
+      - uses: Swatinem/rust-cache@v2.9.3
       - run: cargo doc --all-features --no-deps
 
   ci:
